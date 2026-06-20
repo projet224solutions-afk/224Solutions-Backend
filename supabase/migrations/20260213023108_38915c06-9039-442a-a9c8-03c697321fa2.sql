@@ -1,0 +1,1 @@
+UPDATE products SET price = 5000 WHERE id = '90d9bd14-0212-40c5-989f-8a173053d82e';

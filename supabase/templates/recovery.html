@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Réinitialiser votre mot de passe – 224Solutions</title>
+  <style>
+    body { margin: 0; padding: 0; background-color: #f4f4f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .wrapper { max-width: 560px; margin: 40px auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 32px 40px; text-align: center; }
+    .header h1 { color: #ffffff; font-size: 22px; font-weight: 700; margin: 0; letter-spacing: -0.3px; }
+    .body { padding: 40px; }
+    .body p { color: #3f3f46; font-size: 15px; line-height: 1.6; margin: 0 0 16px; }
+    .btn-wrap { text-align: center; margin: 32px 0; }
+    .btn { display: inline-block; background: #2563eb; color: #ffffff !important; text-decoration: none; font-size: 15px; font-weight: 600; padding: 14px 36px; border-radius: 8px; }
+    .url-fallback { background: #f4f4f5; border-radius: 8px; padding: 14px 16px; margin: 20px 0; word-break: break-all; }
+    .url-fallback p { color: #71717a; font-size: 12px; margin: 0 0 6px; }
+    .url-fallback a { color: #2563eb; font-size: 13px; text-decoration: none; }
+    .footer { background: #fafafa; border-top: 1px solid #e4e4e7; padding: 24px 40px; text-align: center; }
+    .footer p { color: #a1a1aa; font-size: 12px; margin: 0; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <h1>224Solutions</h1>
+    </div>
+    <div class="body">
+      <p>Bonjour,</p>
+      <p>Vous avez demandé à réinitialiser le mot de passe de votre compte <strong>224Solutions</strong>. Cliquez sur le bouton ci-dessous pour choisir un nouveau mot de passe.</p>
+      <div class="btn-wrap">
+        <a href="{{ .SiteURL }}/reset-password?token_hash={{ .TokenHash }}&type=recovery" class="btn">
+          Réinitialiser mon mot de passe
+        </a>
+      </div>
+      <p>Ce lien est valable pendant <strong>1 heure</strong>. Si vous n'avez pas demandé cette réinitialisation, ignorez cet email — votre mot de passe restera inchangé.</p>
+      <div class="url-fallback">
+        <p>Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :</p>
+        <a href="{{ .SiteURL }}/reset-password?token_hash={{ .TokenHash }}&type=recovery">
+          {{ .SiteURL }}/reset-password?token_hash={{ .TokenHash }}&type=recovery
+        </a>
+      </div>
+    </div>
+    <div class="footer">
+      <p>224Solutions &nbsp;·&nbsp; Marketplace Multi-Services<br />
+      <a href="{{ .SiteURL }}" style="color:#2563eb;">224solution.net</a></p>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,64 @@
+-- ============================================================================
+-- Affinage order_monitor_report : exclure les produits NUMÉRIQUES du contrôle
+-- « commande payée sans escrow ».
+-- ----------------------------------------------------------------------------
+-- Constat : les achats de produits numériques (item_type='digital_product' /
+-- source_flow='digital_marketplace') sont livrés INSTANTANÉMENT (téléchargement)
+-- et le vendeur est payé immédiatement → AUCUN escrow par conception. Le capteur
+-- order_paid_no_escrow les flaggait à tort (faux positif). On les exclut.
+-- Les autres contrôles sont inchangés. Non destructif, rejouable.
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.order_monitor_report()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_no_escrow  int;
+  v_dup_pi     int;
+  v_neg_stock  int;
+  v_rapid      int;
+  v_nonpos     int;
+BEGIN
+  -- Commande PAYÉE sans escrow — HORS cash COD ET HORS produits numériques
+  -- (ces derniers n'ont pas d'escrow par conception : livraison instantanée).
+  SELECT count(*) INTO v_no_escrow FROM public.orders o
+  WHERE o.payment_status = 'paid'
+    AND o.payment_method <> 'cash'
+    AND COALESCE(o.metadata->>'item_type', '') <> 'digital_product'
+    AND COALESCE(o.metadata->>'source_flow', '') <> 'digital_marketplace'
+    AND o.created_at > now() - interval '7 days'
+    AND NOT EXISTS (SELECT 1 FROM public.escrow_transactions e WHERE e.order_id = o.id);
+
+  SELECT COALESCE(count(*), 0) INTO v_dup_pi FROM (
+    SELECT 1 FROM public.orders
+    WHERE payment_intent_id IS NOT NULL AND payment_intent_id <> ''
+    GROUP BY payment_intent_id HAVING count(*) > 1
+  ) d;
+
+  SELECT count(*) INTO v_neg_stock FROM public.products
+  WHERE COALESCE(stock_quantity, 0) < 0;
+
+  SELECT count(*) INTO v_rapid FROM public.orders
+  WHERE created_at > now() - interval '5 minutes';
+
+  SELECT count(*) INTO v_nonpos FROM public.orders
+  WHERE COALESCE(total_amount, 0) <= 0
+    AND created_at > now() - interval '7 days';
+
+  RETURN jsonb_build_object('generated_at', now(), 'checks', jsonb_build_array(
+    jsonb_build_object('key','order_paid_no_escrow','label','Commande physique payée sans escrow (séquestre manquant)','severity','high','count',v_no_escrow,'observed',v_no_escrow),
+    jsonb_build_object('key','order_duplicate_payment_intent','label','Doublon payment_intent (1 paiement → 2 commandes)','severity','critical','count',v_dup_pi,'observed',v_dup_pi),
+    jsonb_build_object('key','order_negative_stock','label','Stock produit négatif','severity','high','count',v_neg_stock,'observed',v_neg_stock),
+    jsonb_build_object('key','order_rapid','label','Rafale de commandes (5 min) — possible bot/attaque','severity',CASE WHEN v_rapid > 50 THEN 'high' ELSE 'low' END,'count',CASE WHEN v_rapid > 50 THEN v_rapid ELSE 0 END,'observed',v_rapid),
+    jsonb_build_object('key','order_nonpositive','label','Commande au montant total ≤ 0','severity','medium','count',v_nonpos,'observed',v_nonpos)
+  ));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.order_monitor_report() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.order_monitor_report() TO service_role;
+
+SELECT 'order_monitor_report() affiné : produits numériques exclus du contrôle escrow.' AS status;

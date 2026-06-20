@@ -1,0 +1,2 @@
+-- Déprécier officiellement agent_affiliate_commissions
+COMMENT ON TABLE agent_affiliate_commissions IS 'DEPRECATED - Ne pas utiliser pour les stats officielles. Source de vérité unique : agent_commissions_log. Conservée pour historique/compatibilité uniquement.';

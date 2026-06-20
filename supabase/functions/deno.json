@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "lib": ["deno.window"],
+    "strict": true
+  },
+  "imports": {
+    "https://deno.land/std@0.168.0/": "https://deno.land/std@0.190.0/",
+    "https://deno.land/std@0.190.0/": "https://deno.land/std@0.190.0/"
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": true
+  }
+}

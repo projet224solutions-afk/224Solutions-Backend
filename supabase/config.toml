@@ -1,0 +1,425 @@
+project_id = "uakkxaibujzxdiqzpnpr"
+
+[auth]
+site_url = "https://224solution.net"
+additional_redirect_urls = [
+  "https://224solution.net/**",
+  "https://www.224solution.net/**",
+  "http://localhost:5173/**",
+  "http://localhost:3000/**"
+]
+enable_signup = true
+enable_anonymous_sign_ins = true
+enable_manual_linking = true
+minimum_password_length = 6
+password_requirements = "lower_upper_letters_digits_symbols"
+
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+double_confirm_changes = true
+secure_password_change = true
+max_frequency = "1m0s"
+
+[auth.email.template.confirmation]
+subject = "Confirmez votre adresse email – 224Solutions"
+content_path = "./supabase/templates/confirmation.html"
+
+[auth.email.template.recovery]
+subject = "Réinitialiser votre mot de passe – 224Solutions"
+content_path = "./supabase/templates/recovery.html"
+
+[auth.mfa.totp]
+enroll_enabled = true
+verify_enabled = true
+
+[auth.mfa.phone]
+enroll_enabled = false
+verify_enabled = false
+otp_length = 6
+template = "224Solutions - Code 2FA : {{ .Code }}"
+max_frequency = "5s"
+
+[auth.sms]
+enable_signup = true
+enable_confirmations = true
+template = "224Solutions - Votre code de vérification : {{ .Code }}"
+
+[auth.sms.twilio]
+enabled = true
+account_sid = "env(TWILIO_ACCOUNT_SID)"
+message_service_sid = "env(TWILIO_MESSAGE_SERVICE_SID)"
+auth_token = "env(TWILIO_AUTH_TOKEN)"
+
+[auth.web3.solana]
+enabled = true
+
+[auth.web3.ethereum]
+enabled = true
+
+[functions.secure-payment-init]
+verify_jwt = true
+
+[functions.secure-payment-validate]
+verify_jwt = false
+
+
+[functions.admin-release-funds]
+verify_jwt = true
+
+[functions.calculate-delivery-distances]
+verify_jwt = false
+
+[functions.send-delivery-notification]
+verify_jwt = false
+
+[functions.create-product]
+verify_jwt = true
+
+[functions.subscription-webhook]
+verify_jwt = false
+
+[functions.subscription-expiry-check]
+verify_jwt = false
+
+[functions.renew-subscription]
+verify_jwt = true
+
+[functions.generate-unique-id]
+verify_jwt = false
+
+[functions.wallet-operations]
+verify_jwt = true
+
+[functions.send-bureau-access-email]
+verify_jwt = false
+
+[functions.taxi-accept-ride]
+verify_jwt = true
+
+[functions.taxi-refuse-ride]
+verify_jwt = true
+
+[functions.taxi-payment]
+verify_jwt = true
+
+[functions.taxi-payment-process]
+verify_jwt = true
+
+[functions.pdg-ai-assistant]
+verify_jwt = true
+
+[functions.ai-copilot]
+verify_jwt = true
+
+[functions.ai-error-analyzer]
+verify_jwt = true
+
+[functions.detect-anomalies]
+verify_jwt = true
+
+[functions.security-incident-response]
+verify_jwt = true
+
+[functions.security-block-ip]
+verify_jwt = true
+
+[functions.security-detect-anomaly]
+verify_jwt = true
+
+[functions.google-cloud-test]
+verify_jwt = false
+
+[functions.verify-bureau-token]
+verify_jwt = false
+
+[functions.generate-bureau-token]
+verify_jwt = true
+
+[functions.geocode-address]
+verify_jwt = false
+
+[functions.mapbox-proxy]
+verify_jwt = false
+
+[functions.get-agent-users]
+verify_jwt = true
+
+[functions.create-user-by-agent]
+verify_jwt = true
+
+[functions.create-sub-agent]
+verify_jwt = true
+
+[functions.agent-toggle-user-status]
+verify_jwt = true
+
+[functions.agent-delete-user]
+verify_jwt = true
+
+[functions.delete-user]
+verify_jwt = false
+
+[functions.check-all-services]
+verify_jwt = false
+
+[functions.calculate-route]
+verify_jwt = false
+
+[functions.google-maps-config]
+verify_jwt = true
+
+[functions.competitive-analysis]
+verify_jwt = true
+
+[functions.security-analysis]
+verify_jwt = true
+
+[functions.communication-handler]
+verify_jwt = true
+
+[functions.escrow-create]
+verify_jwt = false
+
+[functions.escrow-create-stripe]
+verify_jwt = true
+
+[functions.escrow-release]
+verify_jwt = true
+
+[functions.escrow-refund]
+verify_jwt = true
+
+[functions.escrow-stripe-webhook]
+verify_jwt = false
+
+[functions.escrow-auto-release]
+verify_jwt = false
+
+[functions.confirm-delivery]
+verify_jwt = true
+
+[functions.dispute-create]
+verify_jwt = true
+
+[functions.dispute-respond]
+verify_jwt = true
+
+[functions.dispute-ai-arbitrate]
+verify_jwt = true
+
+[functions.dispute-resolve]
+verify_jwt = true
+
+[functions.generate-product-image]
+verify_jwt = true
+
+[functions.enhance-product-image]
+verify_jwt = true
+
+[functions.generate-similar-image]
+verify_jwt = true
+
+[functions.generate-product-description]
+verify_jwt = false
+
+[functions.vendor-agent-get-products]
+verify_jwt = false
+
+[functions.cancel-order]
+verify_jwt = true
+
+[functions.request-refund]
+verify_jwt = true
+
+[functions.create-pdg-agent]
+verify_jwt = true
+
+[functions.delete-pdg-agent]
+verify_jwt = true
+
+[functions.create-contract]
+verify_jwt = true
+
+[functions.generate-contract-with-ai]
+verify_jwt = true
+
+[functions.generate-contract-pdf]
+verify_jwt = true
+
+[functions.ai-contract-assistant]
+verify_jwt = true
+
+[functions.notify-vendor-delivery-complete]
+verify_jwt = true
+
+[functions.upload-bureau-stamp]
+verify_jwt = false
+
+[functions.google-places-autocomplete]
+verify_jwt = false
+
+[functions.generate-product-image-openai]
+verify_jwt = false
+
+[functions.test-gemini-api]
+verify_jwt = false
+
+[functions.pubsub-publish]
+verify_jwt = false
+
+[functions.pubsub-subscribe]
+verify_jwt = false
+
+[functions.pubsub-manage]
+verify_jwt = false
+
+[functions.firebase-config]
+verify_jwt = false
+
+[functions.pdg-update-agent-email]
+verify_jwt = true
+
+[functions.create-vendor-agent]
+verify_jwt = true
+
+[functions.update-vendor-agent-email]
+verify_jwt = true
+
+[functions.create-bureau-with-auth]
+verify_jwt = true
+
+[functions.update-bureau-email]
+verify_jwt = true
+
+[functions.ml-fraud-detection]
+verify_jwt = true
+
+[functions.get-google-secret]
+verify_jwt = true
+
+[functions.gcs-signed-url]
+verify_jwt = true
+
+[functions.gcs-upload-complete]
+verify_jwt = true
+
+[functions.test-google-cloud-api]
+verify_jwt = false
+
+[functions.cleanup-cache-errors]
+verify_jwt = false
+
+[functions.geo-detect]
+verify_jwt = false
+
+[functions.wallet-transfer]
+verify_jwt = false
+
+[functions.client-ai-assistant]
+verify_jwt = true
+
+[functions.vendor-ai-assistant]
+verify_jwt = true
+
+[functions.generate-pdf]
+verify_jwt = true
+
+[functions.waap-protect]
+verify_jwt = false
+
+[functions.stripe-create-payment-intent]
+verify_jwt = true
+
+[functions.payment-core]
+verify_jwt = true
+
+[functions.create-payment-intent]
+verify_jwt = true
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.stripe-pos-payment]
+verify_jwt = true
+
+[functions.stripe-deposit]
+verify_jwt = true
+
+[functions.stripe-withdrawal]
+verify_jwt = true
+
+[functions.mobile-money-withdrawal]
+verify_jwt = true
+
+[functions.get-user-activity]
+verify_jwt = false
+
+[functions.wallet-audit]
+verify_jwt = false
+
+[functions.validate-purchase]
+verify_jwt = true
+
+[functions.generate-purchase-pdf]
+verify_jwt = true
+
+[functions.og-meta]
+verify_jwt = false
+
+[functions.short-link]
+verify_jwt = false
+
+[functions.paypal-deposit]
+verify_jwt = false
+
+[functions.paypal-withdrawal]
+verify_jwt = false
+
+[functions.paypal-client-id]
+verify_jwt = false
+
+[functions.cognito-sync-session]
+verify_jwt = false
+
+[functions.cognito-auth-proxy]
+verify_jwt = false
+
+[functions.ai-recommend]
+verify_jwt = false
+
+[functions.wallet-payment-api]
+verify_jwt = false
+
+[functions.process-digital-renewals]
+verify_jwt = false
+
+[functions.sync-to-cloudsql]
+verify_jwt = false
+
+[functions.create-short-link]
+verify_jwt = false
+
+[functions.resolve-short-link]
+verify_jwt = false
+
+[functions.resolve-payment-link]
+verify_jwt = false
+
+[functions.process-payment-link]
+verify_jwt = false
+
+[functions.phone-auth-setup]
+verify_jwt = false
+
+[functions.phone-send-otp]
+verify_jwt = false
+
+[functions.phone-verify-otp]
+verify_jwt = false
+
+[functions.phone-signup-send]
+verify_jwt = false
+
+[functions.phone-signup-verify]
+verify_jwt = false

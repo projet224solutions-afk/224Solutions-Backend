@@ -1,0 +1,52 @@
+# ==================================================================
+# Backend 224SOLUTIONS — déploiement VPS AWS (EC2) via Docker Compose
+#
+# Démarrage mono-instance (le plus simple pour un VPS) :
+#   - service "backend" : API HTTP + jobs de fond (RUN_BACKGROUND_JOBS=true dans .env)
+#   - service "redis"   : cache / rate-limiting / locks (auto-hébergé)
+#
+# Si tu utilises Redis managé (Upstash / ElastiCache) :
+#   1. mets REDIS_URL=... dans .env
+#   2. supprime le service "redis" + la ligne depends_on ci-dessous
+#
+# Lancer :   docker compose up -d --build
+# Logs   :   docker compose logs -f backend
+# Stop   :   docker compose down
+# ==================================================================
+services:
+  backend:
+    build: .
+    image: backend-224solutions:latest
+    container_name: backend-224solutions
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Surcharge : pointe le backend vers le Redis du compose.
+      # (ignoré si REDIS_URL est défini dans .env)
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "3001:3001"          # exposé localement ; mettre Nginx/ALB devant pour le TLS
+    volumes:
+      - ./uploads:/app/uploads   # fichiers uploadés persistants
+      - ./logs:/app/logs         # logs persistants
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-224solutions
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

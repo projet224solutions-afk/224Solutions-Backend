@@ -1,0 +1,5 @@
+# Forcer les fins de ligne LF pour les fichiers exécutés sous Linux (EC2)
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf

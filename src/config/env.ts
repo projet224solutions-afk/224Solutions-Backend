@@ -1,0 +1,205 @@
+/**
+ * 🔧 ENVIRONMENT CONFIGURATION
+ * Validation et typage des variables d'environnement
+ * Aucun fallback sur les secrets critiques
+ */
+
+// dotenv.config() appelé dans server.ts
+// NB : ne JAMAIS logguer la valeur d'un secret (ni même l'URL Supabase en clair).
+// La validation/synthèse au démarrage se fait via assertSecretsOnBoot() (plus bas),
+// appelée dans server.ts — sortie redacted uniquement.
+
+function requireEnv(key: string): string {
+  const value = process.env[key];
+  if (!value) {
+    throw new Error(`❌ CRITICAL: Missing required environment variable: ${key}`);
+  }
+  return value;
+}
+
+function optionalEnv(key: string, defaultValue: string): string {
+  return process.env[key] || defaultValue;
+}
+
+function optionalEnvInt(key: string, defaultValue: number): number {
+  const val = process.env[key];
+  return val ? parseInt(val, 10) : defaultValue;
+}
+
+const defaultUploadPath = process.env.VERCEL ? '/tmp/uploads' : './uploads';
+
+export const env = {
+  // Server
+  NODE_ENV: optionalEnv('NODE_ENV', 'development'),
+  PORT: optionalEnvInt('PORT', 3001),
+
+  // Supabase (required)
+  SUPABASE_URL: requireEnv('SUPABASE_URL'),
+  SUPABASE_SERVICE_ROLE_KEY: requireEnv('SUPABASE_SERVICE_ROLE_KEY'),
+  SUPABASE_ANON_KEY: optionalEnv('SUPABASE_ANON_KEY', ''),
+
+  // Security
+  INTERNAL_API_KEY: optionalEnv('INTERNAL_API_KEY', ''),
+  JWT_SECRET: optionalEnv('JWT_SECRET', ''),
+
+  // 2FA admin (step-up TOTP serveur sur les ops financières sensibles)
+  // ADMIN_MFA_ENFORCED='false' par défaut : transition non-bloquante — un admin SANS
+  // 2FA enrôlé garde l'accès (un avertissement est loggé), le temps que tous enrôlent.
+  // Passer à 'true' une fois les admins enrôlés → l'accès aux ops sensibles EXIGE la 2FA.
+  ADMIN_MFA_ENFORCED: optionalEnv('ADMIN_MFA_ENFORCED', 'false') === 'true',
+  // Clé de chiffrement du secret TOTP au repos (repli sur d'autres secrets serveur déjà
+  // présents — jamais en clair, jamais côté client). Dérivée en clé 32 octets (scrypt).
+  MFA_ENCRYPTION_KEY: optionalEnv(
+    'MFA_ENCRYPTION_KEY',
+    process.env.CCP_ENCRYPTION_KEY || process.env.TRANSACTION_SECRET_KEY || process.env.JWT_SECRET || ''
+  ),
+
+  // Secrets d'intégration (paiements / cloud) — centralisés ici, jamais en dur.
+  // Optionnels au boot (warn), mais requis fonctionnellement quand le service est utilisé.
+  STRIPE_SECRET_KEY: optionalEnv('STRIPE_SECRET_KEY', ''),
+  STRIPE_WEBHOOK_SECRET: optionalEnv('STRIPE_WEBHOOK_SECRET', ''),
+  PAYPAL_CLIENT_SECRET: optionalEnv('PAYPAL_CLIENT_SECRET', ''),
+  TRANSACTION_SECRET_KEY: optionalEnv('TRANSACTION_SECRET_KEY', ''),
+  CCP_ENCRYPTION_KEY: optionalEnv('CCP_ENCRYPTION_KEY', ''),
+  RESEND_API_KEY: optionalEnv('RESEND_API_KEY', ''),
+  TWILIO_ACCOUNT_SID: optionalEnv('TWILIO_ACCOUNT_SID', ''),
+  TWILIO_AUTH_TOKEN: optionalEnv('TWILIO_AUTH_TOKEN', ''),
+  TWILIO_PHONE_NUMBER: optionalEnv('TWILIO_PHONE_NUMBER', ''),
+  TWILIO_MESSAGING_SERVICE_SID: optionalEnv('TWILIO_MESSAGING_SERVICE_SID', ''),
+
+  // OAuth (Google)
+  OAUTH_CLIENT_ID: optionalEnv('OAUTH_CLIENT_ID', ''),
+  OAUTH_CLIENT_SECRET: optionalEnv('OAUTH_CLIENT_SECRET', ''),
+  OAUTH_REDIRECT_URI: optionalEnv('OAUTH_REDIRECT_URI', ''),
+
+  // CORS
+  CORS_ORIGINS: optionalEnv(
+    'CORS_ORIGINS',
+    'http://localhost,http://localhost:3000,http://localhost:5173,http://localhost:8080,http://127.0.0.1:3000,http://127.0.0.1:5173,http://127.0.0.1:8080,http://[::1]:3000,http://[::1]:5173,http://[::1]:8080,https://localhost:5173,capacitor://localhost,ionic://localhost,https://224solution.net,https://www.224solution.net,https://*.224solution.net'
+  ),
+
+  // CSP
+  CSP_CONNECT_SRC: optionalEnv('CSP_CONNECT_SRC', ''),
+
+  // Rate limiting
+  RATE_LIMIT_WINDOW_MS: optionalEnvInt('RATE_LIMIT_WINDOW_MS', 60000),
+  RATE_LIMIT_MAX_REQUESTS: optionalEnvInt('RATE_LIMIT_MAX_REQUESTS', 10000),
+
+  // Uploads
+  MAX_FILE_SIZE: optionalEnvInt('MAX_FILE_SIZE', 10 * 1024 * 1024),
+  UPLOAD_PATH: optionalEnv('UPLOAD_PATH', defaultUploadPath),
+
+  // Logging
+  LOG_LEVEL: optionalEnv('LOG_LEVEL', 'info'),
+  LOG_FILE: optionalEnv('LOG_FILE', './logs/backend.log'),
+
+  // Cron
+  ENABLE_CRON_JOBS: optionalEnv('ENABLE_CRON_JOBS', 'true') === 'true',
+
+  // Feature flags
+  ENABLE_MONITORING: optionalEnv('ENABLE_MONITORING', 'true') === 'true',
+
+  // Scaling horizontal (ECS Fargate) : les tâches de fond (file de jobs + surveillance 24/7)
+  // ne doivent tourner que sur UN worker, pas dans chaque conteneur web (sinon doublons).
+  // Défaut 'true' = comportement actuel inchangé. Mettre 'false' sur le service WEB,
+  // 'true' sur le service WORKER unique. (Un verrou Redis sert en plus de garde-fou.)
+  RUN_BACKGROUND_JOBS: optionalEnv('RUN_BACKGROUND_JOBS', 'true') === 'true',
+
+  get isProduction(): boolean {
+    return this.NODE_ENV === 'production';
+  },
+
+  get isDevelopment(): boolean {
+    return this.NODE_ENV === 'development';
+  },
+
+  get corsOrigins(): string[] {
+    const defaults = [
+      'http://localhost',
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:8080',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:5173',
+      'http://127.0.0.1:8080',
+      'http://[::1]:3000',
+      'http://[::1]:5173',
+      'http://[::1]:8080',
+      'https://localhost:5173',
+      'capacitor://localhost',
+      'ionic://localhost',
+      'https://224solution.net',
+      'https://www.224solution.net',
+      'https://*.224solution.net',
+    ];
+
+    return [...new Set([
+      ...defaults,
+      ...this.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean),
+    ])];
+  },
+
+  get oauthConfigured(): boolean {
+    return Boolean(this.OAUTH_CLIENT_ID && this.OAUTH_CLIENT_SECRET && this.OAUTH_REDIRECT_URI);
+  }
+} as const;
+
+// ─────────────────────────────────────────────────────────────────────
+// SEAM VAULT : point d'indirection unique pour récupérer un secret.
+// Aujourd'hui : variables d'environnement. Demain : brancher ici un vrai
+// coffre (Supabase Vault / AWS Secrets Manager / HashiCorp Vault) sans
+// toucher au reste du code — il suffira de remplacer l'implémentation.
+// ─────────────────────────────────────────────────────────────────────
+export function getSecret(key: string, opts: { required?: boolean } = {}): string {
+  const value = process.env[key] || '';
+  if (!value && opts.required) {
+    throw new Error(`❌ CRITICAL: secret manquant: ${key}`);
+  }
+  return value;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// VALIDATION AU DÉMARRAGE (appelée dans server.ts)
+//  - fail-fast en PRODUCTION sur les anomalies dangereuses (secret faible) ;
+//  - avertissements clairs (redacted) pour les secrets manquants/recommandés.
+//  - N'imprime JAMAIS la valeur d'un secret.
+// ─────────────────────────────────────────────────────────────────────
+export function assertSecretsOnBoot(): void {
+  const isProd = env.isProduction;
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // JWT_SECRET : sert de repli de vérification quand Supabase Auth est indisponible.
+  // Un secret FAIBLE est PIRE qu'absent (tokens forgeables en HS256) → bloquant en prod.
+  if (process.env.JWT_SECRET) {
+    if (process.env.JWT_SECRET.length < 32) {
+      (isProd ? errors : warnings).push('JWT_SECRET trop court (<32 caractères) — repli d\'auth forgeable');
+    }
+  } else {
+    warnings.push('JWT_SECRET absent — le repli d\'auth local est désactivé (OK si Supabase Auth fiable)');
+  }
+
+  // Clé d'API interne (routes machine-à-machine)
+  if (process.env.INTERNAL_API_KEY) {
+    if (process.env.INTERNAL_API_KEY.length < 16) {
+      (isProd ? errors : warnings).push('INTERNAL_API_KEY trop courte (<16 caractères)');
+    }
+  } else {
+    warnings.push('INTERNAL_API_KEY absente — routes internes inutilisables');
+  }
+
+  // Secrets de paiement recommandés (warn — requis seulement si le service est actif)
+  for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']) {
+    if (!process.env[k]) warnings.push(`${k} absent — paiements ${k.includes('WEBHOOK') ? 'webhook ' : ''}Stripe indisponibles`);
+  }
+
+  for (const w of warnings) console.warn(`[secrets] ⚠️  ${w}`);
+
+  if (errors.length) {
+    for (const e of errors) console.error(`[secrets] ❌ ${e}`);
+    throw new Error(`Secrets invalides en production (${errors.length}). Démarrage interrompu.`);
+  }
+
+  // Synthèse redacted (aucune valeur affichée)
+  console.log(`[secrets] ✅ Validation OK (env=${env.NODE_ENV}, warnings=${warnings.length})`);
+}

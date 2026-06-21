@@ -1,7 +1,14 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { authenticateInternal } from "../middlewares/auth.js";
 
 const router = Router();
+
+// 🔒 SÉCURITÉ : toutes les routes de migration exécutent des opérations DB
+// privilégiées via service_role (ALTER TABLE, DROP CONSTRAINT, exec_sql…).
+// Elles DOIVENT être réservées aux appels internes authentifiés
+// (header X-Internal-API-Key) et jamais accessibles à un client anonyme.
+router.use(authenticateInternal);
 
 // Initialize Supabase client with service role key
 const supabase = createClient(

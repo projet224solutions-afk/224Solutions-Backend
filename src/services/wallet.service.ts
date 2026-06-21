@@ -303,48 +303,29 @@ export async function creditWallet(
     // 'credit' n'est pas une valeur d'enum valide → on mappe vers 'deposit'.
     const txType = transactionType === 'credit' ? 'deposit' : transactionType;
 
-    // Crédit ATOMIQUE + PLAFOND/QUARANTAINE (AML) via le primitif unique credit_user_wallet_safe :
-    // il verrouille/crée le wallet, applique le plafond de détention et met l'excédent en quarantaine.
-    const { data: res, error: rpcError } = await supabaseAdmin.rpc('credit_user_wallet_safe', {
+    // Crédit AML + ledger ATOMIQUES via RPC SQL (1 transaction : si le ledger échoue, le crédit
+    // ET sa quarantaine sont rollback → aucun crédit orphelin). credit_user_wallet_safe (verrou
+    // wallet + plafond de détention + quarantaine de l'excédent) est appelée DANS la transaction.
+    const { data: res, error: rpcError } = await supabaseAdmin.rpc('execute_atomic_deposit', {
       p_user_id: userId,
       p_amount: amount,
-      p_from_currency: null,        // null = devise du wallet (pas de conversion sur un dépôt)
+      p_description: description,
+      p_reference: reference,
       p_source_type: txType,
-      p_source_txn_id: reference,
     });
 
-    if (rpcError || !res) {
+    if (rpcError || !(res as any)?.success) {
       await releaseLock();
-      logger.error(`[Wallet] credit_user_wallet_safe failed: ${rpcError?.message || 'no result'}`);
-      return { success: false, error: rpcError?.message || 'Crédit impossible' };
+      logger.error(`[Wallet] execute_atomic_deposit failed: ${(res as any)?.error || rpcError?.message || 'no result'}`);
+      return { success: false, error: (res as any)?.error || rpcError?.message || 'Crédit impossible' };
     }
 
     const credited = Number((res as any).credited || 0);
     const quarantined = Number((res as any).quarantined || 0);
     const walletId = (res as any).wallet_id;
-    const walletCur = (res as any).currency || 'GNF';
-
-    // Journal transaction (le solde a déjà été crédité atomiquement ; net_amount = part dépensable).
-    const { error: txErr } = await supabaseAdmin.from('wallet_transactions').insert({
-      transaction_id: randomUUID(),
-      sender_wallet_id: null,
-      receiver_wallet_id: walletId,
-      sender_user_id: null,
-      receiver_user_id: userId,
-      transaction_type: txType,
-      amount,
-      net_amount: credited,
-      status: 'completed',
-      currency: walletCur,
-      description,
-      metadata: { reference, source: 'backend-node', quarantined },
-    });
-    if (txErr) {
-      logger.error(`[Wallet] credit history insert failed (solde déjà crédité): ${txErr.message}`);
-    }
 
     const { data: w } = await supabaseAdmin.from('wallets').select('balance').eq('id', walletId).maybeSingle();
-    logger.info(`[Wallet] Credited via credit_user_wallet_safe: user=${userId}, credited=${credited}, quarantined=${quarantined}`);
+    logger.info(`[Wallet] Credited (atomic RPC): user=${userId}, credited=${credited}, quarantined=${quarantined}`);
     return { success: true, newBalance: w?.balance, quarantined };
   } catch (err: any) {
     logger.error(`[Wallet] creditWallet error: ${err.message}`);

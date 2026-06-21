@@ -120,6 +120,75 @@ const DETAILS: Record<string, DetailFetcher> = {
       days_overdue: Math.max(0, Math.floor((Date.now() - new Date(s.due_date).getTime()) / 864e5)),
     }));
   },
+
+  // ESCROW — escrow > sous-total produit (commission acheteur glissée → vendeur sur-payé).
+  // Détail EXACT : n° commande, montant escrow, sous-total, écart (= fuite), date. Aligné sur le moniteur (30j).
+  escrow_amount_mismatch: async () => {
+    const since = new Date(Date.now() - 30 * 864e5).toISOString();
+    const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
+      .select('id, order_id, amount, currency, status, created_at, receiver_id, seller_id')
+      .gte('created_at', since).order('created_at', { ascending: false }).limit(500);
+    const ids = [...new Set((escrows || []).map((e: any) => e.order_id).filter(Boolean))];
+    const orders = new Map<string, any>();
+    for (let i = 0; i < ids.length; i += 100) {
+      const { data: os } = await supabaseAdmin.from('orders').select('id, order_number, subtotal').in('id', ids.slice(i, i + 100));
+      for (const o of os || []) orders.set(o.id, o);
+    }
+    const out: any[] = [];
+    for (const e of escrows || []) {
+      const o = orders.get(e.order_id);
+      if (o && o.subtotal != null && Number(e.amount) > Number(o.subtotal) + 0.01) {
+        out.push({
+          escrow_id: e.id, order_number: o.order_number, status: e.status, currency: e.currency,
+          escrow_amount: e.amount, order_subtotal: o.subtotal,
+          ecart_fuite: Number(e.amount) - Number(o.subtotal),
+          created_at: e.created_at, vendeur: await enrichUser(e.receiver_id || e.seller_id),
+        });
+        if (out.length >= 50) break;
+      }
+    }
+    return out;
+  },
+
+  // ESCROW — libérations passées par l'Edge cassée (transaction_type='payment' + "Libération escrow").
+  non_converted_releases: async () => {
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const { data } = await supabaseAdmin.from('wallet_transactions')
+      .select('id, created_at, amount, currency, description, receiver_user_id, metadata')
+      .eq('transaction_type', 'payment').like('description', 'Libération escrow%')
+      .gte('created_at', since).order('created_at', { ascending: false }).limit(50);
+    return Promise.all((data || []).map(async (w: any) => ({ ...w, beneficiaire: await enrichUser(w.receiver_user_id) })));
+  },
+
+  // ESCROW — libéré sans ligne d'historique (atomicité). Liste les escrows released (7j) sans wallet_transaction.
+  released_no_ledger: async () => {
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
+      .select('id, order_id, amount, currency, status, released_at, receiver_id, seller_id')
+      .eq('status', 'released').gte('released_at', since).order('released_at', { ascending: false }).limit(200);
+    const out: any[] = [];
+    for (const e of escrows || []) {
+      const { count } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'escrow_release').or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
+      if (!count) { out.push({ ...e, vendeur: await enrichUser(e.receiver_id || e.seller_id) }); if (out.length >= 50) break; }
+    }
+    return out;
+  },
+
+  // ESCROW — taux BCRG (GNF) non rafraîchis > 24h : montre quelles paires sont périmées et depuis quand.
+  stale_rates: async () => {
+    const cutoff = new Date(Date.now() - 24 * 3600e3).toISOString();
+    const { data } = await supabaseAdmin.from('currency_exchange_rates')
+      .select('id, from_currency, to_currency, rate, source_type, retrieved_at, is_active')
+      .eq('is_active', true).or('from_currency.eq.GNF,to_currency.eq.GNF')
+      .lt('retrieved_at', cutoff).order('retrieved_at', { ascending: true }).limit(50);
+    return (data || []).map((r: any) => ({
+      ...r,
+      paire: `${r.from_currency}/${r.to_currency}`,
+      heures_depuis_maj: Math.floor((Date.now() - new Date(r.retrieved_at).getTime()) / 3600e3),
+    }));
+  },
 };
 
 /**

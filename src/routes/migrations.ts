@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { authenticateInternal } from "../middlewares/auth.js";
+import { logger } from "../config/logger.js";
 
 const router = Router();
 
@@ -34,7 +35,7 @@ router.post(
   "/apply-type-agent",
   async (req: Request, res: Response<MigrationResult>) => {
     try {
-      console.log("🔄 Starting type_agent migration...");
+      logger.info("Starting type_agent migration...");
 
       // Step 1: Check if column already exists
       const { data: columns, error: checkError } = await supabase
@@ -44,7 +45,7 @@ router.post(
         .eq("column_name", "type_agent");
 
       if (checkError) {
-        console.error("Error checking column:", checkError);
+        logger.error("Error checking column:", checkError);
       }
 
       if (columns && columns.length > 0) {
@@ -56,7 +57,7 @@ router.post(
       }
 
       // Step 2: Try to add column via RPC (if exec_sql exists)
-      console.log("Adding type_agent column...");
+      logger.info("Adding type_agent column...");
       let addError: { message?: string } | null = null;
       try {
         const addResponse = await supabase.rpc("exec_sql", {
@@ -71,18 +72,18 @@ router.post(
       }
 
       // Step 3: Update existing rows
-      console.log("Updating existing agents...");
+      logger.info("Updating existing agents...");
       const { error: updateError } = await supabase
         .from("agents_management")
         .update({ type_agent: "principal" } as any)
         .is("type_agent", null);
 
       if (updateError && !updateError.message.includes("column")) {
-        console.warn("Update warning:", updateError);
+        logger.warn("Update warning:", updateError);
       }
 
       // Step 4: Try to add constraint
-      console.log("Adding CHECK constraint...");
+      logger.info("Adding CHECK constraint...");
       try {
         await supabase.rpc("exec_sql", {
           sql_string: `
@@ -99,7 +100,7 @@ router.post(
       }
 
       // Step 5: Verify migration
-      console.log("Verifying migration...");
+      logger.info("Verifying migration...");
       const { data: verification, error: verifyError } = await supabase
         .from("agents_management")
         .select("id, type_agent")
@@ -114,8 +115,8 @@ router.post(
       }
 
       if (verification && verification[0]) {
-        console.log(
-          "✅ Migration verified - type_agent column exists and is accessible"
+        logger.info(
+          "Migration verified - type_agent column exists and is accessible"
         );
         return res.status(200).json({
           success: true,
@@ -131,7 +132,7 @@ router.post(
           "Try running the SQL manually in Supabase Studio SQL Editor",
       });
     } catch (error) {
-      console.error("Migration error:", error);
+      logger.error("Migration error:", error);
       return res.status(500).json({
         success: false,
         message: "Migration error",

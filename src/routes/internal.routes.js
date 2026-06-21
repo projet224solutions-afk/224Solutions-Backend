@@ -22,13 +22,17 @@ router.post('/trigger-job', async (req, res) => {
 
     logger.info(`Internal job triggered: ${jobType}`);
 
-    // TODO: Implémenter le système de jobs
-
-    res.json({
-      success: true,
-      message: 'Job triggered successfully',
-      jobType,
-      jobId: Date.now().toString()
+    // Enfile via la file de jobs (Redis/BullMQ) si configurée, sinon 501 honnête.
+    if (process.env.REDIS_URL && jobType) {
+      const { jobQueue } = await import('../jobs/jobQueue.js');
+      await jobQueue.enqueue(jobType, payload || {});
+      logger.info(`Internal job enqueued: ${jobType}`);
+      return res.json({ success: true, message: 'Job déclenché', jobType });
+    }
+    logger.warn(`Internal job non disponible: ${jobType}`);
+    return res.status(501).json({
+      success: false,
+      error: `Job "${jobType}" non disponible — file de jobs (Redis) non configurée ou jobType manquant`,
     });
   } catch (error) {
     logger.error(`Internal job error: ${error.message}`);
@@ -49,12 +53,9 @@ router.post('/process-batch', async (req, res) => {
 
     logger.info(`Batch processing started: ${operation}`);
 
-    // TODO: Implémenter traitement batch
-
-    res.json({
-      success: true,
-      message: 'Batch processed',
-      processed: data?.length || 0
+    return res.status(501).json({
+      success: false,
+      error: 'Traitement batch non encore implémenté',
     });
   } catch (error) {
     logger.error(`Batch processing error: ${error.message}`);

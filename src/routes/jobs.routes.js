@@ -22,13 +22,15 @@ router.post('/process-images', requireRole('admin', 'vendeur'), async (req, res)
 
     logger.info(`Image processing job started by ${req.user.id}`);
 
-    // TODO: Implémenter traitement d'images avec Sharp
-
-    res.json({
-      success: true,
-      message: 'Images queued for processing',
-      jobId: Date.now().toString(),
-      count: images?.length || 0
+    // Enfile le job si la file (Redis/BullMQ) est configurée, sinon 501 honnête (pas de faux succès).
+    if (process.env.REDIS_URL) {
+      const { jobQueue } = await import('../jobs/jobQueue.js');
+      await jobQueue.enqueue('process-images', { images, operations, userId: req.user.id });
+      return res.json({ success: true, message: 'Job d\'images enfilé', count: images?.length || 0 });
+    }
+    return res.status(501).json({
+      success: false,
+      error: 'Traitement d\'images non disponible — file de jobs (Redis) non configurée',
     });
   } catch (error) {
     logger.error(`Image processing error: ${error.message}`);
@@ -49,13 +51,10 @@ router.post('/generate-reports', requireRole('admin', 'vendeur'), async (req, re
 
     logger.info(`Report generation started: ${reportType} by ${req.user.id}`);
 
-    // TODO: Implémenter génération de rapports
-
-    res.json({
-      success: true,
-      message: 'Report generation started',
-      jobId: Date.now().toString(),
-      reportType
+    return res.status(501).json({
+      success: false,
+      error: 'Génération de rapports non encore implémentée',
+      hint: 'Utiliser les exports CSV depuis le dashboard PDG',
     });
   } catch (error) {
     logger.error(`Report generation error: ${error.message}`);
@@ -74,14 +73,7 @@ router.get('/:jobId/status', async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    // TODO: Implémenter vérification de statut avec Redis/Bull
-
-    res.json({
-      success: true,
-      jobId,
-      status: 'processing',
-      progress: 50
-    });
+    return res.status(501).json({ success: false, error: 'Statut jobs non disponible' });
   } catch (error) {
     res.status(500).json({
       success: false,

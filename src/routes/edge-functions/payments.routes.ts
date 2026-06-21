@@ -13,6 +13,7 @@
 import { Router, Request, Response, raw } from "express";
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
+import { logger } from "../../config/logger.js";
 
 const router = Router();
 
@@ -203,7 +204,7 @@ router.post("/stripe-deposit", validateBearerToken, async (req: any, res: Respon
       .single();
 
     if (insertError) {
-      console.error("[payments/stripe-deposit] transaction insert error:", insertError.message);
+      logger.error("[payments/stripe-deposit] transaction insert error:", insertError.message);
     }
 
     return res.json({
@@ -220,7 +221,7 @@ router.post("/stripe-deposit", validateBearerToken, async (req: any, res: Respon
       netAmount,
     });
   } catch (error) {
-    console.error("[payments/stripe-deposit] Error:", error);
+    logger.error("[payments/stripe-deposit] Error:", error);
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Deposit creation failed",
@@ -273,7 +274,7 @@ router.post("/confirm-stripe-deposit", validateBearerToken, async (req: any, res
         last4 = charge.payment_method_details?.card?.last4 || null;
         cardBrand = charge.payment_method_details?.card?.brand || null;
       } catch (chargeError) {
-        console.error("[payments/confirm-stripe-deposit] charge lookup error:", chargeError);
+        logger.error("[payments/confirm-stripe-deposit] charge lookup error:", chargeError);
       }
     }
 
@@ -357,7 +358,7 @@ router.post("/confirm-stripe-deposit", validateBearerToken, async (req: any, res
       result: depositResult,
     });
   } catch (error) {
-    console.error("[payments/confirm-stripe-deposit] Error:", error);
+    logger.error("[payments/confirm-stripe-deposit] Error:", error);
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Deposit confirmation failed",
@@ -401,7 +402,7 @@ router.post("/stripe/intent", async (req: Request, res: Response) => {
       intent_id: intent.id,
     });
   } catch (error) {
-    console.error("[payment/stripe/intent] Error:", error);
+    logger.error("[payment/stripe/intent] Error:", error);
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Payment intent failed",
@@ -428,7 +429,7 @@ router.post("/stripe/webhook", raw({ type: "application/json" }), async (req: Re
     try {
       event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
     } catch (err) {
-      console.error("[stripe/webhook] Invalid signature:", err);
+      logger.error("[stripe/webhook] Invalid signature:", err);
       return res.status(400).json({ error: "Invalid signature" });
     }
 
@@ -436,7 +437,7 @@ router.post("/stripe/webhook", raw({ type: "application/json" }), async (req: Re
     switch (event.type) {
       case "payment_intent.succeeded":
         const pi = event.data.object as Stripe.PaymentIntent;
-        console.log(`[stripe/webhook] Payment succeeded: ${pi.id}`);
+        logger.info(`[stripe/webhook] Payment succeeded: ${pi.id}`);
         // Update order status in DB
         await supabase
           .from("orders")
@@ -450,7 +451,7 @@ router.post("/stripe/webhook", raw({ type: "application/json" }), async (req: Re
 
       case "payment_intent.payment_failed":
         const fpi = event.data.object as Stripe.PaymentIntent;
-        console.log(`[stripe/webhook] Payment failed: ${fpi.id}`);
+        logger.info(`[stripe/webhook] Payment failed: ${fpi.id}`);
         await supabase
           .from("orders")
           .update({
@@ -462,14 +463,14 @@ router.post("/stripe/webhook", raw({ type: "application/json" }), async (req: Re
 
       case "customer.subscription.updated":
       case "customer.subscription.deleted":
-        console.log(`[stripe/webhook] Subscription event: ${event.type}`);
+        logger.info(`[stripe/webhook] Subscription event: ${event.type}`);
         // Handle subscription updates
         break;
     }
 
     return res.status(200).json({ received: true });
   } catch (error) {
-    console.error("[payment/stripe/webhook] Error:", error);
+    logger.error("[payment/stripe/webhook] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Webhook processing failed",
@@ -534,7 +535,7 @@ router.post("/stripe/deposit", async (req: Request, res: Response) => {
       deposit_id: deposit.id,
     });
   } catch (error) {
-    console.error("[payment/stripe/deposit] Error:", error);
+    logger.error("[payment/stripe/deposit] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Deposit creation failed",
@@ -547,37 +548,111 @@ router.post("/stripe/deposit", async (req: Request, res: Response) => {
  * Handle PayPal Webhooks
  * Replaces: supabase/functions/payment/paypal/webhook
  */
+// ── Helper : vérification signature PayPal via l'API officielle ───────────────
+async function verifyPayPalWebhookSignature(
+  headers: Record<string, string | string[] | undefined>,
+  body: unknown,
+  webhookId: string,
+  paypalClientId: string,
+  paypalClientSecret: string
+): Promise<boolean> {
+  try {
+    const credentials = Buffer.from(`${paypalClientId}:${paypalClientSecret}`).toString('base64');
+    const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials',
+    });
+    if (!tokenRes.ok) return false;
+    const { access_token } = await tokenRes.json() as { access_token: string };
+
+    const verifyRes = await fetch('https://api-m.paypal.com/v1/notifications/verify-webhook-signature', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        auth_algo: headers['paypal-auth-algo'],
+        cert_url: headers['paypal-cert-url'],
+        transmission_id: headers['paypal-transmission-id'],
+        transmission_sig: headers['paypal-transmission-sig'],
+        transmission_time: headers['paypal-transmission-time'],
+        webhook_id: webhookId,
+        webhook_event: body,
+      }),
+    });
+    if (!verifyRes.ok) return false;
+    const { verification_status } = await verifyRes.json() as { verification_status: string };
+    return verification_status === 'SUCCESS';
+  } catch {
+    return false;
+  }
+}
+
 router.post("/paypal/webhook", async (req: Request, res: Response) => {
   try {
-    const { event_type, resource } = req.body;
+    // ── 1. Vérification de signature PayPal (sinon n'importe qui peut injecter un paiement) ──
+    const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+    const paypalClientId = process.env.PAYPAL_CLIENT_ID;
+    const paypalClientSecret = process.env.PAYPAL_CLIENT_SECRET;
 
-    console.log(`[paypal/webhook] Event: ${event_type}`);
+    if (!webhookId || !paypalClientId || !paypalClientSecret) {
+      logger.error('[paypal/webhook] PAYPAL_WEBHOOK_ID / PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET manquant');
+      return res.status(500).json({ error: 'Webhook PayPal non configuré' });
+    }
+
+    const isValid = await verifyPayPalWebhookSignature(
+      req.headers as Record<string, string>,
+      req.body,
+      webhookId,
+      paypalClientId,
+      paypalClientSecret
+    );
+    if (!isValid) {
+      logger.warn('[paypal/webhook] Signature invalide — requête rejetée', {
+        ip: req.ip,
+        transmissionId: req.headers['paypal-transmission-id'],
+      });
+      return res.status(401).json({ error: 'Invalid PayPal webhook signature' });
+    }
+
+    const { event_type, resource } = req.body;
+    logger.info(`[paypal/webhook] Événement validé: ${event_type}`);
 
     switch (event_type) {
-      case "CHECKOUT.ORDER.COMPLETED":
-        // Order completed, update status
-        await supabase
+      case "CHECKOUT.ORDER.COMPLETED": {
+        // ── 2. order_id validé (jamais d'UPDATE sans WHERE → sinon TOUTES les commandes passent payées) ──
+        const orderId = resource?.metadata?.order_id ?? resource?.purchase_units?.[0]?.custom_id;
+        if (!orderId || typeof orderId !== 'string' || orderId.trim() === '') {
+          logger.error('[paypal/webhook] order_id manquant/invalide — aucun UPDATE effectué', { resourceId: resource?.id });
+          return res.status(200).json({ status: 'received', warning: 'order_id missing — no DB update performed' });
+        }
+
+        // ── 3. UPDATE scopé sur un seul order_id + garde-fou status=pending ──
+        const { error: updateError } = await supabase
           .from("orders")
-          .update({
-            status: "paid",
-            paypal_order_id: resource.id,
-            paid_at: new Date().toISOString(),
-          })
-          .eq("id", resource.metadata?.order_id);
+          .update({ status: "paid", paypal_order_id: resource.id, paid_at: new Date().toISOString() })
+          .eq("id", orderId.trim())
+          .eq("status", "pending");
+
+        if (updateError) {
+          logger.error('[paypal/webhook] Erreur UPDATE commande', { orderId, error: updateError.message });
+          return res.status(500).json({ error: 'DB update failed' });
+        }
+        logger.info(`[paypal/webhook] Commande ${orderId} marquée payée`);
         break;
+      }
 
       case "CHECKOUT.ORDER.APPROVED":
-        console.log(`[paypal/webhook] Order approved: ${resource.id}`);
+        logger.info(`[paypal/webhook] Commande approuvée: ${resource?.id}`);
         break;
+
+      default:
+        logger.info(`[paypal/webhook] Événement non géré: ${event_type}`);
     }
 
     return res.status(200).json({ status: "received" });
-  } catch (error) {
-    console.error("[payment/paypal/webhook] Error:", error);
-    return res.status(500).json({
-      success: false,
-      error: "Webhook processing failed",
-    });
+  } catch (error: any) {
+    logger.error("[payment/paypal/webhook] Erreur inattendue:", { message: error?.message });
+    return res.status(500).json({ success: false, error: "Webhook processing failed" });
   }
 });
 
@@ -624,7 +699,7 @@ router.post("/escrow/create", async (req: Request, res: Response) => {
       escrow: escrow,
     });
   } catch (error) {
-    console.error("[escrow/create] Error:", error);
+    logger.error("[escrow/create] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Escrow creation failed",
@@ -699,7 +774,7 @@ router.post("/escrow/release", async (req: Request, res: Response) => {
       message: "Escrow released to seller",
     });
   } catch (error) {
-    console.error("[escrow/release] Error:", error);
+    logger.error("[escrow/release] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Escrow release failed",
@@ -758,7 +833,7 @@ router.post("/wallet/transfer", async (req: Request, res: Response) => {
       message: "Transfer completed",
     });
   } catch (error) {
-    console.error("[wallet/transfer] Error:", error);
+    logger.error("[wallet/transfer] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Transfer failed",
@@ -800,7 +875,7 @@ router.get("/wallet/balance", async (req: Request, res: Response) => {
       wallet,
     });
   } catch (error) {
-    console.error("[wallet/balance] Error:", error);
+    logger.error("[wallet/balance] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Failed to get wallet balance",

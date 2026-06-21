@@ -80,14 +80,11 @@ import marketplaceRoutes from './routes/marketplace.routes.js';
 import coreRoutes from './routes/core.routes.js';
 import campaignRoutes from './routes/campaigns.routes.js';
 import webhookRoutes from './routes/webhooks.routes.js';
-// @ts-ignore
 import migrationsRoutes from './routes/migrations.js';
 // @ts-ignore
 import edgeFunctionsRoutes from './routes/edge-functions/index.js';
 
 // Routes legacy JS (auth migré vers auth.routes.ts)
-// @ts-ignore
-import authRoutesLegacy from './routes/auth.routes.js';
 import authRoutes from './routes/auth.routes.js';
 // @ts-ignore
 import walletRoutes from './routes/wallet.routes.js';

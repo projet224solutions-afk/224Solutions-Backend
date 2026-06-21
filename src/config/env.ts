@@ -171,12 +171,33 @@ export function assertSecretsOnBoot(): void {
 
   // JWT_SECRET : sert de repli de vérification quand Supabase Auth est indisponible.
   // Un secret FAIBLE est PIRE qu'absent (tokens forgeables en HS256) → bloquant en prod.
-  if (process.env.JWT_SECRET) {
-    if (process.env.JWT_SECRET.length < 32) {
-      (isProd ? errors : warnings).push('JWT_SECRET trop court (<32 caractères) — repli d\'auth forgeable');
+  const jwtSecret = process.env.JWT_SECRET || '';
+  if (jwtSecret) {
+    if (jwtSecret.length < 32) {
+      (isProd ? errors : warnings).push(
+        'JWT_SECRET trop court (<32 caractères) — un token forgé peut usurper n\'importe quel utilisateur'
+      );
     }
+  } else if (isProd) {
+    warnings.push(
+      'JWT_SECRET absent en production — si Supabase Auth est indisponible, le fallback JWT est désactivé. ' +
+      'Définir JWT_SECRET (≥32 chars) pour sécuriser la continuité de service.'
+    );
   } else {
-    warnings.push('JWT_SECRET absent — le repli d\'auth local est désactivé (OK si Supabase Auth fiable)');
+    warnings.push('JWT_SECRET absent — repli d\'auth local désactivé (OK si Supabase Auth seul)');
+  }
+
+  // MFA_ENCRYPTION_KEY : si vide, les secrets TOTP sont chiffrés avec '' → trivial à déchiffrer
+  const mfaKey = process.env.MFA_ENCRYPTION_KEY
+    || process.env.CCP_ENCRYPTION_KEY
+    || process.env.TRANSACTION_SECRET_KEY
+    || process.env.JWT_SECRET
+    || '';
+  if (!mfaKey && isProd) {
+    errors.push(
+      'MFA_ENCRYPTION_KEY manquante (et aucun secret de fallback configuré) — ' +
+      'les secrets TOTP admin seraient stockés sans chiffrement. Définir MFA_ENCRYPTION_KEY en production.'
+    );
   }
 
   // Clé d'API interne (routes machine-à-machine)

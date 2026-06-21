@@ -460,14 +460,17 @@ router.post('/search', verifyJWT, async (req: AuthenticatedRequest, res: Respons
 router.get('/history', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const service = String(req.query?.service ?? '');
+    // Les plus RÉCENTS d'abord (sinon, au-delà de la limite, on ne gardait que les
+    // messages les plus ANCIENS et on perdait la conversation récente).
     let q = supabaseAdmin.from('copilot_memory')
       .select('role, content, created_at')
       .eq('user_id', req.user!.id)
-      .order('created_at', { ascending: true })
-      .limit(40);
+      .order('created_at', { ascending: false })
+      .limit(50);
     if (service) q = q.eq('service', service);
     const { data } = await q;
-    res.json({ success: true, history: data || [] });
+    // …puis remis en ordre chronologique pour l'affichage.
+    res.json({ success: true, history: (data || []).reverse() });
   } catch (e: any) {
     logger.warn(`[copilot/history] ${e?.message}`);
     res.json({ success: true, history: [] });

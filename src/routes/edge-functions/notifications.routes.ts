@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
+import { logger } from "../../config/logger.js";
+import { sendSms } from "../../services/sms.service.js";
 
 const router = Router();
 
@@ -188,8 +190,14 @@ router.post("/sms", async (req: any, res: any) => {
         metadata: { phone_number },
       });
     }
-    // TODO: intégrer un vrai fournisseur SMS (Twilio, Orange SMS API, etc.) via TWILIO_API_KEY
-    return res.json({ success: true, queued: true, phone_number });
+    // Envoi RÉEL via le service SMS (Twilio backend → repli Edge Function send-sms).
+    const smsResult = await sendSms(phone_number, message_body);
+    if (!smsResult.ok) {
+      logger.warn(`[notifications/sms] Échec envoi SMS à ${phone_number}: ${smsResult.error}`);
+      return res.status(503).json({ success: false, error: smsResult.error || "Service SMS indisponible" });
+    }
+    logger.info(`[notifications/sms] SMS envoyé à ${phone_number}`);
+    return res.json({ success: true, sent: true, phone_number });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }

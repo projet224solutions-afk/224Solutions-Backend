@@ -106,6 +106,20 @@ const DETAILS: Record<string, DetailFetcher> = {
       .eq('status', 'held').lt('auto_release_date', now).order('auto_release_date', { ascending: true }).limit(50);
     return Promise.all((data || []).map(async (e: any) => ({ ...e, user: await enrichUser(e.seller_id) })));
   },
+
+  // POS — ventes à crédit échues impayées (recouvrement vendeur). Aligné sur pos_monitor_report :
+  // status='pending' ET due_date < now() ET remaining_amount > 0. Donne au PDG QUI doit payer.
+  pos_credit_overdue: async () => {
+    const now = new Date().toISOString();
+    const { data } = await supabaseAdmin.from('vendor_credit_sales')
+      .select('id, vendor_id, order_number, customer_name, customer_phone, total, paid_amount, remaining_amount, due_date, status, created_at')
+      .eq('status', 'pending').lt('due_date', now).gt('remaining_amount', 0)
+      .order('due_date', { ascending: true }).limit(100);
+    return (data || []).map((s: any) => ({
+      ...s,
+      days_overdue: Math.max(0, Math.floor((Date.now() - new Date(s.due_date).getTime()) / 864e5)),
+    }));
+  },
 };
 
 /**

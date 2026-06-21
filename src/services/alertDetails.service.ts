@@ -127,7 +127,7 @@ const DETAILS: Record<string, DetailFetcher> = {
     const since = new Date(Date.now() - 30 * 864e5).toISOString();
     const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
       .select('id, order_id, amount, currency, status, created_at, receiver_id, seller_id')
-      .gte('created_at', since).order('created_at', { ascending: false }).limit(500);
+      .eq('status', 'held').gte('created_at', since).order('created_at', { ascending: false }).limit(500);
     const ids = [...new Set((escrows || []).map((e: any) => e.order_id).filter(Boolean))];
     const orders = new Map<string, any>();
     for (let i = 0; i < ids.length; i += 100) {

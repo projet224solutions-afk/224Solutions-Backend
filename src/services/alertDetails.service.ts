@@ -142,7 +142,7 @@ const DETAILS: Record<string, DetailFetcher> = {
           escrow_id: e.id, order_number: o.order_number, status: e.status, currency: e.currency,
           escrow_amount: e.amount, order_subtotal: o.subtotal,
           ecart_fuite: Number(e.amount) - Number(o.subtotal),
-          created_at: e.created_at, vendeur: await enrichUser(e.receiver_id || e.seller_id),
+          created_at: e.created_at, user: await enrichUser(e.receiver_id || e.seller_id),
         });
         if (out.length >= 50) break;
       }
@@ -157,23 +157,7 @@ const DETAILS: Record<string, DetailFetcher> = {
       .select('id, created_at, amount, currency, description, receiver_user_id, metadata')
       .eq('transaction_type', 'payment').like('description', 'Libération escrow%')
       .gte('created_at', since).order('created_at', { ascending: false }).limit(50);
-    return Promise.all((data || []).map(async (w: any) => ({ ...w, beneficiaire: await enrichUser(w.receiver_user_id) })));
-  },
-
-  // ESCROW — libéré sans ligne d'historique (atomicité). Liste les escrows released (7j) sans wallet_transaction.
-  released_no_ledger: async () => {
-    const since = new Date(Date.now() - 7 * 864e5).toISOString();
-    const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
-      .select('id, order_id, amount, currency, status, released_at, receiver_id, seller_id')
-      .eq('status', 'released').gte('released_at', since).order('released_at', { ascending: false }).limit(200);
-    const out: any[] = [];
-    for (const e of escrows || []) {
-      const { count } = await supabaseAdmin.from('wallet_transactions')
-        .select('id', { count: 'exact', head: true })
-        .eq('transaction_type', 'escrow_release').or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
-      if (!count) { out.push({ ...e, vendeur: await enrichUser(e.receiver_id || e.seller_id) }); if (out.length >= 50) break; }
-    }
-    return out;
+    return Promise.all((data || []).map(async (w: any) => ({ ...w, user: await enrichUser(w.receiver_user_id) })));
   },
 
   // ESCROW — taux BCRG (GNF) non rafraîchis > 24h : montre quelles paires sont périmées et depuis quand.

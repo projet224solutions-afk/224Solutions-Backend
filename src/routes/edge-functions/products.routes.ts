@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { z } from "zod";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -109,7 +110,7 @@ router.post("/agent-get-products", async (req: any, res: any) => {
       vendorId: agent.vendor_id,
     });
   } catch (err: any) {
-    console.error("agent-get-products error:", err);
+    logger.error("agent-get-products error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -187,7 +188,7 @@ router.post("/create-product", validateBearerToken, async (req: any, res: any) =
       message: "Product created successfully",
     });
   } catch (err: any) {
-    console.error("create-product error:", err);
+    logger.error("create-product error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -230,7 +231,7 @@ router.patch("/agent-update-product", async (req: any, res: any) => {
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("agent-update-product error:", err);
+    logger.error("agent-update-product error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -270,7 +271,7 @@ router.delete("/agent-delete-product", async (req: any, res: any) => {
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("agent-delete-product error:", err);
+    logger.error("agent-delete-product error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -313,7 +314,7 @@ router.patch("/agent-toggle-product-status", async (req: any, res: any) => {
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("agent-toggle-product-status error:", err);
+    logger.error("agent-toggle-product-status error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -361,7 +362,7 @@ router.post("/vendor-agent-get-products", async (req: any, res: any) => {
       vendorId: vendorAgent.vendor_id,
     });
   } catch (err: any) {
-    console.error("vendor-agent-get-products error:", err);
+    logger.error("vendor-agent-get-products error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -401,7 +402,7 @@ router.delete("/pdg-delete-service-product", validateBearerToken, async (req: an
 
     return res.json({ success: true, message: "Product deleted" });
   } catch (err: any) {
-    console.error("pdg-delete-service-product error:", err);
+    logger.error("pdg-delete-service-product error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -469,7 +470,7 @@ Descriptions should be professional, engaging, and suitable for a Guinean e-comm
       description,
     });
   } catch (err: any) {
-    console.error("generate-product-description error:", err);
+    logger.error("generate-product-description error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -528,7 +529,7 @@ Professional studio setting, clean white background, well-lit, product-focused p
       imageUrl,
     });
   } catch (err: any) {
-    console.error("generate-product-image error:", err);
+    logger.error("generate-product-image error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

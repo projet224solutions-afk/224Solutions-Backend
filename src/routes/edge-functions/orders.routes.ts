@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import Stripe from "stripe";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -301,7 +302,7 @@ router.post("/create-paypal-order", validateBearerToken, async (req: any, res: a
       transaction_id: transaction?.id,
     });
   } catch (err: any) {
-    console.error("create-paypal-order error:", err);
+    logger.error("create-paypal-order error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -401,7 +402,7 @@ router.post("/marketplace-escrow-payment", validateBearerToken, async (req: any,
       .single();
 
     if (insertError) {
-      console.error("marketplace-escrow-payment stripe transaction insert error:", insertError.message);
+      logger.error("marketplace-escrow-payment stripe transaction insert error:", insertError.message);
     }
 
     return res.json({
@@ -414,7 +415,7 @@ router.post("/marketplace-escrow-payment", validateBearerToken, async (req: any,
       totalAmount,
     });
   } catch (err: any) {
-    console.error("marketplace-escrow-payment error:", err);
+    logger.error("marketplace-escrow-payment error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -511,7 +512,7 @@ router.post("/stripe-marketplace-payment", validateBearerToken, async (req: any,
       .single();
 
     if (insertError) {
-      console.error("stripe-marketplace-payment stripe transaction insert error:", insertError.message);
+      logger.error("stripe-marketplace-payment stripe transaction insert error:", insertError.message);
     }
 
     return res.json({
@@ -525,7 +526,7 @@ router.post("/stripe-marketplace-payment", validateBearerToken, async (req: any,
       productAmount: amount,
     });
   } catch (err: any) {
-    console.error("stripe-marketplace-payment error:", err);
+    logger.error("stripe-marketplace-payment error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -597,7 +598,7 @@ router.post("/cancel-order", validateBearerToken, async (req: any, res: any) => 
       message: "Commande annulée avec succès",
     });
   } catch (err: any) {
-    console.error("cancel-order error:", err);
+    logger.error("cancel-order error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -668,7 +669,7 @@ router.post("/confirm-order-by-seller", validateBearerToken, async (req: any, re
       auto_release_date: autoReleaseDate,
     });
   } catch (err: any) {
-    console.error("confirm-order-by-seller error:", err);
+    logger.error("confirm-order-by-seller error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -729,7 +730,7 @@ router.post("/confirm-delivery", validateBearerToken, async (req: any, res: any)
       commission_retained: releaseData?.commission_retained,
     });
   } catch (err: any) {
-    console.error("confirm-delivery error:", err);
+    logger.error("confirm-delivery error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -775,7 +776,7 @@ router.post("/link-escrow-order", validateBearerToken, async (req: any, res: any
       order_id: updated.order_id,
     });
   } catch (err: any) {
-    console.error("link-escrow-order error:", err);
+    logger.error("link-escrow-order error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -852,7 +853,7 @@ router.post("/request-refund", validateBearerToken, async (req: any, res: any) =
       requested_amount: refund.requested_amount,
     });
   } catch (err: any) {
-    console.error("request-refund error:", err);
+    logger.error("request-refund error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

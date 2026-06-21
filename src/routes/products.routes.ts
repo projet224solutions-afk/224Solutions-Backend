@@ -101,7 +101,7 @@ async function loadFreePlanLimits() {
     }
     freePlanLoaded = true;
   } catch (e) {
-    console.error('Failed to load free plan limits from DB:', e);
+    logger.error('Failed to load free plan limits from DB:', e);
   }
 }
 

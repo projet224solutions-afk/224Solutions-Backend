@@ -123,13 +123,36 @@ router.get('/alerts', verifyJWT, requireRole(PDG_ROLES), async (req: Authenticat
 /** POST /api/v2/guard224/alert/:id/status — ACK / RESOLVED / FALSE_POSITIVE (admin/PDG). */
 router.post('/alert/:id/status', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
   try {
+    const alertId = req.params.id?.trim();
+    if (!alertId) {
+      res.status(400).json({ success: false, error: 'ID alerte manquant' }); return;
+    }
+
     const status = String(req.body?.status || '').toUpperCase();
     if (!['OPEN', 'ACK', 'RESOLVED', 'FALSE_POSITIVE'].includes(status)) {
       res.status(400).json({ success: false, error: 'Statut invalide' }); return;
     }
-    const { data: alert } = await supabaseAdmin.from('guard_224_alerts').select('pattern_key').eq('id', req.params.id).maybeSingle();
-    const { error } = await supabaseAdmin.from('guard_224_alerts').update({ status, updated_at: new Date().toISOString() }).eq('id', req.params.id);
+
+    // Vérifier que l'alerte existe AVANT de tenter l'UPDATE (sinon Supabase ignore
+    // silencieusement un UPDATE qui ne touche aucune ligne → aucun retour d'erreur).
+    const { data: alert, error: fetchError } = await supabaseAdmin
+      .from('guard_224_alerts')
+      .select('id, pattern_key, status')
+      .eq('id', alertId)
+      .maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!alert) {
+      logger.warn(`[guard224/status] Alerte introuvable: ${alertId} — tentative par ${req.user?.id}`);
+      res.status(404).json({ success: false, error: 'Alerte introuvable' }); return;
+    }
+
+    const { error } = await supabaseAdmin
+      .from('guard_224_alerts')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', alertId);
     if (error) throw error;
+
+    logger.info(`[guard224/status] Alerte ${alertId} → ${status} par admin ${req.user?.id}`);
 
     // Apprentissage : un faux positif nourrit le trust score (jamais sur motif critique côté client).
     if (status === 'FALSE_POSITIVE' && alert?.pattern_key) {

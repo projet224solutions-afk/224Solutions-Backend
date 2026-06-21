@@ -16,6 +16,7 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { getClientIp } from "../../middlewares/ipBlocklist.js";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -120,7 +121,7 @@ router.post("/login", async (req: AuthRequest, res: Response) => {
       session: data.session,
     });
   } catch (error) {
-    console.error("[auth/login] Error:", error);
+    logger.error("[auth/login] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
@@ -164,7 +165,7 @@ router.post("/verify-otp", async (req: AuthRequest, res: Response) => {
       session: data.session,
     });
   } catch (error) {
-    console.error("[auth/verify-otp] Error:", error);
+    logger.error("[auth/verify-otp] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
@@ -224,7 +225,7 @@ router.post("/agent/login", async (req: AuthRequest, res: Response) => {
       agent: agentData,
     });
   } catch (error) {
-    console.error("[auth/agent/login] Error:", error);
+    logger.error("[auth/agent/login] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
@@ -285,7 +286,7 @@ router.post("/bureau/login", async (req: AuthRequest, res: Response) => {
       bureau: bureauData,
     });
   } catch (error) {
-    console.error("[auth/bureau/login] Error:", error);
+    logger.error("[auth/bureau/login] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
@@ -327,7 +328,7 @@ router.post("/reset-password", async (req: AuthRequest, res: Response) => {
       message: "Password reset email sent",
     });
   } catch (error) {
-    console.error("[auth/reset-password] Error:", error);
+    logger.error("[auth/reset-password] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",
@@ -388,7 +389,7 @@ router.patch("/change-password", async (req: AuthRequest, res: Response) => {
       message: "Password changed successfully",
     });
   } catch (error) {
-    console.error("[auth/change-password] Error:", error);
+    logger.error("[auth/change-password] Error:", error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",

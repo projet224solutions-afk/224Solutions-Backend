@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -69,15 +70,15 @@ async function translateText(content: string, sourceLanguage: string, targetLang
       if (res.status === 429 || res.status >= 500) {
         const retryAfter = Number(res.headers.get("retry-after")) || 0;
         const wait = retryAfter ? retryAfter * 1000 : 700 * Math.pow(2, attempt); // 0.7s,1.4s,2.8s…
-        console.warn(`[translate-message] API ${res.status}, retry ${attempt + 1}/4 dans ${wait}ms`);
+        logger.warn(`[translate-message] API ${res.status}, retry ${attempt + 1}/4 dans ${wait}ms`);
         await sleep(wait);
         continue;
       }
       // Erreur non transitoire (400/401…) → inutile de retenter.
-      console.error("[translate-message] API", res.status, (await res.text()).slice(0, 200));
+      logger.error("[translate-message] API", res.status, (await res.text()).slice(0, 200));
       return null;
     } catch (e: any) {
-      console.error(`[translate-message] fetch error (tentative ${attempt + 1}):`, e?.message);
+      logger.error(`[translate-message] fetch error (tentative ${attempt + 1}):`, e?.message);
       await sleep(700 * Math.pow(2, attempt));
     }
   }
@@ -105,12 +106,12 @@ async function transcribeAudio(buf: Buffer, mime: string, hintLang?: string): Pr
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST", headers: { Authorization: `Bearer ${key}` }, body: fd as any,
     });
-    if (!r.ok) { console.error("[translate-audio] Whisper", r.status, (await r.text()).slice(0, 200)); return null; }
+    if (!r.ok) { logger.error("[translate-audio] Whisper", r.status, (await r.text()).slice(0, 200)); return null; }
     const data: any = await r.json();
     const rawLang = String(data.language || hintLang || "").toLowerCase();
     const lang = WHISPER_LANG_TO_ISO[rawLang] || (rawLang.length === 2 ? rawLang : hintLang || "fr");
     return { text: String(data.text || "").trim(), lang };
-  } catch (e: any) { console.error("[translate-audio] Whisper error:", e?.message); return null; }
+  } catch (e: any) { logger.error("[translate-audio] Whisper error:", e?.message); return null; }
 }
 
 /** Synthèse vocale du texte traduit via OpenAI TTS (mp3). Renvoie un Buffer mp3. */
@@ -123,9 +124,9 @@ async function synthesizeSpeech(text: string): Promise<Buffer | null> {
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: "tts-1", voice: "alloy", input: text.slice(0, 4000), response_format: "mp3" }),
     });
-    if (!r.ok) { console.error("[translate-audio] TTS", r.status, (await r.text()).slice(0, 200)); return null; }
+    if (!r.ok) { logger.error("[translate-audio] TTS", r.status, (await r.text()).slice(0, 200)); return null; }
     return Buffer.from(await r.arrayBuffer());
-  } catch (e: any) { console.error("[translate-audio] TTS error:", e?.message); return null; }
+  } catch (e: any) { logger.error("[translate-audio] TTS error:", e?.message); return null; }
 }
 
 /**
@@ -185,12 +186,12 @@ router.post("/translate-audio", async (req: Request, res: Response) => {
       const status = translatedAudioUrl ? "completed" : "text_only";
       const update: any = { transcribed_text: stt.text, translated_text: translatedText, original_language: detected, target_language: targetLanguage, audio_translation_status: status };
       if (translatedAudioUrl) update.translated_audio_url = translatedAudioUrl;
-      try { await supabaseAdmin.from("messages").update(update).eq("id", messageId); } catch (e: any) { console.warn("[translate-audio] update messages:", e?.message); }
+      try { await supabaseAdmin.from("messages").update(update).eq("id", messageId); } catch (e: any) { logger.warn("[translate-audio] update messages:", e?.message); }
     }
 
     return res.json({ success: true, transcribedText: stt.text, translatedText, translatedAudioUrl, sourceLanguage: detected, targetLanguage, wasTranslated });
   } catch (e: any) {
-    console.error("[translate-audio] error:", e?.message);
+    logger.error("[translate-audio] error:", e?.message);
     await markFailed();
     return res.status(500).json({ success: false, error: "Erreur de traduction audio" });
   }
@@ -242,7 +243,7 @@ router.post("/translate-message", async (req: Request, res: Response) => {
         translated_text: translated, original_language: detected, target_language: targetLanguage,
       }).eq("id", messageId);
     } catch (e: any) {
-      console.warn("[translate-message] update messages échoué:", e?.message);
+      logger.warn("[translate-message] update messages échoué:", e?.message);
     }
   }
 

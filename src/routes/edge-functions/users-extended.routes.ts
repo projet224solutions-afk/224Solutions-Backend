@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -94,7 +95,7 @@ router.post("/create-by-agent", validateBearerToken, async (req: any, res: any) 
 
     return res.json({ success: true, user: profile });
   } catch (err: any) {
-    console.error("create-by-agent error:", err);
+    logger.error("create-by-agent error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -129,7 +130,7 @@ router.post("/restore", validateBearerToken, async (req: any, res: any) => {
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("restore error:", err);
+    logger.error("restore error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -192,7 +193,7 @@ router.post("/pdg/create-agent", validateBearerToken, async (req: any, res: any)
 
     return res.json({ success: true, agent });
   } catch (err: any) {
-    console.error("pdg/create-agent error:", err);
+    logger.error("pdg/create-agent error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -252,7 +253,7 @@ router.post("/sub/create", validateBearerToken, async (req: any, res: any) => {
 
     return res.json({ success: true, agent });
   } catch (err: any) {
-    console.error("sub/create error:", err);
+    logger.error("sub/create error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -301,7 +302,7 @@ router.post("/vendor/create", validateBearerToken, async (req: any, res: any) =>
 
     return res.json({ success: true, agent });
   } catch (err: any) {
-    console.error("vendor/create error:", err);
+    logger.error("vendor/create error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -333,7 +334,7 @@ router.delete("/pdg/delete", validateBearerToken, async (req: any, res: any) => 
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("pdg/delete error:", err);
+    logger.error("pdg/delete error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -368,7 +369,7 @@ router.delete("/pdg/vendor/delete", validateBearerToken, async (req: any, res: a
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("pdg/vendor/delete error:", err);
+    logger.error("pdg/vendor/delete error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -403,7 +404,7 @@ router.patch("/agent/email", validateBearerToken, async (req: any, res: any) => 
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("agent/email error:", err);
+    logger.error("agent/email error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -427,7 +428,7 @@ router.patch("/bureau/email", validateBearerToken, async (req: any, res: any) =>
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("bureau/email error:", err);
+    logger.error("bureau/email error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -451,7 +452,7 @@ router.patch("/member/email", validateBearerToken, async (req: any, res: any) =>
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("member/email error:", err);
+    logger.error("member/email error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -475,7 +476,7 @@ router.patch("/vendor/email", validateBearerToken, async (req: any, res: any) =>
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("vendor/email error:", err);
+    logger.error("vendor/email error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -520,11 +521,11 @@ router.post("/agent/invite", validateBearerToken, async (req: any, res: any) => 
     if (error) throw error;
 
     // Ne jamais logguer le token d'invitation (secret) — uniquement l'email destinataire.
-    console.log(`Invitation sent to ${email}`);
+    logger.info(`Invitation sent to ${email}`);
 
     return res.json({ success: true, invitation });
   } catch (err: any) {
-    console.error("agent/invite error:", err);
+    logger.error("agent/invite error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -554,7 +555,7 @@ router.get("/agent/users/:agent_id", async (req: any, res: any) => {
       pagination: { offset, limit, total: count || 0 },
     });
   } catch (err: any) {
-    console.error("agent/users error:", err);
+    logger.error("agent/users error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -597,7 +598,7 @@ router.get("/agent/affiliate-link/:agent_id", async (req: any, res: any) => {
 
     return res.json({ success: true, affiliate_link: affiliate });
   } catch (err: any) {
-    console.error("agent/affiliate-link error:", err);
+    logger.error("agent/affiliate-link error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -621,7 +622,7 @@ router.patch("/agent/user/toggle", validateBearerToken, async (req: any, res: an
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("agent/user/toggle error:", err);
+    logger.error("agent/user/toggle error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -669,7 +670,7 @@ router.post("/register/affiliate", async (req: any, res: any) => {
 
     return res.json({ success: true, user: profile });
   } catch (err: any) {
-    console.error("register/affiliate error:", err);
+    logger.error("register/affiliate error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -713,7 +714,7 @@ router.post("/affiliate/commission/trigger", validateBearerToken, async (req: an
 
     return res.json({ success: true, commission });
   } catch (err: any) {
-    console.error("affiliate/commission/trigger error:", err);
+    logger.error("affiliate/commission/trigger error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -754,7 +755,7 @@ router.post("/affiliate/member/create", validateBearerToken, async (req: any, re
 
     return res.json({ success: true, member });
   } catch (err: any) {
-    console.error("affiliate/member/create error:", err);
+    logger.error("affiliate/member/create error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -807,7 +808,7 @@ router.post("/migrate-cognito", validateBearerToken, async (req: any, res: any) 
       users: migrated,
     });
   } catch (err: any) {
-    console.error("migrate-cognito error:", err);
+    logger.error("migrate-cognito error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -834,7 +835,7 @@ router.post("/bulk-invite", validateBearerToken, async (req: any, res: any) => {
 
     return res.json({ success: true, count: invitations.length });
   } catch (err: any) {
-    console.error("bulk-invite error:", err);
+    logger.error("bulk-invite error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

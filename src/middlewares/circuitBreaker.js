@@ -1,3 +1,4 @@
+import { logger } from '../config/logger.js';
 /**
  * ⚡ CIRCUIT BREAKER MIDDLEWARE
  * Protège l'application contre les cascades de pannes
@@ -57,7 +58,7 @@ class CircuitBreaker {
     if (this.state === 'HALF_OPEN') {
       this.successCount++;
       if (this.successCount >= this.successThreshold) {
-        console.log('[Circuit Breaker] HALF_OPEN → CLOSED (service recovered)');
+        logger.info('[Circuit Breaker] HALF_OPEN → CLOSED (service recovered)');
         this.state = 'CLOSED';
         this.successCount = 0;
       }
@@ -70,7 +71,7 @@ class CircuitBreaker {
     this.successCount = 0;
 
     if (this.failureCount >= this.failureThreshold) {
-      console.error(`[Circuit Breaker] OPEN - ${this.failureCount} failures detected`);
+      logger.error(`[Circuit Breaker] OPEN - ${this.failureCount} failures detected`);
       this.state = 'OPEN';
       this.nextAttempt = Date.now() + this.timeout;
     }
@@ -91,7 +92,7 @@ class CircuitBreaker {
     this.failureCount = 0;
     this.successCount = 0;
     this.nextAttempt = Date.now();
-    console.log('[Circuit Breaker] RESET manually');
+    logger.info('[Circuit Breaker] RESET manually');
   }
 }
 

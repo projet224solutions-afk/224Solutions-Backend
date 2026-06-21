@@ -87,7 +87,7 @@ async function loadFreePlanFallback() {
     }
     freePlanFallbackLoaded = true;
   } catch (e) {
-    console.error('Failed to load free plan fallback from DB:', e);
+    logger.error('Failed to load free plan fallback from DB:', e);
   }
 }
 

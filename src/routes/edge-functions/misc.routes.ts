@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -99,7 +100,7 @@ function toNumber(value: any): number {
 router.post("/data/apply-migrations", async (req: any, res: any) => {
   try {
     const { migrations } = req.body;
-    console.log(`Applying ${migrations.length} migrations...`);
+    logger.info(`Applying ${migrations.length} migrations...`);
     return res.json({ success: true, applied: migrations.length });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
@@ -240,7 +241,7 @@ router.post("/pubsub/manage", async (req: any, res: any) => {
 router.post("/pubsub/publish", async (req: any, res: any) => {
   try {
     const { topic_id, message } = req.body;
-    console.log(`Published to ${topic_id}: ${message}`);
+    logger.info(`Published to ${topic_id}: ${message}`);
     return res.json({ success: true });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });

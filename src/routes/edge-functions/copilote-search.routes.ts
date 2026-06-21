@@ -6,6 +6,7 @@
 
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { logger } from '../../config/logger.js';
 
 const router = Router();
 
@@ -655,7 +656,7 @@ router.post("/search", async (req: Request, res: Response) => {
       query: query.trim(),
     });
   } catch (error) {
-    console.error("[Copilote Search]", error);
+    logger.error("[Copilote Search]", error);
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Erreur lors de la recherche",
@@ -738,7 +739,7 @@ Règles : keywords = 3 à 6 mots pour chercher ce produit ; inclure la couleur e
       confidence: parsed.confidence ?? 0.5,
     });
   } catch (error) {
-    console.error("[Copilote Analyze Image]", error);
+    logger.error("[Copilote Analyze Image]", error);
     return res.status(500).json({
       success: false,
       error: "Analyse d'image échouée",
@@ -785,14 +786,14 @@ router.post("/transcribe", async (req: Request, res: Response) => {
 
     if (!response.ok) {
       const err = await response.text();
-      console.error("[Whisper] HTTP error:", response.status, err);
+      logger.error("[Whisper] HTTP error:", response.status, err);
       throw new Error(`Whisper ${response.status}`);
     }
 
     const text = (await response.text()).trim();
     return res.status(200).json({ success: true, data: { text } });
   } catch (error) {
-    console.error("[Copilote Transcribe]", error);
+    logger.error("[Copilote Transcribe]", error);
     return res.status(500).json({ success: false, error: "Transcription échouée" });
   }
 });

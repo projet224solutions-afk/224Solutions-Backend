@@ -46,6 +46,8 @@ export const env = {
   // ADMIN_MFA_ENFORCED='false' par défaut : transition non-bloquante — un admin SANS
   // 2FA enrôlé garde l'accès (un avertissement est loggé), le temps que tous enrôlent.
   // Passer à 'true' une fois les admins enrôlés → l'accès aux ops sensibles EXIGE la 2FA.
+  // ⚠️ PRODUCTION : avant d'activer, vérifier que TOUS les admins ont enrôlé leur TOTP :
+  //   SELECT id, email, is_mfa_enrolled FROM profiles WHERE role IN ('admin','pdg','ceo');
   ADMIN_MFA_ENFORCED: optionalEnv('ADMIN_MFA_ENFORCED', 'false') === 'true',
   // Clé de chiffrement du secret TOTP au repos (repli sur d'autres secrets serveur déjà
   // présents — jamais en clair, jamais côté client). Dérivée en clé 32 octets (scrypt).
@@ -83,7 +85,11 @@ export const env = {
 
   // Rate limiting
   RATE_LIMIT_WINDOW_MS: optionalEnvInt('RATE_LIMIT_WINDOW_MS', 60000),
-  RATE_LIMIT_MAX_REQUESTS: optionalEnvInt('RATE_LIMIT_MAX_REQUESTS', 10000),
+  // 300 req/min = 5 req/s par IP : suffisant pour une app mobile active (une session
+  // ouverte génère ~10-30 req/min en usage normal). Les routes sensibles (login, OTP,
+  // paiement) ont en plus des limites dédiées via routeRateLimiter — cette limite est
+  // le filet de sécurité global anti brute-force. Augmenter via .env si trafic légitime bloqué.
+  RATE_LIMIT_MAX_REQUESTS: optionalEnvInt('RATE_LIMIT_MAX_REQUESTS', 300),
 
   // Uploads
   MAX_FILE_SIZE: optionalEnvInt('MAX_FILE_SIZE', 10 * 1024 * 1024),

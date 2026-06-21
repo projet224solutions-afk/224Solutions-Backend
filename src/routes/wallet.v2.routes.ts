@@ -16,7 +16,6 @@
  */
 
 import { Router, Response } from 'express';
-import crypto from 'crypto';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import { requirePermissionOrRole } from '../middlewares/permissions.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';

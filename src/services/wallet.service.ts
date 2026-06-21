@@ -429,7 +429,15 @@ export async function debitWallet(
       metadata: { idempotency_key: idempotencyKey, source: 'backend-node' },
     });
     if (txErr) {
-      logger.error(`[Wallet] debit history insert failed (solde déjà débité): ${txErr.message}`);
+      // 🛡️ Le ledger a échoué APRÈS le débit → COMPENSATION : on re-crédite le solde pour ne pas
+      // laisser un débit ORPHELIN (argent retiré sans trace). Le `eq(balance, newBalance)` évite
+      // toute double-compensation. Puis on libère le lock et on échoue proprement.
+      logger.error(`[Wallet] debit ledger insert failed → rollback du débit: ${txErr.message}`);
+      await supabaseAdmin.from('wallets')
+        .update({ balance: wallet.balance, updated_at: new Date().toISOString() })
+        .eq('user_id', userId).eq('balance', newBalance);
+      await releaseLock();
+      return { success: false, error: "Échec d'enregistrement de la transaction. Retrait annulé, solde restauré." };
     }
 
     logger.info(`[Wallet] Debited: user=${userId}, amount=${amount}, newBalance=${newBalance}`);

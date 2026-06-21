@@ -1228,7 +1228,8 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       return;
     }
 
-    const idemKey = idempotency_key || `withdraw:${userId}:${amount}:${crypto.randomBytes(8).toString('hex')}`;
+    // Fallback DÉTERMINISTE (fenêtre 30s) : double-clic retrait → même clé → dé-dupliqué.
+    const idemKey = idempotency_key || `withdraw:${userId}:${amount}:${Math.floor(Date.now() / 30000)}`;
 
     const result = await debitWallet(userId, amount, description || 'Retrait', idemKey);
 
@@ -1431,7 +1432,10 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       ? `${description ? `${description} — ` : ''}${fmtMoney(amount)} ${senderCurrency} envoyé → ${fmtMoney(amountToCredit)} ${receiverCurrency} reçu`
       : (description || 'Transfert');
 
-    const idemKey = idempotency_key || `transfer:${senderId}:${resolvedRecipientId}:${amount}:${crypto.randomBytes(8).toString('hex')}`;
+    // Fallback DÉTERMINISTE (fenêtre 30s) si le client n'envoie pas de clé : 2 clics rapides
+    // (même expéditeur/destinataire/montant) → MÊME clé → dé-dupliqué (anti double-transfert).
+    // Un transfert légitime identique espacé de >30s reste possible. Idéal : clé fournie par le front.
+    const idemKey = idempotency_key || `transfer:${senderId}:${resolvedRecipientId}:${amount}:${Math.floor(Date.now() / 30000)}`;
 
     const result = await transferBetweenWallets(
       senderId,

@@ -384,64 +384,21 @@ export async function debitWallet(
       return { success: false, error: 'Transaction bloquée pour activité suspecte' };
     }
 
-    // Récupérer le wallet
-    const { data: wallet, error: walletErr } = await supabaseAdmin
-      .from('wallets')
-      .select('id, balance, is_blocked, currency')
-      .eq('user_id', userId)
-      .single();
-
-    if (walletErr || !wallet) { await releaseLock(); return { success: false, error: 'Wallet introuvable' }; }
-    if (wallet.is_blocked) { await releaseLock(); return { success: false, error: 'Wallet bloqué' }; }
-    if (Number(wallet.balance) < amount) { await releaseLock(); return { success: false, error: 'Solde insuffisant' }; }
-
-    const newBalance = Number(wallet.balance) - amount;
-
-    // Verrouillage optimiste : on ne met à jour que si le solde n'a pas changé
-    const { data: updated, error: updateErr } = await supabaseAdmin
-      .from('wallets')
-      .update({ balance: newBalance, updated_at: new Date().toISOString() })
-      .eq('user_id', userId)
-      .eq('balance', wallet.balance)
-      .select('balance')
-      .single();
-
-    if (updateErr || !updated) {
-      await releaseLock();
-      return { success: false, error: 'Solde modifié pendant la transaction. Réessayez.' };
-    }
-
-    // Journal transaction
-    // NB: transaction_id + net_amount sont NOT NULL ; receiver_wallet_id doit
-    // différer du sender (CHECK different_wallets) → null pour un débit.
-    const { error: txErr } = await supabaseAdmin.from('wallet_transactions').insert({
-      transaction_id: randomUUID(),
-      sender_wallet_id: wallet.id,
-      receiver_wallet_id: null,
-      sender_user_id: userId,
-      receiver_user_id: null,
-      transaction_type: 'withdrawal',
-      amount,
-      net_amount: amount,
-      status: 'completed',
-      currency: wallet.currency || 'GNF',
-      description,
-      metadata: { idempotency_key: idempotencyKey, source: 'backend-node' },
+    // Débit + ledger ATOMIQUES via RPC SQL (FOR UPDATE + transaction unique → aucun débit orphelin
+    // possible : si l'écriture du ledger échoue, le débit est rollback par la même transaction).
+    const { data: res, error: rpcErr } = await supabaseAdmin.rpc('execute_atomic_withdrawal', {
+      p_user_id: userId,
+      p_amount: amount,
+      p_description: description,
+      p_idempotency_key: idempotencyKey,
     });
-    if (txErr) {
-      // 🛡️ Le ledger a échoué APRÈS le débit → COMPENSATION : on re-crédite le solde pour ne pas
-      // laisser un débit ORPHELIN (argent retiré sans trace). Le `eq(balance, newBalance)` évite
-      // toute double-compensation. Puis on libère le lock et on échoue proprement.
-      logger.error(`[Wallet] debit ledger insert failed → rollback du débit: ${txErr.message}`);
-      await supabaseAdmin.from('wallets')
-        .update({ balance: wallet.balance, updated_at: new Date().toISOString() })
-        .eq('user_id', userId).eq('balance', newBalance);
+    if (rpcErr || !res?.success) {
       await releaseLock();
-      return { success: false, error: "Échec d'enregistrement de la transaction. Retrait annulé, solde restauré." };
+      return { success: false, error: res?.error || rpcErr?.message || 'Échec du retrait' };
     }
 
-    logger.info(`[Wallet] Debited: user=${userId}, amount=${amount}, newBalance=${newBalance}`);
-    return { success: true, newBalance };
+    logger.info(`[Wallet] Debited (atomic RPC): user=${userId}, amount=${amount}, newBalance=${res.new_balance}`);
+    return { success: true, newBalance: Number(res.new_balance) };
   } catch (err: any) {
     logger.error(`[Wallet] debitWallet error: ${err.message}`);
     await releaseLock();

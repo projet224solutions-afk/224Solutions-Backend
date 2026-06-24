@@ -16,11 +16,27 @@ interface ServiceAccount {
 }
 
 interface SignedUrlRequest {
-  action: 'upload' | 'download';
+  action: 'upload' | 'download' | 'delete';
   fileName: string;
   contentType?: string;
   folder?: string;
   expiresInMinutes?: number;
+  deleteToken?: string; // jeton de suppression délivré à l'upload (rollback sécurisé)
+}
+
+/**
+ * Jeton de suppression : HMAC-SHA256(objectPath) avec une clé SERVEUR (private_key_id
+ * du compte de service, jamais exposée au client). Seul celui qui a reçu ce jeton à
+ * l'upload peut supprimer l'objet → empêche un utilisateur de supprimer les fichiers
+ * d'autrui en devinant un chemin depuis une URL publique.
+ */
+async function computeDeleteToken(secret: string, objectPath: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(objectPath));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
@@ -32,7 +48,7 @@ async function generateSignedUrl(
   bucketName: string,
   objectPath: string,
   options: {
-    method: 'GET' | 'PUT';
+    method: 'GET' | 'PUT' | 'DELETE';
     contentType?: string;
     expiresInSeconds: number;
   }
@@ -209,9 +225,9 @@ serve(async (req) => {
       );
     }
 
-    if (!['upload', 'download'].includes(action)) {
+    if (!['upload', 'download', 'delete'].includes(action)) {
       return new Response(
-        JSON.stringify({ error: 'action must be "upload" or "download"' }),
+        JSON.stringify({ error: 'action must be "upload", "download" or "delete"' }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400 }
       );
     }
@@ -291,9 +307,40 @@ serve(async (req) => {
       );
     }
 
+    // ── Suppression atomique (rollback d'un fichier orphelin) ──────────────
+    // Le client passe fileName = objectPath complet (déjà préfixé du dossier).
+    // On génère une URL signée DELETE et on l'exécute CÔTÉ SERVEUR (pas de CORS).
+    if (action === 'delete') {
+      const delObjectPath = folder ? `${folder}/${fileName}` : fileName;
+
+      // 🔒 Autorisation : exiger le jeton signé délivré à l'upload (sinon n'importe
+      // quel utilisateur authentifié pourrait supprimer le fichier d'autrui).
+      const expectedToken = await computeDeleteToken(serviceAccount.private_key_id, delObjectPath);
+      if (!request.deleteToken || request.deleteToken !== expectedToken) {
+        console.warn(`[gcs-signed-url] DELETE refusé (jeton invalide) pour ${delObjectPath}`);
+        return new Response(
+          JSON.stringify({ error: 'invalid_delete_token' }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 403 }
+        );
+      }
+
+      const signedDeleteUrl = await generateSignedUrl(serviceAccount, bucketName, delObjectPath, {
+        method: 'DELETE',
+        expiresInSeconds: 120,
+      });
+      const delResp = await fetch(signedDeleteUrl, { method: 'DELETE' });
+      // 204 = supprimé ; 404 = déjà absent → on considère que c'est OK (idempotent).
+      const ok = delResp.ok || delResp.status === 404;
+      console.log(`[gcs-signed-url] DELETE ${delObjectPath} → HTTP ${delResp.status} (ok=${ok})`);
+      return new Response(
+        JSON.stringify({ success: ok, status: delResp.status, objectPath: delObjectPath }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: ok ? 200 : 502 }
+      );
+    }
+
     // Générer le chemin de l'objet
-    const uniqueFileName = action === 'upload' 
-      ? generateUniqueFileName(fileName) 
+    const uniqueFileName = action === 'upload'
+      ? generateUniqueFileName(fileName)
       : fileName;
     
     const objectPath = folder 
@@ -316,6 +363,11 @@ serve(async (req) => {
 
     console.log(`[gcs-signed-url] Generated ${action} URL successfully`);
 
+    // Jeton de suppression sécurisé délivré à l'upload (pour un rollback ultérieur).
+    const deleteToken = action === 'upload'
+      ? await computeDeleteToken(serviceAccount.private_key_id, objectPath)
+      : undefined;
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -325,6 +377,7 @@ serve(async (req) => {
         expiresAt: new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString(),
         // Pour l'upload, on renvoie aussi l'URL publique finale (si le bucket est configuré pour)
         publicUrl: `https://storage.googleapis.com/${bucketName}/${objectPath}`,
+        deleteToken,
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );

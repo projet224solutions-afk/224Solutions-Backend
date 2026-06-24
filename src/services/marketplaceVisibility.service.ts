@@ -25,6 +25,13 @@ interface RankingConfig {
   vendor_diversity_penalty: number;
   min_quality_threshold: number;
   rotation_factor: number;
+  // ✅ AJOUTS — colonnes additives de la migration
+  new_vendor_bonus_days: number;
+  new_vendor_max_bonus: number;
+  trend_weight: number;
+  trend_window_hours: number;
+  low_stock_threshold: number;
+  low_stock_penalty: number;
 }
 
 interface ScoredItem {
@@ -37,6 +44,12 @@ interface ScoredItem {
   qualityScore: number;
   relevanceScore: number;
   finalScore: number;
+  // ✅ AJOUTS — nouvelles composantes du score
+  trendBonus: number;
+  newVendorBonus: number;
+  reliabilityPenalty: number;
+  lowStockPenalty: number;
+  categoryBonus: number;
   breakdown: Record<string, number | string | null>;
 }
 
@@ -57,6 +70,13 @@ const DEFAULT_CONFIG: RankingConfig = {
   vendor_diversity_penalty: 8,
   min_quality_threshold: 20,
   rotation_factor: 10,
+  // ✅ AJOUTS — fallback si les colonnes SQL ne sont pas encore présentes
+  new_vendor_bonus_days: 30,
+  new_vendor_max_bonus: 30,
+  trend_weight: 15,
+  trend_window_hours: 24,
+  low_stock_threshold: 3,
+  low_stock_penalty: 5,
 };
 
 function clamp(value: number, min = 0, max = 100): number {
@@ -79,7 +99,9 @@ function relevanceFromRecency(createdAt: string | null | undefined, rotationFact
   const createdMs = parseDateOrNow(createdAt).getTime();
   const ageDays = Math.max(0, Math.floor((now - createdMs) / 86_400_000));
 
-  const recencyScore = clamp(100 - ageDays * 1.2);
+  // ✅ Fraîcheur logarithmique : jamais 0, déclin lent après le 1er mois
+  // Jour 0→100 · 7→~83 · 30→~68 · 90→~50 · 365→~35
+  const recencyScore = clamp(100 / (1 + Math.log10(ageDays + 1) * 2));
   const daySeed = new Date().toISOString().slice(0, 10);
   const hashInput = `${createdAt || 'n/a'}:${daySeed}`;
   let hash = 0;
@@ -94,7 +116,7 @@ function relevanceFromRecency(createdAt: string | null | undefined, rotationFact
 async function getConfig(): Promise<RankingConfig> {
   const { data, error } = await supabaseAdmin
     .from('marketplace_visibility_settings')
-    .select('subscription_weight, performance_weight, boost_weight, quality_weight, relevance_weight, vendor_diversity_penalty, min_quality_threshold, rotation_factor')
+    .select('subscription_weight, performance_weight, boost_weight, quality_weight, relevance_weight, vendor_diversity_penalty, min_quality_threshold, rotation_factor, new_vendor_bonus_days, new_vendor_max_bonus, trend_weight, trend_window_hours, low_stock_threshold, low_stock_penalty')
     .eq('is_active', true)
     .order('updated_at', { ascending: false })
     .limit(1)
@@ -116,6 +138,13 @@ async function getConfig(): Promise<RankingConfig> {
     vendor_diversity_penalty: Number(data.vendor_diversity_penalty ?? DEFAULT_CONFIG.vendor_diversity_penalty),
     min_quality_threshold: Number(data.min_quality_threshold ?? DEFAULT_CONFIG.min_quality_threshold),
     rotation_factor: Number(data.rotation_factor ?? DEFAULT_CONFIG.rotation_factor),
+    // ✅ AJOUTS
+    new_vendor_bonus_days: Number((data as any).new_vendor_bonus_days ?? DEFAULT_CONFIG.new_vendor_bonus_days),
+    new_vendor_max_bonus: Number((data as any).new_vendor_max_bonus ?? DEFAULT_CONFIG.new_vendor_max_bonus),
+    trend_weight: Number((data as any).trend_weight ?? DEFAULT_CONFIG.trend_weight),
+    trend_window_hours: Number((data as any).trend_window_hours ?? DEFAULT_CONFIG.trend_window_hours),
+    low_stock_threshold: Number((data as any).low_stock_threshold ?? DEFAULT_CONFIG.low_stock_threshold),
+    low_stock_penalty: Number((data as any).low_stock_penalty ?? DEFAULT_CONFIG.low_stock_penalty),
   };
 }
 
@@ -163,7 +192,93 @@ async function getVendorPlanMap(vendorUserIds: string[]): Promise<Record<string,
   return result;
 }
 
-async function getActiveBoostMap(candidates: VisibilityCandidate[]): Promise<Map<string, number>> {
+// ✅ NOUVEAU : date de création de chaque vendeur (bonus nouveau vendeur)
+async function getVendorCreationMap(vendorUserIds: string[]): Promise<Map<string, Date>> {
+  if (!vendorUserIds.length) return new Map();
+  const { data, error } = await supabaseAdmin
+    .from('vendors')
+    .select('user_id, created_at')
+    .in('user_id', vendorUserIds);
+  if (error) {
+    logger.warn(`[Visibility] Vendor creation dates error: ${error.message}`);
+    return new Map();
+  }
+  const result = new Map<string, Date>();
+  for (const row of data || []) {
+    const uid = (row as any).user_id as string;
+    const d = (row as any).created_at;
+    if (uid && d) result.set(uid, new Date(d));
+  }
+  return result;
+}
+
+// ✅ NOUVEAU : score tendance par produit (vues + paniers + achats des N dernières heures)
+async function getTrendScoreMap(
+  candidates: VisibilityCandidate[],
+  windowHours: number
+): Promise<Map<string, number>> {
+  if (!candidates.length) return new Map();
+  const productIds = candidates.map(c => c.id);
+  const since = new Date(Date.now() - windowHours * 3_600_000).toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from('product_trend_signals')
+    .select('product_id, signal_type')
+    .in('product_id', productIds)
+    .gte('created_at', since);
+
+  if (error) {
+    logger.warn(`[Visibility] Trend signals error (non-blocking): ${error.message}`);
+    return new Map();
+  }
+
+  const SIGNAL_WEIGHTS: Record<string, number> = { view: 0.3, add_to_cart: 0.5, purchase: 1.0 };
+  const raw = new Map<string, number>();
+  for (const row of data || []) {
+    const pid = (row as any).product_id as string;
+    const w = SIGNAL_WEIGHTS[(row as any).signal_type] ?? 0;
+    raw.set(pid, (raw.get(pid) || 0) + w);
+  }
+  if (!raw.size) return new Map();
+
+  // Normaliser 0-100 relativement au max de la fenêtre
+  const maxRaw = Math.max(...Array.from(raw.values()), 1);
+  const normalized = new Map<string, number>();
+  for (const [id, score] of raw) normalized.set(id, clamp((score / maxRaw) * 100));
+  return normalized;
+}
+
+// ✅ NOUVEAU : score fiabilité vendeur (depuis le cache)
+async function getVendorReliabilityMap(vendorUserIds: string[]): Promise<Map<string, number>> {
+  if (!vendorUserIds.length) return new Map();
+  const { data, error } = await supabaseAdmin
+    .from('vendor_reliability_cache')
+    .select('vendor_user_id, reliability_score')
+    .in('vendor_user_id', vendorUserIds);
+  if (error) {
+    logger.warn(`[Visibility] Reliability cache error (non-blocking): ${error.message}`);
+    return new Map();
+  }
+  const result = new Map<string, number>();
+  for (const row of data || []) {
+    const uid = (row as any).vendor_user_id as string;
+    if (uid) result.set(uid, Number((row as any).reliability_score ?? 100));
+  }
+  return result;
+}
+
+// ✅ NOUVEAU : bonus nouveau vendeur (linéaire décroissant sur N jours)
+function computeNewVendorBonus(createdAt: Date | undefined, bonusDays: number, maxBonus: number): number {
+  if (!createdAt) return 0;
+  const ageDays = (Date.now() - createdAt.getTime()) / 86_400_000;
+  if (ageDays >= bonusDays || bonusDays <= 0) return 0;
+  return clamp(maxBonus * (1 - ageDays / bonusDays), 0, maxBonus);
+}
+
+async function getActiveBoostMap(
+  candidates: VisibilityCandidate[],
+  context?: Record<string, any>          // ✅ optionnel (compatible existant) — filtrage géo
+): Promise<Map<string, number>> {
   if (!candidates.length) return new Map();
 
   const productIds = candidates.filter(c => c.itemType !== 'professional_service').map(c => c.id);
@@ -171,7 +286,7 @@ async function getActiveBoostMap(candidates: VisibilityCandidate[]): Promise<Map
 
   let query = supabaseAdmin
     .from('marketplace_visibility_boosts')
-    .select('target_type, target_id, boost_score')
+    .select('target_type, target_id, boost_score, target_country, target_city')
     .eq('status', 'active')
     .lte('starts_at', new Date().toISOString())
     .gte('ends_at', new Date().toISOString());
@@ -192,8 +307,20 @@ async function getActiveBoostMap(candidates: VisibilityCandidate[]): Promise<Map
     return new Map();
   }
 
+  // ✅ Filtrage géolocalisé : un boost ciblé (pays/ville) n'est appliqué que si
+  // le contexte correspond. NULL = mondial (comportement original préservé).
+  const ctxCountry = ((context?.country as string) || '').toLowerCase().trim();
+  const ctxCity    = ((context?.city as string) || '').toLowerCase().trim();
+  const relevantBoosts = (data || []).filter((row: any) => {
+    const bCountry = ((row.target_country as string) || '').toLowerCase().trim();
+    const bCity    = ((row.target_city as string) || '').toLowerCase().trim();
+    if (bCountry && bCountry !== 'all' && ctxCountry && bCountry !== ctxCountry) return false;
+    if (bCity    && bCity    !== 'all' && ctxCity    && bCity    !== ctxCity)    return false;
+    return true;
+  });
+
   const boostMap = new Map<string, number>();
-  for (const row of data || []) {
+  for (const row of relevantBoosts) {
     const type = String((row as any).target_type || '');
     const targetId = String((row as any).target_id || '');
     const score = Number((row as any).boost_score || 0);
@@ -330,11 +457,21 @@ export async function rankMarketplaceCandidates(candidates: VisibilityCandidate[
     getConfig(),
     getPlanScoresMap(),
     getProductMetrics(candidates),
-    getActiveBoostMap(candidates),
+    getActiveBoostMap(candidates, context), // ✅ context → filtrage géo des boosts
   ]);
 
   const vendorUserIds = Array.from(new Set(candidates.map(c => c.vendorUserId).filter((v): v is string => !!v)));
-  const vendorPlanMap = await getVendorPlanMap(vendorUserIds);
+
+  // ✅ Chargements parallèles des nouvelles données
+  const [vendorPlanMap, vendorCreationMap, trendScoreMap, vendorReliabilityMap] = await Promise.all([
+    getVendorPlanMap(vendorUserIds),
+    getVendorCreationMap(vendorUserIds),
+    getTrendScoreMap(candidates, config.trend_window_hours),
+    getVendorReliabilityMap(vendorUserIds),
+  ]);
+
+  const preferredCats: string[] = Array.isArray(context?.userPreferredCategories)
+    ? (context!.userPreferredCategories as string[]) : [];
 
   const scored: ScoredItem[] = candidates
     .map((candidate) => {
@@ -354,6 +491,31 @@ export async function rankMarketplaceCandidates(candidates: VisibilityCandidate[
 
       const relevance = relevanceFromRecency(candidate.createdAt, config.rotation_factor);
 
+      // ✅ Signal tendance (vues/paniers/achats récents) → 0..trend_weight
+      const rawTrend = trendScoreMap.get(candidate.id) || 0;
+      const trendBonus = clamp((rawTrend / 100) * config.trend_weight);
+
+      // ✅ Bonus nouveau vendeur (dégressif sur N jours)
+      const vendorCreatedAt = vendorCreationMap.get(candidate.vendorUserId || '');
+      const newVendorBonus = computeNewVendorBonus(
+        vendorCreatedAt, config.new_vendor_bonus_days, config.new_vendor_max_bonus
+      );
+
+      // ✅ Pénalité fiabilité vendeur (litiges + retours) : 0..-30
+      const reliability = vendorReliabilityMap.get(candidate.vendorUserId || '') ?? 100;
+      const reliabilityPenalty = clamp((100 - reliability) * 0.3);
+
+      // ✅ Pénalité stock faible (stock_quantity déjà chargé dans getProductMetrics)
+      const stockQty = Number(metrics?.stock_quantity ?? Infinity);
+      const lowStockPenalty = (
+        candidate.itemType === 'product' && stockQty > 0 && stockQty <= config.low_stock_threshold
+      ) ? config.low_stock_penalty : 0;
+
+      // ✅ Bonus catégorie préférée utilisateur (depuis le contexte)
+      const itemCategory = String(metrics?.category_name || metrics?.category || '').toLowerCase().trim();
+      const categoryBonus = (preferredCats.length > 0 && itemCategory &&
+        preferredCats.some(c => c.toLowerCase().trim() === itemCategory)) ? 10 : 0;
+
       const weighted =
         (basePlanScore * config.subscription_weight) / 100 +
         (perf * config.performance_weight) / 100 +
@@ -363,7 +525,18 @@ export async function rankMarketplaceCandidates(candidates: VisibilityCandidate[
 
       const qualityFloorPenalty = quality < config.min_quality_threshold ? 15 : 0;
       const sponsoredBonus = candidate.isSponsored ? 5 : 0;
-      const finalScore = clamp(weighted + sponsoredBonus - qualityFloorPenalty);
+
+      // ✅ Score final enrichi (additif — tous les existants préservés)
+      const finalScore = clamp(
+        weighted
+        + sponsoredBonus           // existant : +5 si sponsorisé
+        + trendBonus               // ✅ +0..+15 (signal chaud)
+        + newVendorBonus           // ✅ +0..+30 (vendeur récent)
+        + categoryBonus            // ✅ +10 si catégorie préférée
+        - qualityFloorPenalty      // existant : -15 si fiche trop vide
+        - reliabilityPenalty       // ✅ -0..-30 (litiges + retours)
+        - lowStockPenalty          // ✅ -5 si stock ≤ seuil
+      );
 
       return {
         id: candidate.id,
@@ -375,12 +548,26 @@ export async function rankMarketplaceCandidates(candidates: VisibilityCandidate[
         qualityScore: quality,
         relevanceScore: relevance,
         finalScore,
+        trendBonus: Math.round(trendBonus * 10) / 10,
+        newVendorBonus: Math.round(newVendorBonus * 10) / 10,
+        reliabilityPenalty: Math.round(reliabilityPenalty * 10) / 10,
+        lowStockPenalty,
+        categoryBonus,
         breakdown: {
           planName,
           productBoost,
           shopBoost,
           qualityFloorPenalty,
           sponsoredBonus,
+          // ✅ nouveaux éléments de breakdown
+          trendBonus: Math.round(trendBonus * 10) / 10,
+          newVendorBonus: Math.round(newVendorBonus * 10) / 10,
+          reliabilityPenalty: Math.round(reliabilityPenalty * 10) / 10,
+          lowStockPenalty,
+          categoryBonus,
+          vendorAgeDays: vendorCreatedAt
+            ? Math.floor((Date.now() - vendorCreatedAt.getTime()) / 86_400_000) : null,
+          trendRawScore: Math.round(rawTrend * 10) / 10,
         },
       } as ScoredItem;
     })
@@ -435,6 +622,49 @@ export async function rankMarketplaceCandidates(candidates: VisibilityCandidate[
   };
 }
 
+// ✅ NOUVEAU : checklist de visibilité pour le dashboard vendeur
+function buildVendorChecklist(params: {
+  planName: string;
+  baseScore: number;
+  activeBoostScore: number;
+  topProduct?: Record<string, any>;
+}): Array<{ done: boolean; action: string; impact: string; priority: number }> {
+  const { planName, activeBoostScore, topProduct } = params;
+  const tp = (topProduct || {}) as any;
+  return [
+    {
+      priority: 1,
+      done: (tp?.description?.length || 0) >= 600,
+      action: 'Ajouter une description de 600+ caractères sur votre produit principal',
+      impact: '+20 pts qualité',
+    },
+    {
+      priority: 2,
+      done: Array.isArray(tp?.images) && tp.images.length >= 5,
+      action: 'Ajouter 5 photos ou plus',
+      impact: '+20 pts qualité',
+    },
+    {
+      priority: 3,
+      done: (tp?.reviews_count || 0) >= 10,
+      action: 'Obtenir 10 avis clients',
+      impact: '+11 pts performance',
+    },
+    {
+      priority: 4,
+      done: !['free', 'basic'].includes(String(planName).toLowerCase()),
+      action: 'Passer au plan Pro ou supérieur',
+      impact: '+25 à +60 pts abonnement',
+    },
+    {
+      priority: 5,
+      done: activeBoostScore > 0,
+      action: 'Activer un boost produit ou boutique',
+      impact: "+jusqu'à 30 pts boost",
+    },
+  ];
+}
+
 export async function getVendorVisibilitySummary(vendorUserId: string) {
   const [planScoresMap, vendorPlanMap] = await Promise.all([
     getPlanScoresMap(),
@@ -462,7 +692,7 @@ export async function getVendorVisibilitySummary(vendorUserId: string) {
 
   const { data: topProducts } = await supabaseAdmin
     .from('products')
-    .select('id, name, sales_count, rating, reviews_count, is_sponsored')
+    .select('id, name, sales_count, rating, reviews_count, is_sponsored, description, images')
     .eq('vendor_id', (await supabaseAdmin.from('vendors').select('id').eq('user_id', vendorUserId).maybeSingle()).data?.id || '')
     .order('sales_count', { ascending: false })
     .limit(10);
@@ -474,6 +704,13 @@ export async function getVendorVisibilitySummary(vendorUserId: string) {
     currentVisibilityScore: clamp(baseScore + activeBoostScore),
     boosts: boosts || [],
     topProducts: topProducts || [],
+    // ✅ NOUVEAU : checklist d'actions pour améliorer la visibilité
+    checklist: buildVendorChecklist({
+      planName,
+      baseScore,
+      activeBoostScore,
+      topProduct: ((topProducts || []) as any[])[0],
+    }),
   };
 }
 

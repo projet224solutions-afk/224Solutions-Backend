@@ -214,10 +214,18 @@ serve(async (req) => {
       .eq('id', userId)
       .maybeSingle();
 
-    if (profileError || !profile) {
-      console.log('Profil non trouvé, vérification alternative...');
-      // Vérification alternative: le token est valide si Supabase l'accepte
+    // ✅ Blocage STRICT : le client Supabase ci-dessus utilise le JWT de l'appelant
+    // comme header d'auth → si Supabase rejette le token, profileError est non-null.
+    // Si le profil n'existe pas, l'utilisateur n'est pas légitime → refus.
+    if (profileError) {
+      console.warn('[agora-token] Erreur Supabase auth:', profileError.message);
+      return unauthorized('Token Supabase invalide ou expiré');
     }
+    if (!profile) {
+      console.warn('[agora-token] Profil introuvable pour userId:', userId);
+      return unauthorized('Utilisateur non trouvé');
+    }
+    // À ce stade : userId est authentifié ET correspond à un profil réel ✅
 
     const { channel, uid: requestedUid, role = 'publisher' } = await req.json();
 

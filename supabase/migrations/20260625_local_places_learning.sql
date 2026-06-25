@@ -11,7 +11,7 @@
 
 BEGIN;
 
-CREATE EXTENSION IF NOT EXISTS unaccent;
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA extensions;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1. Table
@@ -37,9 +37,11 @@ CREATE POLICY local_places_read ON public.local_places
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. Normalisation (minuscule, sans accents, trim)
 -- ─────────────────────────────────────────────────────────────────────────────
+-- unaccent est dans le schéma `extensions` sur Supabase (cf. migration marketplace).
+-- On qualifie + on passe le dictionnaire en 1er argument (forme robuste, IMMUTABLE).
 CREATE OR REPLACE FUNCTION public.normalize_place_name(p text)
 RETURNS text LANGUAGE sql IMMUTABLE AS $$
-  SELECT trim(lower(public.unaccent(coalesce(p, ''))));
+  SELECT trim(lower(extensions.unaccent('extensions.unaccent', coalesce(p, ''))));
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────

@@ -503,6 +503,33 @@ router.post('/users', async (req, res: Response): Promise<void> => {
       });
     } catch (e) { logger.warn(`[agents/users] audit: ${(e as Error)?.message}`); }
 
+    // ✅ SMS de bienvenue — premier contact numérique avec l'utilisateur
+    // Non-bloquant : n'empêche pas la réponse si le SMS échoue
+    if (body.phone) {
+      const { sendSms } = await import('../services/sms.service.js');
+      const roleLabels: Record<string, string> = {
+        client:      'client',
+        vendeur:     'vendeur',
+        taxi:        'chauffeur taxi',
+        livreur:     'livreur',
+        prestataire: 'prestataire',
+        syndicat:    'responsable syndicat',
+        transitaire: 'transitaire',
+      };
+      const roleLabel = roleLabels[body.role] || body.role;
+      const welcomeMsg = [
+        `Bienvenue sur 224Solutions !`,
+        `Votre compte ${roleLabel} a ete cree.`,
+        `Email : ${body.email}`,
+        `Telechargez l'app : www.224solution.net`,
+        `Connectez-vous et changez votre mot de passe a votre premiere connexion.`,
+      ].join(' ');
+
+      sendSms(body.phone, welcomeMsg).catch((e) =>
+        logger.warn(`[agents/users] SMS bienvenue echoue: ${e?.message}`)
+      );
+    }
+
     logger.info(`[agents/users] utilisateur ${body.role} ${userId} créé par agent ${effectiveAgentId || 'PDG'}`);
     res.json({ success: true, data: { user: { id: userId, email: body.email, public_id: publicId, role: body.role } }, user: { id: userId, email: body.email, public_id: publicId, role: body.role }, message: `Utilisateur ${body.role} créé avec succès` });
   } catch (err: any) {

@@ -144,19 +144,16 @@ serve(async (req) => {
     const resendApiKey = Deno.env.get('RESEND_API_KEY');
 
     if (!resendApiKey) {
-      console.warn('⚠️ RESEND_API_KEY non configurée, simulation envoi');
-      // NEVER return OTP in response - log only
-      console.log('🔑 OTP (dev only - server log):', otp);
-      
+      // ✅ Erreur explicite — pas de succès silencieux en production
+      // Si en dev local : configurer RESEND_API_KEY dans supabase/functions/.env
+      console.error('[send-otp-email] RESEND_API_KEY non configurée — email NON envoyé');
       return new Response(
         JSON.stringify({
-          success: true,
-          message: 'Email simulé (dev mode)'
+          error: 'Service email non configuré. Contactez l\'administrateur.',
+          success: false,
+          code: 'EMAIL_SERVICE_UNAVAILABLE',
         }),
-        {
-          status: 200,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
+        { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 

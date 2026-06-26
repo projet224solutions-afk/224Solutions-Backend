@@ -31,6 +31,7 @@ import { metrics } from './services/metrics.service.js';
 import { surveillance24x7Service } from './services/surveillance24x7.service.js';
 import { dropshipSyncScheduler } from './services/dropship/dropshipSync.service.js';
 import { medicationReminderScheduler } from './services/medicationReminder.service.js';
+import { notificationRetryScheduler } from './services/notificationRetry.service.js';
 
 // Routes TypeScript
 import healthRoutes from './routes/health.routes.js';
@@ -336,6 +337,7 @@ async function bootstrapBackgroundServices() {
   surveillance24x7Service.start();
   dropshipSyncScheduler.start();
   medicationReminderScheduler.start();
+  notificationRetryScheduler.start();
 
   logger.info(`✅ Ready to handle requests`);
 }
@@ -362,6 +364,7 @@ const gracefulShutdown = async (signal: string) => {
     surveillance24x7Service.stop();
     dropshipSyncScheduler.stop();
     medicationReminderScheduler.stop();
+    notificationRetryScheduler.stop();
     await jobQueue.shutdown();
     await closeRedis();
     await metrics.flushToDB();

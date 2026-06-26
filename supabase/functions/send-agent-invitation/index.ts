@@ -37,7 +37,7 @@ const handler = async (req: Request): Promise<Response> => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: "224Solutions <onboarding@resend.dev>",
+        from: `224Solutions <${Deno.env.get('FROM_EMAIL') || 'noreply@224solution.net'}>`,
         to: [agentEmail],
         subject: "🎉 Votre compte Agent 224Solutions est prêt !",
         html: `

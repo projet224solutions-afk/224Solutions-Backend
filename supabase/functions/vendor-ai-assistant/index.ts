@@ -2380,7 +2380,7 @@ async function executeMarketingCampaign(supabase: any, vendorId: string, campaig
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            from: `${vendor?.business_name || '224Solutions'} <onboarding@resend.dev>`,
+            from: `${vendor?.business_name || '224Solutions'} <${Deno.env.get('FROM_EMAIL') || 'noreply@224solution.net'}>`,
             to: [customer.email],
             subject: campaign.campaign_name,
             html: `

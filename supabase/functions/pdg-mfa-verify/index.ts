@@ -79,8 +79,8 @@ serve(async (req) => {
       let emailSent = false;
       if (resendKey) {
         try {
-          // Use FROM_EMAIL if set, otherwise fallback to Resend's test sender
-          const fromEmail = Deno.env.get('FROM_EMAIL') || 'onboarding@resend.dev';
+          // Use FROM_EMAIL if set, otherwise fallback to 224Solutions verified sender
+          const fromEmail = Deno.env.get('FROM_EMAIL') || 'noreply@224solution.net';
           console.log('[MFA] Sending email from:', fromEmail, 'to:', user.email);
           
           const emailResponse = await fetch('https://api.resend.com/emails', {

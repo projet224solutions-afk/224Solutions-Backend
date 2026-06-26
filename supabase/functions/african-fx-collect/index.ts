@@ -390,6 +390,41 @@ async function scrapeBcrg(): Promise<BcrgRates | null> {
   return null;
 }
 
+/**
+ * ✅ Vérifie la cohérence des taux BCRG USD/GNF et EUR/GNF.
+ * Le ratio EUR/USD implicite doit être proche du marché réel (~1.05-1.15).
+ * Si incohérent → probablement une erreur de scraping sur une devise.
+ */
+function validateBcrgCoherence(
+  usdGnf: number,
+  eurGnf: number | undefined,
+  marketEurUsd: number
+): { valid: boolean; reason?: string } {
+  // Si EUR/GNF absent, pas de vérification croisée possible — on accepte USD seul
+  if (!eurGnf || eurGnf <= 0) {
+    return { valid: true };
+  }
+
+  // Ratio EUR/USD implicite depuis les taux BCRG
+  const impliedEurUsd = eurGnf / usdGnf;
+
+  // Le ratio doit être dans une fourchette raisonnable autour du marché
+  // Marché EUR/USD ~1.08, on tolère ±15% pour les écarts de fixing BCRG
+  const minRatio = marketEurUsd * 0.85;
+  const maxRatio = marketEurUsd * 1.15;
+
+  if (impliedEurUsd < minRatio || impliedEurUsd > maxRatio) {
+    return {
+      valid: false,
+      reason: `Ratio EUR/USD implicite ${impliedEurUsd.toFixed(3)} hors fourchette ` +
+              `[${minRatio.toFixed(3)}, ${maxRatio.toFixed(3)}] — ` +
+              `USD/GNF=${usdGnf}, EUR/GNF=${eurGnf} (marché EUR/USD=${marketEurUsd.toFixed(3)})`,
+    };
+  }
+
+  return { valid: true };
+}
+
 // ═══════════════════════════════════════════════════════════
 // NIVEAU 2 — PARITÉS FIXES OFFICIELLES
 // ═══════════════════════════════════════════════════════════
@@ -681,8 +716,31 @@ serve(async (req) => {
       // les vérifications de fraîcheur dans create_order_core.
       if (code === "GNF") {
         if (bcrgRates) {
-          // BCRG accessible → taux frais, source officielle
-          const eurGnf = bcrgRates.eurGnf || bcrgRates.usdGnf * eurUsdRate;
+          // ✅ Vérifier la cohérence USD↔EUR avant d'accepter les taux
+          const coherence = validateBcrgCoherence(
+            bcrgRates.usdGnf, bcrgRates.eurGnf, eurUsdRate
+          );
+
+          if (!coherence.valid) {
+            // Taux incohérent → log + utiliser uniquement USD/GNF (recalculer EUR depuis marché)
+            console.warn(`[BCRG] ⚠️ Incohérence détectée: ${coherence.reason}`);
+            console.warn('[BCRG] EUR/GNF recalculé depuis USD/GNF × marché EUR/USD');
+
+            await supabase.from("fx_collection_log").insert({
+              currency_code: "GNF",
+              source: "bcrg-official-html",
+              source_url: bcrgRates.scrapedUrl,
+              source_type: "official_html",
+              status: "COHERENCE_WARNING",
+              error_message: coherence.reason,
+            });
+          }
+
+          // Si EUR/GNF incohérent → on le recalcule depuis USD/GNF (plus fiable)
+          const eurGnf = coherence.valid
+            ? (bcrgRates.eurGnf || bcrgRates.usdGnf * eurUsdRate)
+            : bcrgRates.usdGnf * eurUsdRate;  // ← recalcul si incohérent
+
           collected = {
             rateUsd: bcrgRates.usdGnf,
             rateEur: eurGnf,
@@ -690,7 +748,23 @@ serve(async (req) => {
             sourceUrl: bcrgRates.scrapedUrl,
             sourceType: "official_html",
           };
+
+          // ✅ Enregistrer le succès du scrape BCRG
+          try {
+            await supabase.rpc('record_fx_scrape_success', { p_currency: 'GNF' });
+          } catch (e) {
+            console.warn('[BCRG] record_fx_scrape_success échoué:', e);
+          }
         } else {
+          // ✅ Enregistrer l'échec — déclenche alerte PDG si > 24h
+          try {
+            const failureResult = await supabase.rpc('record_fx_scrape_failure', { p_currency: 'GNF' });
+            if (failureResult.data?.pdg_alerted) {
+              console.warn(`[BCRG] ⚠️ PDG alerté — BCRG inaccessible depuis ${failureResult.data.hours_since_success}h`);
+            }
+          } catch (e) {
+            console.warn('[BCRG] record_fx_scrape_failure échoué:', e);
+          }
           // BCRG inaccessible → NE PAS basculer sur open.er-api.com
           // Vérifier si un taux official_html BCRG existe déjà en DB
           const existingUsdGnfType = existingSourceTypeMap.get("USD->GNF");

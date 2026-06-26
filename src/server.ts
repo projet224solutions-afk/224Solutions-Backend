@@ -31,12 +31,14 @@ import { metrics } from './services/metrics.service.js';
 import { surveillance24x7Service } from './services/surveillance24x7.service.js';
 import { dropshipSyncScheduler } from './services/dropship/dropshipSync.service.js';
 import { medicationReminderScheduler } from './services/medicationReminder.service.js';
+import { notificationRetryScheduler } from './services/notificationRetry.service.js';
 
 // Routes TypeScript
 import healthRoutes from './routes/health.routes.js';
 import subscriptionRoutes from './routes/subscriptions.routes.js';
 import paymentRoutes from './routes/payments.routes.js';
 import walletRoutesV2 from './routes/wallet.v2.routes.js';
+import paymentsV2Routes from './routes/payments.v2.routes.js';
 import deliveryRoutes from './routes/delivery.routes.js';
 import taxiRoutes from './routes/taxi.routes.js';
 import restaurantRoutes from './routes/restaurant.routes.js';
@@ -254,6 +256,7 @@ app.use('/media', mediaRoutes);
 // ==================== V2 ROUTES ====================
 
 app.use('/api/v2/wallet', walletRoutesV2);
+app.use('/api/v2/payments', paymentsV2Routes);
 app.use('/api/v2/delivery', deliveryRoutes);
 app.use('/api/v2/taxi', taxiRoutes);
 app.use('/api/v2/restaurant', restaurantRoutes);
@@ -336,6 +339,7 @@ async function bootstrapBackgroundServices() {
   surveillance24x7Service.start();
   dropshipSyncScheduler.start();
   medicationReminderScheduler.start();
+  notificationRetryScheduler.start();
 
   logger.info(`✅ Ready to handle requests`);
 }
@@ -362,6 +366,7 @@ const gracefulShutdown = async (signal: string) => {
     surveillance24x7Service.stop();
     dropshipSyncScheduler.stop();
     medicationReminderScheduler.stop();
+    notificationRetryScheduler.stop();
     await jobQueue.shutdown();
     await closeRedis();
     await metrics.flushToDB();

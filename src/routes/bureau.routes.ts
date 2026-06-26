@@ -62,6 +62,56 @@ router.post('/auth/verify-otp', async (req: BureauRequest, res: Response) => {
   }
 });
 
+/**
+ * POST /api/v2/bureau/auth/resend-otp — régénère et renvoie un OTP au bureau (étape 1 déjà passée).
+ * Réplique le pipeline du login (generate_otp_code → send-otp-email) sans redemander le mot de passe.
+ */
+router.post('/auth/resend-otp', async (req: BureauRequest, res: Response) => {
+  try {
+    const identifier = String(req.body?.identifier || '').trim();
+    if (!identifier) { res.status(400).json({ success: false, error: 'identifier requis' }); return; }
+
+    // Résoudre le bureau par email du président OU code bureau
+    const { data: bureau } = await supabaseAdmin
+      .from('syndicate_bureaus')
+      .select('id, bureau_code, president_email, president_name, status')
+      .or(`president_email.eq.${identifier},bureau_code.eq.${identifier}`)
+      .maybeSingle();
+    if (!bureau) { res.status(404).json({ success: false, error: 'Bureau introuvable' }); return; }
+    if (bureau.status && ['suspended', 'deleted', 'inactive'].includes(String(bureau.status).toLowerCase())) {
+      res.status(403).json({ success: false, error: 'Bureau inactif' }); return;
+    }
+
+    // Générer un nouvel OTP (même RPC que le login)
+    const { data: otpData, error: otpErr } = await supabaseAdmin.rpc('generate_otp_code', {
+      p_identifier: identifier,
+      p_user_type: 'bureau',
+      p_user_id: bureau.id,
+      p_ip_address: (req.headers['x-forwarded-for'] as string) || req.ip || 'unknown',
+      p_user_agent: (req.headers['user-agent'] as string) || 'unknown',
+    });
+    const otpRow = Array.isArray(otpData) ? otpData[0] : otpData;
+    if (otpErr || !otpRow?.otp_code) {
+      logger.error(`[bureau/resend-otp] génération OTP: ${otpErr?.message || 'vide'}`);
+      res.status(500).json({ success: false, error: 'Impossible de générer le code' }); return;
+    }
+
+    // Envoyer par email via la même fonction que le login (best-effort)
+    try {
+      await supabaseAdmin.functions.invoke('send-otp-email', {
+        body: { email: bureau.president_email, otp: otpRow.otp_code, userType: 'bureau', userName: bureau.president_name || 'Président' },
+      });
+    } catch (e: any) {
+      logger.warn(`[bureau/resend-otp] envoi email: ${e?.message}`);
+    }
+
+    res.json({ success: true, otp_expires_at: otpRow.expires_at });
+  } catch (e: any) {
+    logger.error(`[bureau/resend-otp] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 /** GET /api/v2/bureau/stats — stats temps réel DU bureau authentifié (jamais un autre). */
 router.get('/stats', verifyBureauJWT, async (req: BureauRequest, res: Response) => {
   try {

@@ -23,55 +23,21 @@ router.post('/ensure', verifyJWT, async (req: AuthenticatedRequest, res: Respons
   try {
     const userId = req.user!.id;
 
-    // Déjà un custom_id ?
-    const { data: existing } = await supabaseAdmin
-      .from('user_ids')
-      .select('custom_id')
-      .eq('user_id', userId)
-      .maybeSingle();
+    // 🔒 ATOMIQUE + ANTI-RACE : tout est fait en une seule transaction côté serveur
+    // (verrou par utilisateur, idempotent, user_ids + profiles.public_id synchronisés).
+    // Remplace l'ancienne séquence lecture→génération→upsert→update (non atomique,
+    // sujette à des custom_id divergents en cas d'appels concurrents).
+    const { data, error } = await supabaseAdmin.rpc('ensure_user_identity', { p_user_id: userId });
 
-    if (existing?.custom_id) {
-      res.json({ success: true, data: { custom_id: existing.custom_id, created: false } });
-      return;
-    }
-
-    // Rôle + public_id éventuel
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('role, public_id')
-      .eq('id', userId)
-      .maybeSingle();
-
-    const role = profile?.role || 'client';
-    let customId = profile?.public_id || null;
-
-    // Générer un ID si aucun public_id existant
-    if (!customId) {
-      const { data: gen, error: genErr } = await supabaseAdmin.rpc('generate_custom_id_with_role', { p_role: role });
-      if (genErr || !gen) {
-        logger.error(`[identity/ensure] génération ID échouée: ${genErr?.message || 'no data'}`);
-        res.status(500).json({ success: false, error: 'Génération d\'identifiant impossible' });
-        return;
-      }
-      customId = gen as string;
-    }
-
-    // Écrire user_ids (service_role) + synchroniser profiles.public_id
-    const { error: upErr } = await supabaseAdmin
-      .from('user_ids')
-      .upsert({ user_id: userId, custom_id: customId }, { onConflict: 'user_id' });
-    if (upErr) {
-      logger.error(`[identity/ensure] upsert user_ids: ${upErr.message}`);
+    const result = data as { success?: boolean; custom_id?: string; created?: boolean; error?: string } | null;
+    if (error || !result?.success || !result.custom_id) {
+      logger.error(`[identity/ensure] échec RPC: ${error?.message || result?.error || 'no data'}`);
       res.status(500).json({ success: false, error: 'Création d\'identifiant impossible' });
       return;
     }
 
-    if (!profile?.public_id) {
-      await supabaseAdmin.from('profiles').update({ public_id: customId }).eq('id', userId);
-    }
-
-    logger.info(`[identity/ensure] ID assuré user=${userId} custom_id=${customId}`);
-    res.json({ success: true, data: { custom_id: customId, created: true } });
+    logger.info(`[identity/ensure] ID assuré user=${userId} custom_id=${result.custom_id} (created=${result.created})`);
+    res.json({ success: true, data: { custom_id: result.custom_id, created: !!result.created } });
   } catch (error: any) {
     logger.error(`[identity/ensure] ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la création de l\'identifiant' });

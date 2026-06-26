@@ -71,47 +71,141 @@ serve(async (req) => {
           .single();
 
         if (fcmData?.fcm_token) {
-          const fcmServerKey = Deno.env.get('FIREBASE_SERVER_KEY');
-          
-          if (fcmServerKey) {
-            // Envoyer via Firebase Cloud Messaging HTTP v1
-            const fcmResponse = await fetch(
-              `https://fcm.googleapis.com/fcm/send`,
-              {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `key=${fcmServerKey}`
-                },
-                body: JSON.stringify({
-                  to: fcmData.fcm_token,
-                  notification: {
-                    title: payload.title,
-                    body: payload.message,
-                    icon: '/icon-192.png',
-                    click_action: payload.actionUrl || '/'
-                  },
-                  data: {
-                    type: payload.type,
-                    notification_id: notification.id,
-                    action_url: payload.actionUrl,
-                    ...payload.data
-                  }
-                })
-              }
-            );
+          // Secrets FCM acceptés sous DEUX conventions :
+          //  1) FCM_SERVICE_ACCOUNT_JSON = le JSON complet du service account, OU
+          //  2) les champs séparés déjà utilisés ailleurs dans le projet :
+          //     FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.
+          const serviceAccountRaw = Deno.env.get('FCM_SERVICE_ACCOUNT_JSON');
+          const fbProjectId   = Deno.env.get('FIREBASE_PROJECT_ID');
+          const fbClientEmail = Deno.env.get('FIREBASE_CLIENT_EMAIL');
+          const fbPrivateKey  = Deno.env.get('FIREBASE_PRIVATE_KEY');
 
-            if (fcmResponse.ok) {
-              console.log('📱 Push notification sent via FCM');
-            } else {
-              const errorText = await fcmResponse.text();
-              console.error('❌ FCM error:', errorText);
+          let serviceAccount: any = null;
+          let projectId: string | undefined = fbProjectId;
+          if (serviceAccountRaw) {
+            try {
+              serviceAccount = JSON.parse(serviceAccountRaw);
+              projectId = projectId || serviceAccount.project_id;
+            } catch {
+              console.error('[FCM] FCM_SERVICE_ACCOUNT_JSON invalide (JSON malformé)');
             }
+          } else if (fbClientEmail && fbPrivateKey && fbProjectId) {
+            // \n littéraux possibles quand la clé privée est stockée en variable d'env
+            serviceAccount = {
+              client_email: fbClientEmail,
+              private_key:  fbPrivateKey.replace(/\\n/g, '\n'),
+              project_id:   fbProjectId,
+            };
+          }
+
+          if (!serviceAccount || !projectId) {
+            console.warn('[FCM] Service account non configuré (ni FCM_SERVICE_ACCOUNT_JSON, ni FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY)');
           } else {
-            console.warn('⚠️ FIREBASE_SERVER_KEY non configuré - push notification ignorée');
+            try {
+              // 1. Obtenir un access token OAuth2 depuis le Service Account
+
+              // JWT signé avec la clé privée du Service Account
+              const now  = Math.floor(Date.now() / 1000);
+              const claim = {
+                iss: serviceAccount.client_email,
+                scope: 'https://www.googleapis.com/auth/firebase.messaging',
+                aud: 'https://oauth2.googleapis.com/token',
+                iat: now,
+                exp: now + 3600,
+              };
+
+              // Encoder le JWT (header.payload.signature)
+              const enc = (obj: object) =>
+                btoa(JSON.stringify(obj))
+                  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+              const header    = enc({ alg: 'RS256', typ: 'JWT' });
+              const claimPart = enc(claim);
+              const unsigned  = `${header}.${claimPart}`;
+
+              // Importer la clé RSA privée
+              const keyData   = serviceAccount.private_key
+                .replace('-----BEGIN PRIVATE KEY-----', '')
+                .replace('-----END PRIVATE KEY-----', '')
+                .replace(/\n/g, '');
+              const keyBytes  = Uint8Array.from(atob(keyData), c => c.charCodeAt(0));
+              const cryptoKey = await crypto.subtle.importKey(
+                'pkcs8', keyBytes.buffer,
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+                false, ['sign']
+              );
+              const sigBytes  = await crypto.subtle.sign(
+                'RSASSA-PKCS1-v1_5', cryptoKey,
+                new TextEncoder().encode(unsigned)
+              );
+              const sig       = btoa(String.fromCharCode(...new Uint8Array(sigBytes)))
+                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+              const jwt       = `${unsigned}.${sig}`;
+
+              // Échanger le JWT contre un access_token
+              const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+              });
+              const tokenData   = await tokenRes.json();
+              const accessToken = tokenData.access_token;
+
+              if (!accessToken) {
+                console.error('[FCM] Impossible d\'obtenir le token OAuth2:', tokenData);
+              } else {
+                // 2. Envoyer via FCM HTTP v1
+                const fcmRes = await fetch(
+                  `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
+                  {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${accessToken}`,  // ✅ Bearer OAuth2
+                    },
+                    body: JSON.stringify({
+                      message: {
+                        token: fcmData.fcm_token,  // ✅ 'token' (v1) au lieu de 'to' (Legacy)
+                        notification: {
+                          title: payload.title,
+                          body:  payload.message,
+                        },
+                        data: {
+                          type:            payload.type,
+                          notification_id: notification.id,
+                          action_url:      payload.actionUrl || '',
+                        },
+                        android: { priority: 'high' },
+                        apns: {
+                          payload: { aps: { sound: 'default', badge: 1 } }
+                        },
+                      },
+                    }),
+                  }
+                );
+
+                if (fcmRes.ok) {
+                  console.log('[FCM] ✅ Push envoyé (HTTP v1)');
+                } else {
+                  const err = await fcmRes.json();
+                  console.error('[FCM] Erreur v1:', JSON.stringify(err));
+
+                  // ✅ Token invalide → désactiver pour éviter les tentatives inutiles
+                  if (err?.error?.details?.some((d: any) => d.errorCode === 'UNREGISTERED')) {
+                    await supabaseClient
+                      .from('user_fcm_tokens')
+                      .update({ is_active: false })
+                      .eq('fcm_token', fcmData.fcm_token);
+                    console.log('[FCM] Token UNREGISTERED → is_active = false');
+                  }
+                }
+              }
+            } catch (fcmErr) {
+              console.error('[FCM] Exception v1:', fcmErr);
+            }
           }
         } else {
-          console.log('ℹ️ Pas de token FCM pour cet utilisateur');
+          console.log('[FCM] Pas de token FCM pour cet utilisateur');
         }
       } catch (pushError) {
         console.error('❌ Erreur push notification:', pushError);
@@ -156,8 +250,19 @@ serve(async (req) => {
       }
     }
 
-    // 5️⃣ ENVOYER SMS (si activé et critique)
-    if (payload.sendSMS && payload.type === 'security' && preferences.smsEnabled !== false) {
+    // 5️⃣ ENVOYER SMS (si activé) — étendu aux types critiques, pas uniquement 'security'
+    const SMS_CRITICAL_TYPES = new Set([
+      'security', 'securite', 'otp',
+      'order', 'commande', 'order_confirmed',
+      'payment', 'paiement', 'wallet',
+      'taxi', 'ride', 'ride_accepted', 'ride_completed',
+      'delivery', 'livraison',
+      'syndicat', 'bureau', 'cotisation', 'vehicle_stolen',
+    ]);
+
+    if (payload.sendSMS
+      && SMS_CRITICAL_TYPES.has(payload.type)
+      && preferences.smsEnabled !== false) {
       try {
         const { data: userData } = await supabaseClient
           .from('profiles')

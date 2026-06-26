@@ -12,6 +12,7 @@ import { authenticateInternal } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { sendEmail } from '../services/transactionEmail.service.js';
 import { sendSms } from '../services/sms.service.js';
+import { enqueueRetry, processNotificationRetries } from '../services/notificationRetry.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
@@ -39,6 +40,50 @@ function buildEmailHtml(title: string, message: string): string {
       </div>
       <div style="padding:14px 24px;background:#fafafa;color:#999;font-size:12px;border-top:1px solid #eee">Notification automatique 224Solutions — ne pas répondre à cet email.</div>
     </div></body></html>`;
+}
+
+// ✅ Templates SMS adaptés au contexte — message court et clair
+function buildSmsText(type: string, title: string, message: string): string {
+  const t = (type || '').toLowerCase();
+  const clean = (s: string) => String(s || '').replace(/[<>]/g, '').trim().slice(0, 100);
+
+  if (t.includes('order') || t.includes('commande')) {
+    return `224App : Commande ${clean(title)}. ${clean(message)}`;
+  }
+  if (t.includes('payment') || t.includes('paiement') || t.includes('wallet')) {
+    return `224App - Paiement : ${clean(message)}`;
+  }
+  if (t.includes('taxi') || t.includes('ride') || t.includes('course')) {
+    return `224App Taxi : ${clean(message)}`;
+  }
+  if (t.includes('delivery') || t.includes('livraison')) {
+    return `224App Livraison : ${clean(message)}`;
+  }
+  if (t.includes('security') || t.includes('securite') || t.includes('otp')) {
+    return `224App Securite : ${clean(message)} - Ne partagez pas ce code.`;
+  }
+  if (t.includes('syndicat') || t.includes('bureau') || t.includes('cotisation')) {
+    return `224Syndicat : ${clean(message)}`;
+  }
+  // Générique
+  const prefix = clean(title);
+  return prefix ? `224App - ${prefix} : ${clean(message)}` : `224App : ${clean(message)}`;
+}
+
+// Retry SMS : enqueueRetry + processNotificationRetries sont centralisés dans
+// notificationRetry.service.ts (réutilisés par le planificateur worker + la route ci-dessous).
+
+// ✅ Anti-spam : max 1 SMS/email par type par utilisateur toutes les 5 minutes
+// Stocké en mémoire (redémarre à chaque restart, suffisant pour anti-spam léger)
+const recentlySent = new Map<string, number>(); // key: `${userId}:${type}` → timestamp
+const SPAM_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function isThrottled(userId: string, type: string): boolean {
+  const key  = `${userId}:${type}`;
+  const last = recentlySent.get(key);
+  if (last && Date.now() - last < SPAM_WINDOW_MS) return true;
+  recentlySent.set(key, Date.now());
+  return false;
 }
 
 /**
@@ -71,6 +116,15 @@ router.post('/dispatch', authenticateInternal, async (req, res: Response): Promi
       return;
     }
 
+    // ✅ Anti-spam : types répétitifs groupés sur 5 minutes
+    const GROUPABLE_TYPES = new Set(['order', 'commande', 'delivery', 'livraison', 'promotion']);
+    const shouldThrottle  = type && GROUPABLE_TYPES.has(String(type).toLowerCase());
+    if (shouldThrottle && isThrottled(user_id, String(type))) {
+      logger.info(`[notif-dispatch] throttled user=${user_id} type=${type}`);
+      res.json({ success: true, email: false, sms: false, throttled: true });
+      return;
+    }
+
     const subject = (title && String(title).trim()) || 'Notification 224Solutions';
     const out = { email: false, sms: false };
 
@@ -80,12 +134,19 @@ router.post('/dispatch', authenticateInternal, async (req, res: Response): Promi
       catch (e) { logger.warn(`[notif-dispatch] email: ${(e as Error)?.message}`); }
     }
 
-    // SMS (Twilio) — best-effort. Concaténé titre + message, tronqué.
+    // SMS (Twilio) — best-effort. Template contextuel selon le type, tronqué.
     if (profile.phone) {
       try {
-        const smsText = `${title ? String(title).trim() + ' : ' : ''}${String(message).trim()}`.slice(0, 320);
+        // ✅ Template contextuel selon le type de notification
+        const smsText = buildSmsText(type || '', title || '', message || '').slice(0, 320);
         const r = await sendSms(profile.phone, smsText);
         out.sms = r.ok;
+
+        // ✅ Si SMS échoue → enfile en retry
+        if (!r.ok) {
+          await enqueueRetry(user_id, profile.phone, smsText);
+          logger.warn(`[notif-dispatch] SMS échoué → retry enfilé: ${r.error}`);
+        }
       } catch (e) { logger.warn(`[notif-dispatch] sms: ${(e as Error)?.message}`); }
     }
 
@@ -95,6 +156,22 @@ router.post('/dispatch', authenticateInternal, async (req, res: Response): Promi
     logger.error(`[notif-dispatch] ${e?.message}`);
     // 200 quand même : le dispatch est best-effort, ne pas faire retenter le trigger en boucle.
     res.json({ success: false, error: 'dispatch_error' });
+  }
+});
+
+/**
+ * POST /api/v2/notifications/process-retries
+ * Appelé toutes les 5 minutes par un cron (pg_cron ou cron externe).
+ * Retraite les SMS en échec (max 3 tentatives, backoff 5min/15min/1h).
+ */
+router.post('/process-retries', authenticateInternal, async (req, res: Response): Promise<void> => {
+  try {
+    // Logique centralisée (partagée avec le planificateur worker notificationRetryScheduler).
+    const result = await processNotificationRetries();
+    res.json({ success: true, ...result });
+  } catch (e: any) {
+    logger.error(`[notif-retry] ${e?.message}`);
+    res.status(500).json({ success: false, error: e?.message });
   }
 });
 

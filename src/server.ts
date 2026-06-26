@@ -38,6 +38,7 @@ import healthRoutes from './routes/health.routes.js';
 import subscriptionRoutes from './routes/subscriptions.routes.js';
 import paymentRoutes from './routes/payments.routes.js';
 import walletRoutesV2 from './routes/wallet.v2.routes.js';
+import paymentsV2Routes from './routes/payments.v2.routes.js';
 import deliveryRoutes from './routes/delivery.routes.js';
 import taxiRoutes from './routes/taxi.routes.js';
 import restaurantRoutes from './routes/restaurant.routes.js';
@@ -255,6 +256,7 @@ app.use('/media', mediaRoutes);
 // ==================== V2 ROUTES ====================
 
 app.use('/api/v2/wallet', walletRoutesV2);
+app.use('/api/v2/payments', paymentsV2Routes);
 app.use('/api/v2/delivery', deliveryRoutes);
 app.use('/api/v2/taxi', taxiRoutes);
 app.use('/api/v2/restaurant', restaurantRoutes);

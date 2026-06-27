@@ -1,3 +1,4 @@
+// Route Express standard (express + @types/express installés ; chemins relatifs valides).
 import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { z } from "zod";

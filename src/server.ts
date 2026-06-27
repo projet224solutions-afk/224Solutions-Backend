@@ -332,14 +332,37 @@ async function bootstrapBackgroundServices() {
     return;
   }
 
-  logger.info('🛠️  Mode WORKER : initialisation des tâches de fond (jobs + surveillance 24/7)');
-  // Initialize job queues (non-blocking, graceful failure)
-  await jobQueue.init();
-  await jobQueue.scheduleRecurring();
-  surveillance24x7Service.start();
-  dropshipSyncScheduler.start();
-  medicationReminderScheduler.start();
-  notificationRetryScheduler.start();
+  logger.info('🛠️  Mode WORKER : élection de leader avant démarrage des jobs');
+
+  // ✅ Plusieurs workers peuvent tourner pour la HA ; UN SEUL (le leader)
+  // exécute réellement les jobs. Les autres attendent en secours et prennent
+  // le relais automatiquement si le leader disparaît.
+  const { startLeaderElection } = await import('./services/workerLeader.service.js');
+
+  await startLeaderElection(
+    // onBecomeLeader : devient actif → lance les jobs
+    async () => {
+      await jobQueue.init();
+      await jobQueue.scheduleRecurring();
+      surveillance24x7Service.start();
+      dropshipSyncScheduler.start();
+      medicationReminderScheduler.start();
+      notificationRetryScheduler.start();
+      logger.info('✅ Jobs de fond actifs (worker leader)');
+    },
+    // onLoseLeader : arrête les jobs (un autre worker prend le relais)
+    async () => {
+      try {
+        surveillance24x7Service.stop?.();
+        dropshipSyncScheduler.stop?.();
+        medicationReminderScheduler.stop?.();
+        notificationRetryScheduler.stop?.();
+        logger.warn('⏸️  Jobs de fond arrêtés (leadership perdu)');
+      } catch (e: any) {
+        logger.error(`Erreur arrêt jobs: ${e?.message}`);
+      }
+    },
+  );
 
   logger.info(`✅ Ready to handle requests`);
 }
@@ -356,6 +379,12 @@ if (isVercelRuntime) {
 // Graceful shutdown
 const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received: shutting down gracefully`);
+
+  // ✅ Libérer le verrou leader pour qu'un worker de secours prenne le relais vite
+  try {
+    const { releaseLeadership } = await import('./services/workerLeader.service.js');
+    await releaseLeadership();
+  } catch { /* best-effort */ }
 
   if (!server) {
     process.exit(0);

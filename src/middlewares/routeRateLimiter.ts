@@ -21,6 +21,13 @@ interface RateLimitConfig {
   perIp?: boolean;
   /** Log security event on limit breach */
   logBreach?: boolean;
+  /**
+   * Comportement si Redis est indisponible :
+   * - false (défaut) : fallback mémoire local (disponibilité priorisée)
+   * - true : REFUSER la requête (429) — pour les routes sensibles où mieux vaut
+   *   bloquer que laisser passer N× le quota en multi-instance (auth/paiement/admin)
+   */
+  failClosed?: boolean;
 }
 
 // In-memory fallback store (basic, no persistence)
@@ -59,6 +66,7 @@ export function routeRateLimit(config: RateLimitConfig) {
     perUser = true,
     perIp = true,
     logBreach = true,
+    failClosed = false,   // ✅ défaut : disponibilité (fallback mémoire)
   } = config;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -68,11 +76,36 @@ export function routeRateLimit(config: RateLimitConfig) {
     if (perUser) parts.push((req as any).user?.id || 'anon');
     const key = parts.join(':');
 
-    // Try Redis first, fall back to memory
+    // Try Redis first
     const result = await redisRateLimit.check(key, maxRequests, windowSeconds);
 
-    // If Redis unavailable, use memory
+    // Redis indisponible (resetAt === 0)
     if (result.resetAt === 0) {
+      // ✅ Routes sensibles : fail-closed — on refuse plutôt que de laisser
+      // passer N× le quota entre instances quand Redis est down.
+      if (failClosed) {
+        logger.error(`Rate limit FAIL-CLOSED (Redis down) sur route sensible: ${key}`);
+        if (logBreach) {
+          await auditTrail.log({
+            actorId: (req as any).user?.id || req.ip || 'unknown',
+            actorType: 'user',
+            action: 'rate_limit.fail_closed',
+            resourceType: 'endpoint',
+            resourceId: req.originalUrl,
+            ip: req.ip,
+            riskLevel: 'high',
+            metadata: { keyPrefix, reason: 'redis_unavailable' },
+          });
+        }
+        res.status(429).json({
+          success: false,
+          error: 'Service temporairement indisponible. Veuillez réessayer dans un moment.',
+          retryAfter: windowSeconds,
+        });
+        return;
+      }
+
+      // Routes non sensibles : fallback mémoire local (disponibilité priorisée)
       const memResult = memoryRateLimit(key, maxRequests, windowSeconds * 1000);
       if (!memResult.allowed) {
         if (logBreach) {
@@ -132,9 +165,9 @@ export function routeRateLimit(config: RateLimitConfig) {
 
 // ==================== PRE-CONFIGURED LIMITERS ====================
 
-/** Auth/Login: 10 req / 15 min per IP */
+/** Auth/Login: 10 req / 15 min per IP — FAIL-CLOSED (sécurité) */
 export const authRateLimit = routeRateLimit({
-  maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true,
+  maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true, failClosed: true,
 });
 
 /** Create order: 5 req / min per user */
@@ -147,9 +180,9 @@ export const orderManageRateLimit = routeRateLimit({
   maxRequests: 10, windowSeconds: 60, keyPrefix: 'order:manage', perUser: true, perIp: true,
 });
 
-/** Payment endpoints: 10 req / min per user */
+/** Payment endpoints: 10 req / min per user — FAIL-CLOSED (argent) */
 export const paymentRateLimit = routeRateLimit({
-  maxRequests: 10, windowSeconds: 60, keyPrefix: 'payment', perUser: true, perIp: true,
+  maxRequests: 10, windowSeconds: 60, keyPrefix: 'payment', perUser: true, perIp: true, failClosed: true,
 });
 
 /** Webhook endpoints: 100 req / min per IP (Stripe retries) */
@@ -167,12 +200,12 @@ export const inventoryRateLimit = routeRateLimit({
   maxRequests: 20, windowSeconds: 60, keyPrefix: 'inventory', perUser: true, perIp: false,
 });
 
-/** Subscription confirm/cancel: 5 req / min per user */
+/** Subscription confirm/cancel: 5 req / min per user — FAIL-CLOSED (argent) */
 export const subscriptionRateLimit = routeRateLimit({
-  maxRequests: 5, windowSeconds: 60, keyPrefix: 'subscription', perUser: true, perIp: true,
+  maxRequests: 5, windowSeconds: 60, keyPrefix: 'subscription', perUser: true, perIp: true, failClosed: true,
 });
 
-/** Admin endpoints: 30 req / min per user */
+/** Admin endpoints: 30 req / min per user — FAIL-CLOSED (privilèges) */
 export const adminRateLimit = routeRateLimit({
-  maxRequests: 30, windowSeconds: 60, keyPrefix: 'admin', perUser: true, perIp: true,
+  maxRequests: 30, windowSeconds: 60, keyPrefix: 'admin', perUser: true, perIp: true, failClosed: true,
 });

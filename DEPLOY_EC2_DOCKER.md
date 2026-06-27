@@ -109,6 +109,20 @@ Le backend est **stateless** et pilotable par `RUN_BACKGROUND_JOBS` :
 
 Voir `AWS_ECS_FARGATE.md` pour la version managée (ECS Fargate + ALB) quand le trafic grandit.
 
+## Haute disponibilité du worker (optionnel)
+
+Par défaut, 1 seul worker (`RUN_BACKGROUND_JOBS=true`). Pour éviter le point de
+défaillance unique, tu peux lancer PLUSIEURS workers : l'élection de leader
+(via Redis) garantit qu'UN SEUL exécute les jobs à la fois.
+
+- Lance 2+ conteneurs avec `RUN_BACKGROUND_JOBS=true`
+- Ils s'élisent automatiquement un leader (verrou Redis `224:worker:leader`)
+- Si le leader meurt, un autre prend le relais en ~30s (TTL du verrou)
+- `REDIS_URL` doit être PARTAGÉ entre les workers (Upstash/ElastiCache)
+
+⚠️ Sans Redis partagé, chaque worker se croit leader → jobs dupliqués.
+Le multi-worker EXIGE un Redis commun.
+
 ## Dépannage
 
 | Symptôme | Piste |

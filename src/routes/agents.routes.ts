@@ -444,6 +444,8 @@ router.post('/users', async (req, res: Response): Promise<void> => {
         user_id: userId, business_name: vd.business_name || fullName, description: vd.business_description,
         address: vd.business_address, service_type: vd.service_type || null, phone: body.phone, email: body.email,
         city: body.city || null, vendor_code: vendorCode, is_active: true, is_verified: false,
+        // GPS si fourni par le formulaire agent (sinon NULL → résolu par ville côté proximité)
+        latitude: vd.latitude ?? null, longitude: vd.longitude ?? null,
         kyc_status: 'verified', kyc_verified_at: new Date().toISOString(),
       });
       if (error) { await failRole('Erreur création profil vendeur: ' + error.message); return; }

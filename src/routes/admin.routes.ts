@@ -1411,4 +1411,90 @@ router.post('/mfa/disable', verifyJWT, requireRole(PDG_ROLES), async (req: Authe
   }
 });
 
+/**
+ * POST /api/admin/set-user-active
+ * Suspend ou réactive un utilisateur (is_active). Réservé PDG/admin.
+ * Body : { userId: string, isActive: boolean, reason?: string }
+ *
+ * Passe par service_role (supabaseAdmin) → contourne la RLS profiles de façon
+ * CONTRÔLÉE (la RLS n'autorise que la modif de son propre profil ; un admin doit
+ * pouvoir suspendre autrui, mais uniquement via ce point d'entrée gardé + audité).
+ */
+router.post('/set-user-active', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const actorId = req.user!.id;
+    const { userId, isActive, reason } = req.body || {};
+
+    if (!userId || typeof userId !== 'string') {
+      res.status(400).json({ success: false, error: 'userId requis' });
+      return;
+    }
+    if (typeof isActive !== 'boolean') {
+      res.status(400).json({ success: false, error: 'isActive (boolean) requis' });
+      return;
+    }
+    if (actorId === userId) {
+      res.status(400).json({ success: false, error: 'Impossible de suspendre votre propre compte' });
+      return;
+    }
+
+    const { data: target } = await supabaseAdmin
+      .from('profiles')
+      .select('id, email, role, is_active')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (!target) {
+      res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+      return;
+    }
+
+    // 🛡️ Protéger les comptes privilégiés : on ne suspend pas un admin/pdg/ceo
+    const PROTECTED = ['admin', 'pdg', 'ceo'];
+    if (!isActive && PROTECTED.includes(String((target as any).role || '').toLowerCase())) {
+      logger.warn(`[admin/set-user-active] Refusé (compte protégé): ${(target as any).email} [${(target as any).role}]`);
+      res.status(403).json({
+        success: false,
+        protected: true,
+        error: `Compte protégé (rôle « ${(target as any).role} »). Suspension refusée.`,
+      });
+      return;
+    }
+
+    const beforeActive = (target as any).is_active;
+
+    const { error: updErr } = await supabaseAdmin
+      .from('profiles')
+      .update({ is_active: isActive, updated_at: new Date().toISOString() })
+      .eq('id', userId);
+
+    if (updErr) {
+      logger.error(`[admin/set-user-active] ${updErr.message}`);
+      res.status(500).json({ success: false, error: 'Échec de la mise à jour' });
+      return;
+    }
+
+    await supabaseAdmin.from('audit_logs').insert({
+      actor_id:    actorId,
+      action:      isActive ? 'USER_ACTIVATED' : 'USER_SUSPENDED',
+      target_type: 'user',
+      target_id:   userId,
+      data_json:   {
+        before: { is_active: beforeActive },
+        after:  { is_active: isActive },
+        reason: reason || null,
+        email:  (target as any).email,
+        role:   (target as any).role,
+      },
+      created_at:  new Date().toISOString(),
+    });
+
+    logger.info(`[admin/set-user-active] ${(target as any).email} → is_active=${isActive} par ${actorId}`);
+    res.json({ success: true, userId, isActive });
+  } catch (err: any) {
+    logger.error(`[admin/set-user-active] ${err?.message}`);
+    res.status(500).json({ success: false, error: err?.message || 'Erreur serveur' });
+  }
+});
+
 export default router;

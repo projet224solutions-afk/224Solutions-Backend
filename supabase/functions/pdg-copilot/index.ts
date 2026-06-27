@@ -46,13 +46,15 @@ serve(async (req) => {
     }
 
     const { data: profile } = await supabaseClient
-      .from('users')
+      .from('profiles')                       // ✅ table correcte ('users' n'existe pas)
       .select('role')
       .eq('id', user.id)
       .single();
 
-    if (profile?.role !== 'pdg' && profile?.role !== 'owner') {
-      throw new Error('Accès refusé - Réservé au PDG/Propriétaire');
+    // ✅ Rôles privilégiés cohérents avec le reste de l'app ('owner' n'existe pas)
+    const PRIVILEGED_ROLES = ['admin', 'pdg', 'super_admin', 'ceo'];
+    if (!profile?.role || !PRIVILEGED_ROLES.includes(String(profile.role).toLowerCase())) {
+      throw new Error('Accès refusé - Réservé au PDG/Administration');
     }
 
     // Parse request body

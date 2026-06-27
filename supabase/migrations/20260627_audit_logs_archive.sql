@@ -16,7 +16,7 @@ CREATE POLICY "audit_archive_read_admin" ON public.audit_logs_archive
   FOR SELECT TO authenticated
   USING (EXISTS (SELECT 1 FROM public.profiles
                  WHERE id = auth.uid()
-                   AND role IN ('admin','pdg','super_admin','ceo')));
+                   AND role IN ('admin','pdg','ceo')));
 
 -- ════════════════════════════════════════════════════════════
 -- 2. RPC : archive_old_audit_logs — DÉPLACE (jamais supprime) + auto-audit
@@ -38,7 +38,7 @@ DECLARE
 BEGIN
   -- Garde 1 : rôle privilégié
   SELECT role INTO v_role FROM public.profiles WHERE id = v_uid;
-  IF v_role IS NULL OR v_role NOT IN ('admin','pdg','super_admin','ceo') THEN
+  IF v_role IS NULL OR v_role NOT IN ('admin','pdg','ceo') THEN
     RETURN jsonb_build_object('success', false, 'error', 'NOT_AUTHORIZED');
   END IF;
 

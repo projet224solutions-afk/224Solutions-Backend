@@ -52,7 +52,7 @@ serve(async (req) => {
       .single();
 
     // ✅ Rôles privilégiés cohérents avec le reste de l'app ('owner' n'existe pas)
-    const PRIVILEGED_ROLES = ['admin', 'pdg', 'super_admin', 'ceo'];
+    const PRIVILEGED_ROLES = ['admin', 'pdg', 'ceo'];
     if (!profile?.role || !PRIVILEGED_ROLES.includes(String(profile.role).toLowerCase())) {
       throw new Error('Accès refusé - Réservé au PDG/Administration');
     }

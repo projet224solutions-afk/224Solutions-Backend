@@ -180,6 +180,58 @@ export async function syncDomainAlerts(
   return { generated_at: report.generated_at, checks, overall: computeOverall(checks) };
 }
 
+// Fenêtre (heures) au-delà de laquelle une alerte ÉVÉNEMENTIELLE non revue est
+// considérée résolue. Configurable via env. 12h par défaut.
+const STALE_EVENT_ALERT_HOURS = Math.max(1, Number(process.env.STALE_EVENT_ALERT_HOURS || 12));
+
+/**
+ * Auto-résolution des alertes ÉVÉNEMENTIELLES obsolètes (erreurs frontend
+ * poussées par le 224Guard : ReferenceError, échec de chargement de composant…).
+ * Contrairement aux checks récurrents (escrow/money/aml, auto-résolus quand
+ * count=0), ces alertes n'ont aucun signal de fin → si l'anomalie ne se reproduit
+ * plus (BUG CORRIGÉ), elle doit DISPARAÎTRE. On résout donc les alertes 'active'
+ * NON issues du moniteur (source != 'platform_monitor') dont la dernière
+ * occurrence (metadata.last_seen sinon created_at) dépasse la fenêtre.
+ * Renvoie le nombre d'alertes résolues.
+ */
+export async function autoResolveStaleEventAlerts(windowHours = STALE_EVENT_ALERT_HOURS): Promise<number> {
+  const nowMs = Date.now();
+  const cutoffIso = new Date(nowMs - windowHours * 3_600_000).toISOString();
+  try {
+    const { data: candidates } = await supabaseAdmin
+      .from('system_alerts')
+      .select('id, created_at, metadata')
+      .eq('status', 'active')
+      // Exclut les alertes du moniteur récurrent (elles ont leur propre résolution par count=0).
+      .or('metadata->>source.is.null,metadata->>source.neq.platform_monitor')
+      .lt('created_at', cutoffIso)
+      .limit(2000);
+
+    // Sécurité : ne pas résoudre une alerte dédupliquée encore vue récemment (last_seen frais).
+    const ids = (candidates || [])
+      .filter((a: any) => {
+        const lastSeen = a.metadata?.last_seen || a.created_at;
+        return new Date(lastSeen).getTime() < nowMs - windowHours * 3_600_000;
+      })
+      .map((a: any) => a.id);
+
+    if (ids.length === 0) return 0;
+
+    // Traitement par lots (limite la taille de la clause IN).
+    for (let i = 0; i < ids.length; i += 200) {
+      await supabaseAdmin
+        .from('system_alerts')
+        .update({ status: 'resolved', resolved_at: new Date().toISOString() })
+        .in('id', ids.slice(i, i + 200));
+    }
+    logger.info(`[Monitor] auto-résolu ${ids.length} alerte(s) événementielle(s) obsolète(s) (> ${windowHours}h sans récurrence)`);
+    return ids.length;
+  } catch (e: any) {
+    logger.warn(`[Monitor] autoResolveStaleEventAlerts: ${e?.message || e}`);
+    return 0;
+  }
+}
+
 /**
  * Lance les domaines + renvoie leurs rapports et les alertes associées.
  * @param opts.skipFnDomains  ignore les domaines à scan RÉSEAU (ex. sécurité frontend) — utilisé par
@@ -216,11 +268,16 @@ export async function runPlatformMonitors(
     return { key: targets[i].key, label: targets[i].label, report: { generated_at: new Date().toISOString(), checks: [], overall: 'ok' as const } };
   });
 
+  // ✅ Auto-résout les alertes événementielles obsolètes (bug corrigé → l'erreur
+  // ne se reproduit plus → l'alerte disparaît) AVANT de relire la liste affichée.
+  await autoResolveStaleEventAlerts();
+
   const modules = MONITOR_DOMAINS.map((d) => d.module);
   const { data: alerts } = await supabaseAdmin
     .from('system_alerts')
     .select('id, title, message, severity, status, module, suggested_fix, created_at, metadata')
     .in('module', modules)
+    .eq('status', 'active')
     .order('created_at', { ascending: false })
     .limit(60);
 

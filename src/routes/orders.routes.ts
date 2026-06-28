@@ -1206,6 +1206,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-cod-delivery', verifyJWT, order
       .update({
         status: 'delivered',
         updated_at: nowIso,
+        delivery_confirmed_at: nowIso,   // ✅ départ du compte à rebours 7j (purge preuve)
         metadata: {
           ...(fullOrder.metadata && typeof fullOrder.metadata === 'object' ? fullOrder.metadata : {}),
           delivered_at: nowIso,
@@ -1308,6 +1309,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
       .update({
         status: 'delivered',
         updated_at: nowIso,
+        delivery_confirmed_at: nowIso,   // ✅ départ du compte à rebours 7j (purge preuve)
         metadata: {
           ...(fullOrder.metadata && typeof fullOrder.metadata === 'object' ? fullOrder.metadata : {}),
           delivered_at: nowIso,
@@ -1339,6 +1341,87 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
   } catch (error: any) {
     logger.error(`confirm-delivery error: ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la confirmation de réception' });
+  }
+});
+
+/**
+ * POST /api/orders/:orderId/delivery-proof — le vendeur enregistre les chemins
+ * (fichiers déjà uploadés dans le bucket privé delivery-proofs). Réservé au vendeur.
+ */
+router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { photo_path, video_path } = req.body || {};
+    if (!photo_path || typeof photo_path !== 'string') {
+      res.status(400).json({ success: false, error: 'photo_path requis' }); return;
+    }
+    const { data: order } = await supabaseAdmin
+      .from('orders').select('id, vendor_id').eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+    const { data: vendor } = await supabaseAdmin
+      .from('vendors').select('id').eq('id', order.vendor_id).eq('user_id', userId).maybeSingle();
+    if (!vendor) { res.status(403).json({ success: false, error: 'Action réservée au vendeur' }); return; }
+    // Anti-IDOR : les chemins DOIVENT être scopés à cette commande.
+    if (!photo_path.startsWith(`${orderId}/`) || (video_path && !String(video_path).startsWith(`${orderId}/`))) {
+      res.status(400).json({ success: false, error: 'Chemin de preuve invalide' }); return;
+    }
+    const { error } = await supabaseAdmin.from('orders').update({
+      delivery_proof_photo_path: photo_path,
+      delivery_proof_video_path: video_path || null,
+      delivery_proof_uploaded_at: new Date().toISOString(),
+    } as any).eq('id', orderId);
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    logger.info(`Delivery proof attached to order ${orderId} by vendor ${vendor.id}`);
+    res.json({ success: true });
+  } catch (e: any) {
+    logger.error(`[delivery-proof] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+/**
+ * GET /api/orders/:orderId/delivery-proof — URLs signées (1h) photo + vidéo.
+ * Accessible au vendeur ET au client de la commande. Renvoie purged=true si purgée.
+ */
+router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { data: order } = await supabaseAdmin
+      .from('orders')
+      .select('id, vendor_id, customer_id, delivery_proof_photo_path, delivery_proof_video_path, delivery_proof_purged_at')
+      .eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+
+    const o = order as any;
+    const isCustomer = o.customer_id === userId;
+    let isVendor = false;
+    if (!isCustomer) {
+      const { data: vendor } = await supabaseAdmin
+        .from('vendors').select('id').eq('id', o.vendor_id).eq('user_id', userId).maybeSingle();
+      isVendor = !!vendor;
+    }
+    if (!isCustomer && !isVendor) { res.status(403).json({ success: false, error: 'Accès refusé' }); return; }
+
+    if (o.delivery_proof_purged_at) {
+      res.json({ success: true, purged: true, photo_url: null, video_url: null }); return;
+    }
+    let photo_url: string | null = null, video_url: string | null = null;
+    if (o.delivery_proof_photo_path) {
+      const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+        .createSignedUrl(o.delivery_proof_photo_path, 3600);
+      photo_url = data?.signedUrl || null;
+    }
+    if (o.delivery_proof_video_path) {
+      const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+        .createSignedUrl(o.delivery_proof_video_path, 3600);
+      video_url = data?.signedUrl || null;
+    }
+    res.json({ success: true, purged: false, photo_url, video_url });
+  } catch (e: any) {
+    logger.error(`[delivery-proof GET] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
 
@@ -1567,7 +1650,7 @@ router.get('/vendor', verifyJWT, async (req: AuthenticatedRequest, res: Response
  * PATCH /api/orders/:orderId/status
  * P0 OPTIMIZED: Uses increment_stock_batch for vendor cancellations
  */
-router.patch('/:orderId([0-9a-fA-F-]{36})/status', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+router.patch('/:orderId([0-9a-fA-F-]{36})/status', verifyJWT, orderManageRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const { orderId } = req.params;

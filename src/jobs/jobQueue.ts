@@ -189,6 +189,40 @@ registerHandler('idempotency.cleanup', async () => {
   logger.info(`Idempotency cleanup: deleted ${count || 0} expired keys`);
 });
 
+// Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
+// supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
+registerHandler('delivery-proof.cleanup', async () => {
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const { data: orders, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, delivery_proof_photo_path, delivery_proof_video_path')
+    .lt('delivery_confirmed_at', cutoff)
+    .is('delivery_proof_purged_at', null)
+    .not('delivery_proof_photo_path', 'is', null)
+    .limit(200);
+  if (error) { logger.error(`[delivery-proof.cleanup] ${error.message}`); return; }
+  if (!orders?.length) { logger.info('Delivery proof cleanup: rien à purger'); return; }
+
+  let purged = 0;
+  for (const o of orders as any[]) {
+    const paths: string[] = [];
+    if (o.delivery_proof_photo_path) paths.push(o.delivery_proof_photo_path);
+    if (o.delivery_proof_video_path) paths.push(o.delivery_proof_video_path);
+    if (paths.length) {
+      const { error: delErr } = await supabaseAdmin.storage.from('delivery-proofs').remove(paths);
+      if (delErr) { logger.error(`[delivery-proof.cleanup] storage ${o.id}: ${delErr.message}`); continue; }
+    }
+    const { error: updErr } = await supabaseAdmin.from('orders').update({
+      delivery_proof_photo_path: null,
+      delivery_proof_video_path: null,
+      delivery_proof_purged_at: new Date().toISOString(),
+    } as any).eq('id', o.id);
+    if (updErr) { logger.error(`[delivery-proof.cleanup] db ${o.id}: ${updErr.message}`); continue; }
+    purged++;
+  }
+  logger.info(`Delivery proof cleanup: ${purged}/${orders.length} purgées`);
+});
+
 registerHandler('escrow.auto-release', async () => {
   const now = new Date().toISOString();
   const { data: escrows } = await supabaseAdmin
@@ -835,6 +869,7 @@ export const jobQueue = {
 
       recurringTimers.push(setInterval(() => this.enqueue('recommendations.recalculate', {}).catch(() => {}), every24Hours));
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
+      recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
       recurringTimers.push(setInterval(() => this.enqueue('beauty.reminders', {}).catch(() => {}), 15 * 60 * 1000));
 
@@ -871,6 +906,7 @@ export const jobQueue = {
       // Daily: recommendations + rappels d'expiration d'abonnement
       await queue.add('recommendations.recalculate', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
+      await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');

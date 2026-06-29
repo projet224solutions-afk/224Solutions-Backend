@@ -12,6 +12,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import * as autoHealing from '../services/autoHealing.service.js';
 import { getSystemMap, getLiveObservation } from '../services/systemContext.service.js';
+import { orderManageRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
@@ -34,6 +35,7 @@ const SERVICE_PROMPTS: Record<string, string> = {
   construction: "Tu es un expert BTP/construction. Tu estimes des ordres de prix (en GNF), expliques devis, garanties (décennale), et les bonnes questions avant de signer. Concis.",
   education: "Tu es un conseiller pédagogique. Tu recommandes des parcours de cours, expliques des concepts simplement, et génères des questions de révision. Concis.",
   location: "Tu es un expert immobilier locatif en Guinée. Tu compares des loyers par quartier, expliques droits/obligations locataire et propriétaire. Concis, en GNF.",
+  immobilier: "Tu es l'assistant du service Immobilier de 224Solutions (vente et location, caution sous escrow, paiement du loyer via wallet GNF, visites, états des lieux, mandats). Tu aides à chercher un bien, comprendre la caution séquestrée et sa libération, le paiement du loyer, les visites. Tu peux AUSSI chercher des produits sur le marketplace et des prestataires de proximité, et expliquer comment utiliser l'app. Concis, concret, en GNF.",
   maison: "Tu es un expert maison & déco. Tu conseilles aménagement, styles, et aides à cadrer une demande de devis. Concis.",
   media: "Tu es un expert photo/vidéo. Tu aides à choisir un package (mariage, portrait, événement), expliques droits à l'image et délais de livraison. Concis.",
   freelance: "Tu es un conseiller services professionnels (type Fiverr/Upwork). Tu aides à cadrer un besoin, comparer des offres, comprendre l'escrow. Concis.",
@@ -65,6 +67,12 @@ const APP_GUIDE = [
   '- Abonnement d\'un service : bouton « Mettre à niveau » → choisir un plan → confirmer (débité du wallet).',
   '- Suivi de commande/course : depuis le dashboard du rôle concerné (client, livreur, taxi).',
   '- Devis (Maison/Photo/Freelance/Réparation/Info) : le prestataire envoie un lien /devis/:id ; paiement direct ou séquestre.',
+  '- Créer un compte / se connecter : page /auth — choisir son rôle (client, vendeur, prestataire, livreur, taxi) ; un lien de confirmation arrive par email.',
+  '- Passer une commande : ajouter au panier → choisir l\'adresse de livraison → payer avec le wallet (GNF) → suivre la commande jusqu\'à la livraison.',
+  '- Vendre : créer sa boutique/son service depuis l\'inscription vendeur/prestataire, puis ajouter des produits (POS/Produits) ou des prestations.',
+  '- Livraison : suivre le colis en temps réel, puis « Confirmer la réception » pour libérer le paiement au vendeur (escrow).',
+  '- Litige : si un problème, ouvrir « Signaler un litige »/« Demander un remboursement » sur la commande ; un médiateur tranche, l\'argent reste séquestré jusqu\'à la décision.',
+  '- Changer de langue : sélecteur de langue (accueil/profil) pour l\'interface ; un sélecteur dédié traduit aussi les messages reçus.',
 ].join('\n');
 
 // Conseil par défaut par métier (utilisé quand aucune clé IA n'est configurée).
@@ -193,6 +201,37 @@ async function runProductSearch(q: string): Promise<any[]> {
   } catch { return []; }
 }
 
+// Recherche de prestataires/commerces de PROXIMITÉ (lecture seule, vitrine publique).
+// Réutilise professional_services.latitude/longitude. Tri par distance si position fournie.
+// ⚠️ Ne lit QUE la vitrine (is_active) : aucune donnée sensible (wallet/finance/incident).
+async function runNearbySearch(q: string, lat?: number, lng?: number): Promise<any[]> {
+  const query = String(q || '').trim();
+  try {
+    let req = supabaseAdmin.from('professional_services')
+      .select('id, business_name, service_type_id, city, latitude, longitude, is_active')
+      .eq('is_active', true)
+      .limit(12);
+    if (query.length >= 2) {
+      const safe = query.replace(/[%_\\]/g, '\\$&');
+      req = req.ilike('business_name', `%${safe}%`);
+    }
+    const { data } = await req;
+    let rows: any[] = data || [];
+    if (lat != null && lng != null) {
+      const dist = (la: number, lo: number) => {
+        const R = 6371, dLa = (la - lat) * Math.PI / 180, dLo = (lo - lng) * Math.PI / 180;
+        const a = Math.sin(dLa / 2) ** 2 + Math.cos(lat * Math.PI / 180) * Math.cos(la * Math.PI / 180) * Math.sin(dLo / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      };
+      rows = rows
+        .filter((r) => r.latitude != null && r.longitude != null)
+        .map((r) => ({ ...r, distance_km: Math.round(dist(r.latitude, r.longitude) * 10) / 10 }))
+        .sort((a, b) => a.distance_km - b.distance_km);
+    }
+    return rows.slice(0, 8).map((r) => ({ id: r.id, name: r.business_name, city: r.city, distance_km: r.distance_km ?? null }));
+  } catch { return []; }
+}
+
 // Outils proposés à Claude. search_products = exécuté serveur (lecture). propose_* = JAMAIS
 // exécuté serveur : renvoie une carte de CONFIRMATION au front (zéro débit silencieux).
 const COPILOT_TOOLS = [
@@ -217,6 +256,27 @@ const COPILOT_TOOLS = [
       service_query: { type: 'string', description: 'type de prestation ou nom du prestataire' },
       note: { type: 'string', description: "précision éventuelle (date souhaitée, besoin)" },
     }, required: ['service_query'] },
+  },
+  {
+    name: 'search_nearby',
+    description: "Recherche des prestataires/commerces de PROXIMITÉ sur 224Solutions (page Proximité) : restaurant, pharmacie, coiffeur, boutique, artisan… À utiliser quand l'utilisateur cherche un service ou commerce près de lui. Lecture seule (vitrine publique).",
+    input_schema: { type: 'object', properties: {
+      query: { type: 'string', description: 'type de prestataire/commerce ou nom' },
+    }, required: ['query'] },
+  },
+  {
+    name: 'explain_app',
+    description: "Explique à l'utilisateur COMMENT utiliser une fonctionnalité de 224Solutions (créer un compte, recharger le wallet, passer une commande, s'abonner à un plan, utiliser le marketplace ou la proximité, suivre une livraison, ouvrir un litige, changer de langue…). À utiliser dès que l'utilisateur demande de l'aide pour se servir de l'app.",
+    input_schema: { type: 'object', properties: {
+      topic: { type: 'string', description: 'sujet (wallet, commande, abonnement, marketplace, proximité, livraison, litige, langue…)' },
+    }, required: ['topic'] },
+  },
+  {
+    name: 'search_local_supply',
+    description: "Cherche un produit, un service ou un médicament (HORS ordonnance) DISPONIBLE chez les vendeurs et prestataires de 224Solutions — y compris les boutiques PHYSIQUES qui ne publient pas sur le marketplace et les pharmacies. Indique chez QUI c'est disponible et OÙ (ville, adresse, téléphone). À utiliser quand l'utilisateur cherche où trouver un produit/service précis près de lui. NE communique JAMAIS de quantité (seulement disponible/indisponible).",
+    input_schema: { type: 'object', properties: {
+      query: { type: 'string', description: 'le produit/service/médicament recherché' },
+    }, required: ['query'] },
   },
 ];
 
@@ -264,12 +324,67 @@ function buildProposedAction(name: string, input: any): any | null {
   return null;
 }
 
+// Exécution d'UN appel d'outil — PARTAGÉE par les boucles Claude ET OpenAI (DRY).
+// Renvoie le texte de résultat + éventuels produits (à accumuler) + carte d'action.
+// Toutes les capacités restent PROPOSITIONNELLES (search=lecture, propose=confirmation UI).
+async function executeCopilotTool(name: string, input: any, ctxLat?: number, ctxLng?: number): Promise<{ content: string; products?: any[]; action?: any; supply?: any[] }> {
+  if (name === 'search_local_supply') {
+    // Découverte UNIFIÉE du stock (marketplace + hors-marketplace + pharmacies hors ordonnance).
+    // RPC LECTURE SEULE qui ne renvoie JAMAIS la quantité (booléen `available` seulement).
+    try {
+      const { data } = await supabaseAdmin.rpc('copilot_search_supply' as any, {
+        p_query: String(input?.query || ''), p_lat: ctxLat ?? null, p_lng: ctxLng ?? null, p_limit: 12,
+      });
+      const items: any[] = (data as any)?.success ? ((data as any).items || []) : [];
+      const avail = items.filter((i) => i.available);
+      const content = avail.length
+        ? avail.slice(0, 12).map((i) => {
+            const loc = [i.city, i.country].filter(Boolean).join(', ');
+            const dist = i.dist != null ? ` (${i.dist} km)` : '';
+            const chan = i.on_marketplace ? 'sur le marketplace' : 'boutique/physique — contact direct';
+            return `${i.name} — DISPONIBLE chez ${i.seller_name || 'un vendeur'}${loc ? ' à ' + loc : ''}${dist} [${chan}] (id:${i.item_id})`;
+          }).join('\n') + "\n\n⚠️ Indique seulement « disponible » — NE donne JAMAIS de quantité. Hors marketplace → propose le CONTACT (appeler/itinéraire), pas une commande en ligne."
+        : 'Aucun vendeur/prestataire ne propose cet article pour le moment.';
+      return { content, supply: avail };
+    } catch { return { content: 'Recherche de disponibilité indisponible pour le moment.' }; }
+  }
+  if (name === 'search_products') {
+    const found = await runProductSearch(input?.query || '');
+    return { content: found.length ? found.map((p: any) => `${p.name} — ${p.price} (id:${p.id})`).join('\n') : 'Aucun produit trouvé.', products: found };
+  }
+  if (name === 'search_nearby') {
+    const near = await runNearbySearch(input?.query || '', ctxLat, ctxLng);
+    return { content: near.length ? near.map((n: any) => `${n.name}${n.city ? ' — ' + n.city : ''}${n.distance_km != null ? ' (' + n.distance_km + ' km)' : ''} (id:${n.id})`).join('\n') : 'Aucun prestataire de proximité trouvé.' };
+  }
+  if (name === 'explain_app') {
+    const topic = String(input?.topic || '').slice(0, 40);
+    const g = APP_GUIDE.length > 3500 ? APP_GUIDE.slice(0, 3500) : APP_GUIDE;
+    return { content: `Guide 224Solutions — explique le parcours CONCRET pour « ${topic} » à partir de :\n${g}` };
+  }
+  if (name === 'propose_order' || name === 'propose_booking' || name === 'propose_fix') {
+    const a = buildProposedAction(name, input);
+    return { content: a ? "Bouton de confirmation affiché à l'utilisateur. Rien n'est exécuté tant qu'il ne clique pas." : 'Paramètres insuffisants.', action: a || undefined };
+  }
+  if (name === 'scan_incidents') {
+    try { await autoHealing.scanAndDiagnose(); } catch { /* best-effort */ }
+    const all = await autoHealing.listIncidents();
+    const open = all.filter((i: any) => !['resolved', 'applied', 'failed'].includes(i.status));
+    const domain = String(input?.domain || '').toLowerCase();
+    const filtered = domain ? open.filter((i: any) => String(i.module || '').toLowerCase().includes(domain)) : open;
+    return { content: filtered.length
+      ? filtered.slice(0, 15).map((i: any) => `id:${i.id} | ${i.module}/${i.alert_key} | ${i.severity} | ${i.remediation_kind || '?'} | action:${i.final_action || '?'} | ${i.title}`).join('\n')
+      : 'Aucun incident ouvert' + (domain ? ` pour le domaine « ${domain} ».` : '.') };
+  }
+  return { content: 'Outil inconnu.' };
+}
+
 // Boucle d'outils Anthropic (max 4 tours). Exécute search_products côté serveur, collecte les
 // propose_* comme cartes de confirmation. Renvoie texte + produits trouvés + actions proposées.
-async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools: any[]): Promise<{ text: string | null; products: any[]; actions: any[] }> {
+async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools: any[], ctxLat?: number, ctxLng?: number): Promise<{ text: string | null; products: any[]; actions: any[]; supply: any[] }> {
   const messages: any[] = chat.map((m) => ({ role: m.role, content: m.content }));
   const products: any[] = [];
   const actions: any[] = [];
+  const supplies: any[] = [];
   try {
     for (let turn = 0; turn < 4; turn++) {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -277,7 +392,7 @@ async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools
         headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 800, system: sys, tools, messages }),
       });
-      if (!r.ok) { logger.warn(`[copilot] anthropic(tools) ${r.status}`); return { text: null, products, actions }; }
+      if (!r.ok) { logger.warn(`[copilot] anthropic(tools) ${r.status}`); return { text: null, products, actions, supply: supplies }; }
       const data: any = await r.json();
       const content: any[] = Array.isArray(data.content) ? data.content : [];
       if (data.stop_reason === 'tool_use') {
@@ -285,39 +400,111 @@ async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools
         const toolResults: any[] = [];
         for (const block of content) {
           if (block?.type !== 'tool_use') continue;
-          if (block.name === 'search_products') {
-            const found = await runProductSearch(block.input?.query || '');
-            for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: found.length ? found.map((p) => `${p.name} — ${p.price} (id:${p.id})`).join('\n') : 'Aucun produit trouvé.' });
-          } else if (block.name === 'propose_order' || block.name === 'propose_booking' || block.name === 'propose_fix') {
-            const a = buildProposedAction(block.name, block.input);
-            if (a) actions.push(a);
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: a ? 'Bouton de confirmation affiché au PDG. Rien n\'est exécuté tant qu\'il ne clique pas.' : 'Paramètres insuffisants.' });
-          } else if (block.name === 'scan_incidents') {
-            // PDG uniquement : ingest + diagnostic dual-IA, puis liste des incidents ouverts.
-            try { await autoHealing.scanAndDiagnose(); } catch { /* best-effort */ }
-            const all = await autoHealing.listIncidents();
-            const open = all.filter((i: any) => !['resolved', 'applied', 'failed'].includes(i.status));
-            const domain = String(block.input?.domain || '').toLowerCase();
-            const filtered = domain ? open.filter((i: any) => String(i.module || '').toLowerCase().includes(domain)) : open;
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: filtered.length
-                ? filtered.slice(0, 15).map((i: any) => `id:${i.id} | ${i.module}/${i.alert_key} | ${i.severity} | ${i.remediation_kind || '?'} | action:${i.final_action || '?'} | ${i.title}`).join('\n')
-                : 'Aucun incident ouvert' + (domain ? ` pour le domaine « ${domain} ».` : '.') });
-          } else {
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Outil inconnu.' });
-          }
+          const r = await executeCopilotTool(block.name, block.input, ctxLat, ctxLng);
+          if (r.products) for (const f of r.products) if (!products.some((p) => p.id === f.id)) products.push(f);
+          if (r.action) actions.push(r.action);
+          if (r.supply) for (const s of r.supply) if (!supplies.some((x) => x.item_id === s.item_id)) supplies.push(s);
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: r.content });
         }
         messages.push({ role: 'user', content: toolResults });
         continue;
       }
       const txt = content.find((c: any) => c?.type === 'text')?.text?.trim() || null;
-      return { text: txt, products: products.slice(0, 6), actions };
+      return { text: txt, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) };
     }
-    return { text: null, products: products.slice(0, 6), actions };
-  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions }; }
+    return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) };
+  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) }; }
+}
+
+// Convertit les tools (format Anthropic) au format function-calling OpenAI.
+function toOpenAITools(tools: any[]): any[] {
+  return tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema || { type: 'object', properties: {} } } }));
+}
+
+// Boucle d'outils OpenAI (gpt-4o, function calling) — MÊME contrat que callAnthropicAgentic,
+// MÊMES outils (executeCopilotTool). Permet une vraie bascule provider avec capacités égales.
+async function callOpenAIAgentic(key: string, sys: string, chat: any[], tools: any[], ctxLat?: number, ctxLng?: number): Promise<{ text: string | null; products: any[]; actions: any[]; supply: any[] }> {
+  const messages: any[] = [{ role: 'system', content: sys }, ...chat.map((m) => ({ role: m.role, content: m.content }))];
+  const oaTools = toOpenAITools(tools);
+  const products: any[] = [];
+  const actions: any[] = [];
+  const supplies: any[] = [];
+  try {
+    for (let turn = 0; turn < 4; turn++) {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-4o', max_tokens: 800, temperature: 0.4, messages, tools: oaTools, tool_choice: 'auto' }),
+      });
+      if (!r.ok) { logger.warn(`[copilot] openai(tools) ${r.status}`); return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) }; }
+      const data: any = await r.json();
+      const msg = data.choices?.[0]?.message;
+      if (!msg) return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) };
+      const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+      if (calls.length) {
+        messages.push(msg);
+        for (const c of calls) {
+          let input: any = {};
+          try { input = JSON.parse(c.function?.arguments || '{}'); } catch { input = {}; }
+          const res = await executeCopilotTool(String(c.function?.name || ''), input, ctxLat, ctxLng);
+          if (res.products) for (const f of res.products) if (!products.some((p) => p.id === f.id)) products.push(f);
+          if (res.action) actions.push(res.action);
+          if (res.supply) for (const s of res.supply) if (!supplies.some((x) => x.item_id === s.item_id)) supplies.push(s);
+          messages.push({ role: 'tool', tool_call_id: c.id, content: res.content });
+        }
+        continue;
+      }
+      const txt = typeof msg.content === 'string' ? msg.content.trim() : null;
+      return { text: txt || null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) };
+    }
+    return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) };
+  } catch (e: any) { logger.warn(`[copilot] openai(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, supply: supplies.slice(0, 12) }; }
+}
+
+// PARTIE 5 — VISION : analyse une image (base64) → mots-clés → recherche marketplace.
+// LECTURE/PROPOSITION uniquement : ne commande/paie JAMAIS. Claude vision en primaire,
+// gpt-4o vision en secours. Renvoie { description, keywords, products }.
+async function analyzeImageAndSearch(imageBase64: string, hint: string, anthropicKey?: string, openaiKey?: string): Promise<{ description: string; keywords: string; products: any[] } | null> {
+  // Normaliser : accepter une data URL ou du base64 brut.
+  const m = /^data:(image\/[a-zA-Z+]+);base64,(.*)$/s.exec(imageBase64 || '');
+  const mediaType = m ? m[1] : 'image/jpeg';
+  const b64 = m ? m[2] : String(imageBase64 || '').replace(/^data:[^,]+,/, '');
+  if (!b64 || b64.length < 50) return null;
+  const ask = `Décris en français ce que montre l'image, puis donne 3 à 6 MOTS-CLÉS de recherche e-commerce (produit, type, couleur, marque si visible).${hint ? ` Indice de l'utilisateur : ${String(hint).slice(0, 120)}.` : ''} Format STRICT :\nDESCRIPTION: <une phrase>\nKEYWORDS: <mots-clés séparés par des virgules>`;
+  let raw: string | null = null;
+  try {
+    if (anthropicKey) {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 300, messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } },
+          { type: 'text', text: ask },
+        ] }] }),
+      });
+      if (r.ok) { const d: any = await r.json(); raw = (Array.isArray(d.content) ? d.content.find((c: any) => c.type === 'text')?.text : '') || null; }
+      else logger.warn(`[copilot] vision anthropic ${r.status}`);
+    }
+    if (!raw && openaiKey) {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-4o', max_tokens: 300, messages: [{ role: 'user', content: [
+          { type: 'text', text: ask },
+          { type: 'image_url', image_url: { url: `data:${mediaType};base64,${b64}` } },
+        ] }] }),
+      });
+      if (r.ok) { const d: any = await r.json(); raw = d.choices?.[0]?.message?.content?.trim() || null; }
+      else logger.warn(`[copilot] vision openai ${r.status}`);
+    }
+  } catch (e: any) { logger.warn(`[copilot] vision err ${e?.message}`); return null; }
+  if (!raw) return null;
+  const desc = (/DESCRIPTION:\s*(.+)/i.exec(raw)?.[1] || raw.split('\n')[0] || '').trim().slice(0, 200);
+  const kw = (/KEYWORDS:\s*(.+)/i.exec(raw)?.[1] || desc).trim().slice(0, 120);
+  // Cherche le marketplace avec les mots-clés les plus saillants (1ers termes).
+  const firstTerms = kw.split(/[,;]/).map((s) => s.trim()).filter(Boolean).slice(0, 2).join(' ');
+  const products = await runProductSearch(firstTerms || kw);
+  return { description: desc, keywords: kw, products };
 }
 
 // Extraction de mémoire PAR CLAUDE (remplace l'heuristique quand la clé existe). Petit modèle
@@ -356,12 +543,16 @@ async function extractMemoriesLLM(userId: string, message: string, key: string) 
 
 router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const service = String(req.body?.service ?? '').toLowerCase();
+    let service = String(req.body?.service ?? '').toLowerCase();
     const message = String(req.body?.message ?? '').trim();
     const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
     const context = (req.body?.context && typeof req.body.context === 'object') ? req.body.context : null;
     const userId = req.user!.id;
     if (!message) { res.status(400).json({ success: false, error: 'message requis' }); return; }
+
+    // Position de l'utilisateur (pour search_nearby) — depuis le context du front, si fournie.
+    const ctxLat = typeof context?.latitude === 'number' ? context.latitude : (typeof context?.lat === 'number' ? context.lat : undefined);
+    const ctxLng = typeof context?.longitude === 'number' ? context.longitude : (typeof context?.lng === 'number' ? context.lng : undefined);
 
     // Contexte utilisateur temps réel (Phase 1, optionnel) — injecté dans le system prompt.
     const ctxLine = context ? [
@@ -396,6 +587,16 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
         pdgMode = ['pdg', 'ceo', 'admin'].includes(String(prof?.role || '').toLowerCase());
       } catch { pdgMode = false; }
     }
+
+    // ── BARRIÈRE PDG — GARDE DÉFENSIVE (PARTIE 3) ──
+    // Un NON-pdg qui demande service='pdg' → pdgMode reste false (rôle vérifié en DB).
+    // On bascule explicitement sur le copilote standard : AUCUN prompt/outil/contexte PDG.
+    // (PDG_TOOLS et pdgContext sont déjà gated par pdgMode ; ici on neutralise aussi le
+    //  system prompt 'pdg' pour ne laisser passer AUCUNE personnalité de supervision.)
+    if (service === 'pdg' && !pdgMode) {
+      logger.warn(`[copilot] Accès PDG refusé pour user ${userId} (rôle insuffisant) → copilote standard`);
+      service = 'general';
+    }
     let pdgContext = '';
     if (pdgMode) {
       try {
@@ -404,8 +605,34 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
       } catch { /* best-effort */ }
     }
 
+    // PARTIE 5 — VISION : si une image est jointe, l'analyser + chercher le marketplace AVANT le LLM,
+    // puis donner le résultat au modèle (qui PROPOSE). Lecture/proposition seulement, jamais d'achat auto.
+    const image = typeof req.body?.image === 'string' ? req.body.image : '';
+    const visionProducts: any[] = [];
+    let visionNote = '';
+    if (image) {
+      const vr = await analyzeImageAndSearch(image, message, process.env.ANTHROPIC_API_KEY, process.env.OPENAI_API_KEY);
+      if (vr) {
+        for (const p of vr.products) visionProducts.push(p);
+        visionNote = `\n\n=== IMAGE ENVOYÉE PAR L'UTILISATEUR (analyse vision) ===\nDescription : ${vr.description}\nMots-clés : ${vr.keywords}\nProduits trouvés sur le marketplace : ${vr.products.length ? vr.products.map((p: any) => `${p.name} (id:${p.id})`).join(', ') : 'aucun'}.\nExplique à l'utilisateur ce que tu vois, propose ces produits, et propose de commander (propose_order) UNIQUEMENT s'il le souhaite. Ne commande/paie jamais seul.`;
+      } else {
+        visionNote = "\n\n=== IMAGE ENVOYÉE ===\nL'analyse de l'image a échoué ; demande poliment une description écrite.";
+      }
+    }
+
+    // PARTIE 2 — TOUTES LES LANGUES : langue cible = préférence/contexte front, sinon fr.
+    // Les LLM (Claude/GPT-4o) gèrent 100+ langues ; on leur demande de répondre dans CELLE de l'utilisateur.
+    const userLang = String(context?.lang || context?.language || context?.locale || 'fr').toLowerCase().slice(0, 8) || 'fr';
+    const langLine = `\n\n=== LANGUE ===\nRéponds TOUJOURS dans la langue de l'utilisateur (code : ${userLang}). S'il écrit dans une autre langue, adapte-toi à SA langue. Tu maîtrises toutes les langues, y compris les langues africaines (wolof, peul, soussou, swahili…). Pour les langues à faibles ressources, reste simple et clair.`;
+
+    // PARTIE 3.3 — CONFIDENTIALITÉ DES DISPONIBILITÉS (règle stricte, demande de Thierno).
+    const supplyLine = `\n\n=== DISPONIBILITÉ DES PRODUITS (règles strictes) ===\nQuand tu présentes un article trouvé via search_local_supply :\n- Dis seulement qu'il est DISPONIBLE chez le vendeur (« en stock », « disponible »). NE DONNE JAMAIS la quantité (jamais « il en reste X ») — tu n'as pas cette info.\n- Indique le vendeur, la ville et, si présent, l'adresse/téléphone.\n- Si l'article n'est PAS sur le marketplace, propose le CONTACT (appeler, adresse/itinéraire), PAS une commande en ligne. S'il est sur le marketplace, tu peux proposer de commander (propose_order, confirmation dans l'app).\n- Médicaments : aucun conseil médical ; tu indiques seulement qu'une pharmacie a le produit (hors ordonnance). Pour tout médicament sur ordonnance, invite à consulter un pharmacien/médecin avec l'ordonnance, sans dire « en stock ».`;
+
     const sys = (SERVICE_PROMPTS[service] || DEFAULT_PROMPT)
       + " Ne donne jamais de conseil dangereux ; pour un acte technique risqué, recommande un professionnel."
+      + langLine
+      + supplyLine
+      + visionNote
       + (ctxLine ? `\n\n${ctxLine}` : '')
       + (memLine ? `\n\n${memLine}` : '')
       + (guide ? `\n\n${guide}` : '')
@@ -424,20 +651,33 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     let provider = '';
     let products: any[] = [];
     let actions: any[] = [];
+    let supply: any[] = [];
     const tools = pdgMode ? PDG_TOOLS : COPILOT_TOOLS;
 
-    if (anthropicKey) {
-      const out = await callAnthropicAgentic(anthropicKey, sys, chat, tools);
-      reply = out.text; products = out.products; actions = out.actions;
-      if (reply) provider = 'anthropic';
+    // PARTIE 1 — MULTI-PROVIDER : Claude ET OpenAI, tous DEUX avec tools (function calling).
+    // COPILOT_PROVIDER = 'anthropic' | 'openai' | 'auto' (défaut auto = Claude d'abord).
+    const PREFERRED = (process.env.COPILOT_PROVIDER || 'auto').toLowerCase();
+    const tryAnthropic = async () => anthropicKey ? await callAnthropicAgentic(anthropicKey, sys, chat, tools, ctxLat, ctxLng) : null;
+    const tryOpenAI = async () => openaiKey ? await callOpenAIAgentic(openaiKey, sys, chat, tools, ctxLat, ctxLng) : null;
+    const order: Array<[string, () => Promise<{ text: string | null; products: any[]; actions: any[]; supply: any[] } | null>]> =
+      PREFERRED === 'openai' ? [['openai', tryOpenAI], ['anthropic', tryAnthropic]] : [['anthropic', tryAnthropic], ['openai', tryOpenAI]];
+    for (const [pname, fn] of order) {
+      if (reply) break;
+      const out = await fn();
+      if (out && out.text) { reply = out.text; products = out.products; actions = out.actions; supply = out.supply || []; provider = pname; }
     }
+    // Dernier recours TEXTE-ONLY (sans tools) : Lovable (Gemini) puis OpenAI mini.
     if (!reply && lovableKey) { reply = await callOpenAILike(lovableKey, true, sys, chat); if (reply) provider = 'lovable'; }
-    if (!reply && openaiKey) { reply = await callOpenAILike(openaiKey, false, sys, chat); if (reply) provider = 'openai'; }
+    if (!reply && openaiKey) { reply = await callOpenAILike(openaiKey, false, sys, chat); if (reply) provider = 'openai-mini'; }
+
+    // Produits trouvés par la vision → cartes (fusion dédupliquée avec ceux des tools).
+    for (const p of visionProducts) if (!products.some((x) => x.id === p.id)) products.push(p);
+    products = products.slice(0, 6);
 
     const fallback = !reply;
     const finalReply = reply || web || fallbackReply(service, message);
     await remember(userId, service, message, finalReply);
-    res.json({ success: true, reply: finalReply, fallback, source: fallback ? (web ? 'web' : 'local') : provider, products, actions });
+    res.json({ success: true, reply: finalReply, fallback, source: fallback ? (web ? 'web' : 'local') : provider, products, actions, supply });
   } catch (e: any) {
     logger.error(`[copilot] ${e?.message}`);
     res.status(500).json({ success: false, error: 'Erreur Copilot' });
@@ -457,6 +697,33 @@ router.post('/search', verifyJWT, async (req: AuthenticatedRequest, res: Respons
 });
 
 // Phase 2 — historique persistant de l'utilisateur (pour préchargement de la bulle).
+// PARTIE 3 — TRANSCRIPTION VOCALE : audio (base64) → texte via OpenAI Whisper (multilingue).
+// Le front enregistre au micro et envoie ici ; on remplit le champ message. Rate-limité (coût).
+router.post('/transcribe', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) { res.status(503).json({ success: false, error: 'Transcription indisponible (OPENAI_API_KEY non configurée)' }); return; }
+    const audioBase64 = String(req.body?.audio || '');
+    const lang = req.body?.lang ? String(req.body.lang).toLowerCase().slice(0, 5) : undefined;
+    const mm = /^data:(audio\/[a-zA-Z0-9.+-]+);base64,(.*)$/s.exec(audioBase64);
+    const mime = mm ? mm[1] : 'audio/webm';
+    const b64 = mm ? mm[2] : audioBase64.replace(/^data:[^,]+,/, '');
+    if (!b64 || b64.length < 50) { res.status(400).json({ success: false, error: 'audio requis' }); return; }
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length > 25 * 1024 * 1024) { res.status(413).json({ success: false, error: 'audio trop volumineux (25 Mo max)' }); return; }
+    const ext = mime.includes('mp4') ? 'mp4' : mime.includes('mpeg') ? 'mp3' : mime.includes('wav') ? 'wav' : mime.includes('ogg') ? 'ogg' : 'webm';
+    const fd = new FormData();
+    fd.append('file', new Blob([buf], { type: mime }), `audio.${ext}`);
+    fd.append('model', 'whisper-1');
+    fd.append('response_format', 'verbose_json');
+    if (lang) fd.append('language', lang);
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${key}` }, body: fd as any });
+    if (!r.ok) { logger.warn(`[copilot] transcribe ${r.status}`); res.status(502).json({ success: false, error: 'Transcription échouée' }); return; }
+    const d: any = await r.json();
+    res.json({ success: true, text: String(d.text || '').trim(), detectedLang: d.language || lang || null });
+  } catch (e: any) { logger.warn(`[copilot] transcribe err ${e?.message}`); res.status(500).json({ success: false, error: 'Erreur transcription' }); }
+});
+
 router.get('/history', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const service = String(req.query?.service ?? '');

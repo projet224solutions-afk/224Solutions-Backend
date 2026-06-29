@@ -730,34 +730,29 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
 
     // (Affiliation = produits NUMÉRIQUES uniquement → gérée dans l'endpoint /digital, pas ici.)
 
-    let escrowStatus = result.escrow_status as string;
-    const { error: escrowUpdateError } = await supabaseAdmin
-      .from('escrow_transactions')
-      .update({
-        // ⚠️ L'escrow tient le MONTANT PRODUIT (dû au vendeur), PAS le montant chargé : ce dernier
-        // inclut la commission acheteur déjà prélevée séparément → sinon le vendeur est sur-payé de
-        // la commission acheteur (fuite). create_order_core a déjà mis amount = subtotal ; on le garde.
-        amount: Number((result as any).subtotal ?? effectiveChargedAmount),
-        status: payment_method === 'cash' ? 'pending' : result.escrow_status,
-        metadata: {
-          ...(payment_method === 'cash'
-            ? {
-              payment_type: 'cash_on_delivery',
-              note: 'Paiement à la livraison - escrow virtuel',
-            }
-            : {}),
-          ...(payment_intent_id ? { external_payment_id: payment_intent_id } : {}),
-          ...(order_metadata || {}),
-        },
-      })
-      .eq('order_id', result.order_id);
+    const escrowStatus = result.escrow_status as string;   // 'none' en COD (la RPC ne crée plus d'escrow)
 
-    if (escrowUpdateError) {
-      logger.error(`escrow finalization non bloquant (order ${result.order_id}): ${escrowUpdateError.message}`);
-    }
+    // ESCROW : existe UNIQUEMENT hors COD. En 'cash' (paiement à la livraison), le wallet n'est pas
+    // débité, la plateforme ne retient AUCUN fonds → aucun escrow créé, donc aucun à mettre à jour.
+    if (payment_method !== 'cash') {
+      const { error: escrowUpdateError } = await supabaseAdmin
+        .from('escrow_transactions')
+        .update({
+          // ⚠️ L'escrow tient le MONTANT PRODUIT (dû au vendeur), PAS le montant chargé : ce dernier
+          // inclut la commission acheteur déjà prélevée séparément → sinon le vendeur est sur-payé de
+          // la commission acheteur (fuite). create_order_core a déjà mis amount = subtotal ; on le garde.
+          amount: Number((result as any).subtotal ?? effectiveChargedAmount),
+          status: result.escrow_status,
+          metadata: {
+            ...(payment_intent_id ? { external_payment_id: payment_intent_id } : {}),
+            ...(order_metadata || {}),
+          },
+        })
+        .eq('order_id', result.order_id);
 
-    if (payment_method === 'cash') {
-      escrowStatus = 'pending';
+      if (escrowUpdateError) {
+        logger.error(`escrow finalization non bloquant (order ${result.order_id}): ${escrowUpdateError.message}`);
+      }
     }
 
     try {
@@ -1154,7 +1149,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/cancel', verifyJWT, orderManageRateLimi
 /**
  * POST /api/orders/:orderId/confirm-cod-delivery
  * L'ACHETEUR confirme la réception d'une commande payée à la livraison (COD / cash).
- * → marque la commande 'delivered' + clôture l'escrow virtuel COD. Aucun mouvement wallet (espèces).
+ * → marque la commande 'delivered'. AUCUN escrow en COD (la plateforme ne retient rien) ni mouvement wallet.
  */
 router.post('/:orderId([0-9a-fA-F-]{36})/confirm-cod-delivery', verifyJWT, orderManageRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -1198,12 +1193,8 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-cod-delivery', verifyJWT, order
 
     const nowIso = new Date().toISOString();
 
-    // Clôturer l'escrow virtuel COD (le vendeur a reçu les espèces en main propre).
-    await supabaseAdmin
-      .from('escrow_transactions')
-      .update({ status: 'released', released_at: nowIso, seller_confirmed_at: nowIso })
-      .eq('order_id', orderId);
-
+    // COD = aucun escrow (le wallet n'est pas débité, la plateforme ne retient rien). Le vendeur a
+    // reçu les espèces en main propre → on marque simplement la commande livrée, rien à clôturer.
     const { data: updated, error } = await supabaseAdmin
       .from('orders')
       .update({

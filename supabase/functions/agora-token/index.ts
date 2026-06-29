@@ -172,60 +172,20 @@ serve(async (req) => {
       return unauthorized('Token vide');
     }
 
-    // Extraire le user_id depuis le JWT
-    const parseJwtPayload = (jwt: string): unknown => {
-      const parts = jwt.split('.');
-      if (parts.length !== 3) return null;
-      const base64Url = parts[1];
-      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-      const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
-      const json = atob(padded);
-      return JSON.parse(json);
-    };
-
-    const claims = parseJwtPayload(token) as { sub?: string; exp?: number } | null;
-    const userId = typeof claims?.sub === 'string' ? claims.sub : null;
-    const exp = typeof claims?.exp === 'number' ? claims.exp : null;
-
-    if (!userId) {
-      return unauthorized('JWT sans sub');
-    }
-
-    if (exp && exp <= Math.floor(Date.now() / 1000)) {
-      return unauthorized('JWT expiré');
-    }
-
-    // Confirmer le token via une requête DB
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      },
+    // ✅ PARTIE 1 — Vérifier la SIGNATURE du JWT via Supabase (getUser valide la
+    // signature côté serveur). On ne fait PLUS confiance à un simple atob du payload :
+    // un JWT forgé est rejeté ici. Le userId obtenu est de confiance.
+    const supabaseAuth = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+      auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('id', userId)
-      .maybeSingle();
-
-    // ✅ Blocage STRICT : le client Supabase ci-dessus utilise le JWT de l'appelant
-    // comme header d'auth → si Supabase rejette le token, profileError est non-null.
-    // Si le profil n'existe pas, l'utilisateur n'est pas légitime → refus.
-    if (profileError) {
-      console.warn('[agora-token] Erreur Supabase auth:', profileError.message);
-      return unauthorized('Token Supabase invalide ou expiré');
+    const { data: { user }, error: authErr } = await supabaseAuth.auth.getUser();
+    if (authErr || !user) {
+      console.warn('[agora-token] getUser a rejeté le token:', authErr?.message);
+      return unauthorized('Token invalide');
     }
-    if (!profile) {
-      console.warn('[agora-token] Profil introuvable pour userId:', userId);
-      return unauthorized('Utilisateur non trouvé');
-    }
-    // À ce stade : userId est authentifié ET correspond à un profil réel ✅
+    const userId = user.id;   // ← user_id de confiance (signature validée par Supabase)
 
     const { channel, uid: requestedUid, role = 'publisher' } = await req.json();
 
@@ -242,6 +202,41 @@ serve(async (req) => {
     };
 
     const safeChannel = sanitizeChannelName(channel);
+
+    // ⚠️ PARTIE 2 — GARDE DE CONFIDENTIALITÉ : ne délivrer un token QUE si l'utilisateur
+    // est participant (appelant OU appelé) d'un appel ACTIF sur ce canal. Empêche un tiers
+    // d'obtenir un token pour le canal d'autrui → écouter l'appel. FAIL-CLOSED : pas d'appel
+    // actif où l'user est participant + le canal correspond → REFUS.
+    // (Lecture via service-role : on ne lit QUE les appels où l'user est caller/receiver.)
+    const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+    if (!serviceRoleKey) {
+      console.error('[agora-token] SUPABASE_SERVICE_ROLE_KEY manquant');
+      throw new Error('Configuration serveur manquante');
+    }
+    const admin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { data: activeCalls, error: callsErr } = await admin
+      .from('calls')
+      .select('id, caller_id, receiver_id, status, metadata')
+      .or(`caller_id.eq.${userId},receiver_id.eq.${userId}`)
+      .in('status', ['ringing', 'accepted']);   // statuts ACTIFS (enum call_status_type)
+    if (callsErr) {
+      console.error('[agora-token] lecture calls échouée:', callsErr.message);
+      return unauthorized('Vérification de participation impossible');
+    }
+    // Le canal d'un appel = metadata.agora_channel (posé à l'initiation) ou le repli call_<id>.
+    // On compare en forme SANITISÉE (cohérent avec le canal réellement utilisé pour le join).
+    const isParticipant = (activeCalls || []).some((c: any) => {
+      const candidates = [c?.metadata?.agora_channel, `call_${c?.id}`]
+        .filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
+        .map(sanitizeChannelName);
+      return candidates.includes(safeChannel);
+    });
+    if (!isParticipant) {
+      console.warn(`[agora-token] REFUS confidentialité — user=${userId} non participant du canal=${safeChannel}`);
+      return unauthorized("Vous n'êtes pas participant d'un appel actif sur ce canal");
+    }
 
     // Utiliser l'UID fourni par le client si présent (doit matcher l'UID utilisé côté RTC join)
     const fallbackUid = String(uuidToNumericUid(userId));

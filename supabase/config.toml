@@ -57,6 +57,11 @@ enabled = true
 [auth.web3.ethereum]
 enabled = true
 
+[functions.agora-token]
+# Appels Agora : exiger un JWT Supabase valide AVANT d'invoquer la fonction
+# (défense en profondeur — la fonction revérifie aussi via getUser + garde participant).
+verify_jwt = true
+
 [functions.secure-payment-init]
 verify_jwt = true
 

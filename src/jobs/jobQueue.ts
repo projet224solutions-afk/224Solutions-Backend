@@ -331,6 +331,42 @@ registerHandler('stripe.reconcile-pending', async () => {
   logger.info(`Stripe reconcile: ${fixed} paiement(s) rattrapé(s) sur ${pend.length}`);
 });
 
+// 🚕 Réattribution taxi : une course 'requested' sans chauffeur au-delà d'un délai laisse le
+// client dans le vide. Après 3 min sans acceptation → clôturée par le système
+// (cancel_reason 'no_driver_found') pour libérer le client. La re-proposition au chauffeur
+// suivant est gérée en temps réel (declined_drivers) ; ce job est le filet anti-attente infinie.
+registerHandler('taxi.reassign-stale-requests', async () => {
+  const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();   // 3 min sans chauffeur
+  const { data: stale, error } = await supabaseAdmin
+    .from('taxi_trips')
+    .select('id, customer_id, requested_at')
+    .eq('status', 'requested')
+    .is('driver_id', null)
+    .lt('requested_at', cutoff)
+    .limit(50);
+  if (error) { logger.error(`[taxi.reassign] ${error.message}`); return; }
+  if (!stale?.length) { logger.info('taxi.reassign: aucune course en attente'); return; }
+
+  let closed = 0;
+  for (const r of stale as any[]) {
+    const { error: updErr } = await supabaseAdmin
+      .from('taxi_trips')
+      .update({
+        status: 'cancelled',
+        cancelled_by: 'system',
+        cancel_reason: 'no_driver_found',
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', r.id)
+      .eq('status', 'requested')   // garde optimiste anti-course
+      .is('driver_id', null);
+    if (updErr) { logger.error(`[taxi.reassign] ${r.id}: ${updErr.message}`); continue; }
+    closed++;
+  }
+  logger.info(`taxi.reassign: ${closed}/${stale.length} course(s) sans chauffeur clôturée(s)`);
+});
+
 registerHandler('escrow.auto-release', async () => {
   const now = new Date().toISOString();
   const { data: escrows } = await supabaseAdmin
@@ -983,6 +1019,8 @@ export const jobQueue = {
       // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
       recurringTimers.push(setInterval(() => this.enqueue('orders.cancel-abandoned-card', {}).catch(() => {}), 15 * 60 * 1000));
       recurringTimers.push(setInterval(() => this.enqueue('stripe.reconcile-pending', {}).catch(() => {}), 10 * 60 * 1000));
+      // Taxi : filet anti-attente infinie des courses sans chauffeur (toutes les 60 s)
+      recurringTimers.push(setInterval(() => this.enqueue('taxi.reassign-stale-requests', {}).catch(() => {}), 60 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;
@@ -1022,6 +1060,7 @@ export const jobQueue = {
       // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
       await queue.add('orders.cancel-abandoned-card', {}, { repeat: { every: 15 * 60 * 1000 } });
       await queue.add('stripe.reconcile-pending', {}, { repeat: { every: 10 * 60 * 1000 } });
+      await queue.add('taxi.reassign-stale-requests', {}, { repeat: { every: 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');
     } catch (err: any) {

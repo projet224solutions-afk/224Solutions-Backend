@@ -22,6 +22,7 @@ import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
+import { applyPaymentSucceeded, getStripeSecretKey } from '../routes/webhooks.routes.js';
 
 const REDIS_JOBS_ENABLED = (process.env.REDIS_ENABLED ?? (env.isProduction ? 'true' : 'false')) === 'true';
 
@@ -221,6 +222,113 @@ registerHandler('delivery-proof.cleanup', async () => {
     purged++;
   }
   logger.info(`Delivery proof cleanup: ${purged}/${orders.length} purgées`);
+});
+
+// 🧹 Annule les commandes CARTE 'pending' jamais confirmées par le webhook (client parti au
+// moment de payer). Au-delà de 30 min → annulation ; le trigger restore_stock_on_order_cancel
+// remet le stock automatiquement. JAMAIS COD (payment_method='cash'), JAMAIS 'paid'. Garde
+// optimiste anti-course (.eq payment_status 'pending' sur l'UPDATE).
+registerHandler('orders.cancel-abandoned-card', async () => {
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();   // 30 min
+  const { data: stale, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, created_at, payment_intent_id')
+    .eq('payment_method', 'card')
+    .eq('payment_status', 'pending')
+    .neq('status', 'cancelled')
+    .neq('status', 'delivered')
+    .lt('created_at', cutoff)
+    .limit(100);
+  if (error) { logger.error(`[orders.cancel-abandoned-card] ${error.message}`); return; }
+  if (!stale?.length) { logger.info('Abandoned card orders: rien à annuler'); return; }
+
+  let cancelled = 0;
+  for (const o of stale as any[]) {
+    // ⚠️ DOUBLE-CHECK anti-course : re-lire juste avant (un paiement peut aboutir entre-temps).
+    const { data: fresh } = await supabaseAdmin
+      .from('orders').select('payment_status, metadata').eq('id', o.id).maybeSingle();
+    if (!fresh || fresh.payment_status !== 'pending') continue;   // payée entre-temps → ne pas toucher
+
+    const { error: updErr } = await supabaseAdmin
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        payment_status: 'failed',
+        updated_at: new Date().toISOString(),
+        metadata: {
+          ...(fresh.metadata && typeof fresh.metadata === 'object' ? fresh.metadata : {}),
+          cancel_reason: 'card_payment_abandoned',
+        },
+      })
+      .eq('id', o.id)
+      .eq('payment_status', 'pending');   // garde optimiste : n'annule QUE si toujours pending
+    if (updErr) { logger.error(`[orders.cancel-abandoned-card] ${o.id}: ${updErr.message}`); continue; }
+    cancelled++;
+    // Le trigger restore_stock_on_order_cancel remet le stock automatiquement.
+  }
+  logger.info(`Abandoned card orders: ${cancelled}/${stale.length} annulées (stock remis par trigger)`);
+});
+
+// 🔁 RÉCONCILIATION Stripe : rattrape les webhooks MANQUÉS (downtime/réseau). Pour les commandes
+// carte 'pending' avec un PaymentIntent, âgées de 10-60 min, interroge l'API Stripe :
+//   - PI 'succeeded' → rejoue la MÊME logique idempotente (applyPaymentSucceeded, partagée avec
+//     le webhook) → marque 'paid' + confirme l'escrow, JAMAIS de double-traitement.
+//   - PI 'canceled'/'requires_payment_method' → annule la commande (restock auto).
+//   - sinon (processing/requires_action) → laisse pour un prochain passage.
+registerHandler('stripe.reconcile-pending', async () => {
+  const minAge = new Date(Date.now() - 10 * 60 * 1000).toISOString();   // ≥ 10 min (webhook aurait dû arriver)
+  const maxAge = new Date(Date.now() - 60 * 60 * 1000).toISOString();   // ≤ 60 min (encore pertinent)
+  const { data: pend, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, payment_intent_id')
+    .eq('payment_method', 'card')
+    .eq('payment_status', 'pending')
+    .not('payment_intent_id', 'is', null)
+    .lt('created_at', minAge)
+    .gt('created_at', maxAge)
+    .limit(50);
+  if (error) { logger.error(`[stripe.reconcile-pending] ${error.message}`); return; }
+  if (!pend?.length) { logger.info('Stripe reconcile: rien à réconcilier'); return; }
+
+  const stripeKey = await getStripeSecretKey();
+  if (!stripeKey) { logger.warn('[stripe.reconcile-pending] clé Stripe indisponible — réconciliation ignorée'); return; }
+
+  let fixed = 0;
+  for (const o of pend as any[]) {
+    try {
+      const res = await fetch(`https://api.stripe.com/v1/payment_intents/${o.payment_intent_id}`,
+        { headers: { Authorization: `Bearer ${stripeKey}` } });
+      const pi: any = await res.json();
+      if (!res.ok) {
+        logger.warn(`[stripe.reconcile-pending] ${o.id}: Stripe ${res.status} ${pi?.error?.message || ''}`);
+        continue;
+      }
+
+      if (pi?.status === 'succeeded') {
+        // Webhook manqué mais paiement abouti → rejouer la logique de succès IDEMPOTENTE.
+        await applyPaymentSucceeded(pi, { source: 'reconcile' });
+        fixed++;
+      } else if (['canceled', 'requires_payment_method'].includes(pi?.status)) {
+        // Paiement échoué/abandonné côté Stripe → annuler (restock auto), avec garde optimiste.
+        const { data: fresh } = await supabaseAdmin
+          .from('orders').select('payment_status, metadata').eq('id', o.id).maybeSingle();
+        if (!fresh || fresh.payment_status !== 'pending') continue;
+        await supabaseAdmin.from('orders')
+          .update({
+            status: 'cancelled', payment_status: 'failed', updated_at: new Date().toISOString(),
+            metadata: {
+              ...(fresh.metadata && typeof fresh.metadata === 'object' ? fresh.metadata : {}),
+              cancel_reason: 'stripe_reconcile_not_paid',
+            },
+          })
+          .eq('id', o.id).eq('payment_status', 'pending');
+      }
+      // processing / requires_action → ne rien faire, réessayer plus tard.
+    } catch (e: any) {
+      logger.error(`[stripe.reconcile-pending] ${o.id}: ${e.message}`);
+    }
+  }
+  logger.info(`Stripe reconcile: ${fixed} paiement(s) rattrapé(s) sur ${pend.length}`);
 });
 
 registerHandler('escrow.auto-release', async () => {
@@ -872,6 +980,9 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
       recurringTimers.push(setInterval(() => this.enqueue('beauty.reminders', {}).catch(() => {}), 15 * 60 * 1000));
+      // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
+      recurringTimers.push(setInterval(() => this.enqueue('orders.cancel-abandoned-card', {}).catch(() => {}), 15 * 60 * 1000));
+      recurringTimers.push(setInterval(() => this.enqueue('stripe.reconcile-pending', {}).catch(() => {}), 10 * 60 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;
@@ -908,6 +1019,9 @@ export const jobQueue = {
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });
+      // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
+      await queue.add('orders.cancel-abandoned-card', {}, { repeat: { every: 15 * 60 * 1000 } });
+      await queue.add('stripe.reconcile-pending', {}, { repeat: { every: 10 * 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');
     } catch (err: any) {

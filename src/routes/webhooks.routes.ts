@@ -107,12 +107,26 @@ function stripeAmountToReal(stripeAmount: number, currency: string): number {
     : stripeAmount / 100;
 }
 
-async function handlePaymentIntentSucceeded(event: any): Promise<void> {
-  const paymentIntent = event.data.object;
+/**
+ * 🧩 Cœur IDEMPOTENT du traitement d'un paiement Stripe réussi.
+ *
+ * Appelé par DEUX sources :
+ *   - le webhook réel (payment_intent.succeeded) → source 'webhook' ;
+ *   - le job de réconciliation (stripe.reconcile-pending) qui rattrape un webhook
+ *     MANQUÉ (downtime/réseau) → source 'reconcile'.
+ * Logique partagée → comportement strictement identique. Garde d'idempotence :
+ * si la commande est DÉJÀ 'paid', on sort sans rien re-faire (le webhook réel
+ * est en plus protégé en amont par webhook_events.isAlreadyProcessed).
+ */
+export async function applyPaymentSucceeded(
+  paymentIntent: any,
+  opts: { source?: 'webhook' | 'reconcile' } = {}
+): Promise<void> {
+  const source = opts.source || 'webhook';
   let orderId = paymentIntent.metadata?.order_id;
   const userId = paymentIntent.metadata?.user_id;
 
-  logger.info(`Webhook: payment_intent.succeeded — PI=${paymentIntent.id}, order=${orderId}`);
+  logger.info(`[${source}] payment succeeded — PI=${paymentIntent.id}, order=${orderId}`);
 
   // If no order_id in metadata, try to find the order by payment_intent_id
   // (marketplace-escrow flow creates the order AFTER the PaymentIntent)
@@ -124,11 +138,23 @@ async function handlePaymentIntentSucceeded(event: any): Promise<void> {
       .maybeSingle();
     if (matchedOrder) {
       orderId = matchedOrder.id;
-      logger.info(`Webhook: resolved order by payment_intent_id — order=${orderId}`);
+      logger.info(`[${source}] resolved order by payment_intent_id — order=${orderId}`);
     }
   }
 
   if (orderId) {
+    // 🛡️ IDEMPOTENCE : si la commande est déjà payée, ne RIEN re-faire (protège la
+    // réconciliation, qui n'a pas la garde webhook_events du webhook réel).
+    const { data: cur } = await supabaseAdmin
+      .from('orders')
+      .select('payment_status')
+      .eq('id', orderId)
+      .maybeSingle();
+    if (cur?.payment_status === 'paid') {
+      logger.info(`[${source}] order ${orderId} déjà 'paid' → skip (idempotent)`);
+      return;
+    }
+
     // Update order payment status
     await supabaseAdmin
       .from('orders')
@@ -185,13 +211,43 @@ async function handlePaymentIntentSucceeded(event: any): Promise<void> {
 
   await auditTrail.log({
     actorId: userId || 'stripe',
-    actorType: 'webhook',
+    actorType: source === 'reconcile' ? 'job' : 'webhook',
     action: 'payment.succeeded',
     resourceType: 'payment_intent',
     resourceId: paymentIntent.id,
-    metadata: { orderId, amount: paymentIntent.amount },
+    metadata: { orderId, amount: paymentIntent.amount, source },
     riskLevel: 'medium',
   });
+}
+
+async function handlePaymentIntentSucceeded(event: any): Promise<void> {
+  await applyPaymentSucceeded(event.data.object, { source: 'webhook' });
+}
+
+/**
+ * Résout la clé SECRÈTE Stripe (sk_...) : variable d'env d'abord, sinon table
+ * stripe_config (même stratégie que paymentLinks). Utilisée par le job de
+ * réconciliation pour interroger l'API Stripe (lecture seule des PaymentIntents).
+ */
+export async function getStripeSecretKey(): Promise<string | null> {
+  const envKey = process.env.STRIPE_SECRET_KEY?.trim();
+  if (envKey) return envKey;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('stripe_config')
+      .select('stripe_secret_key')
+      .limit(1)
+      .maybeSingle();
+    if (error) { logger.warn(`[stripe] stripe_config inaccessible: ${error.message}`); return null; }
+    const dbKey = data?.stripe_secret_key?.trim();
+    if (dbKey) {
+      logger.warn('[stripe] STRIPE_SECRET_KEY absent du runtime, fallback stripe_config activé');
+      return dbKey;
+    }
+  } catch (e: any) {
+    logger.warn(`[stripe] fallback stripe_config échoué: ${e?.message || 'unknown'}`);
+  }
+  return null;
 }
 
 async function handlePaymentIntentFailed(event: any): Promise<void> {

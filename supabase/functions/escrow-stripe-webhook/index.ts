@@ -1,3 +1,11 @@
+// ⚠️ DÉPRÉCIÉ — NE DOIT PLUS RECEVOIR D'ÉVÉNEMENTS STRIPE.
+// Le webhook CANONIQUE est le backend Node : `POST /webhooks/stripe`
+// (src/routes/webhooks.routes.ts) — signature HMAC + anti-replay + idempotence
+// (webhook_events) + cycle complet ordre/escrow/wallet + réconciliation.
+// Avoir DEUX endpoints actifs sur les MÊMES événements = risque de double-traitement.
+// → Retirer cet endpoint du Dashboard Stripe (ne plus lui envoyer d'événements).
+// Conservé pour référence uniquement. Si jamais réactivé : garantir UNE SEULE source
+// par type d'événement et la MÊME table d'idempotence (webhook_events) que le Node.
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Stripe from "https://esm.sh/stripe@18";

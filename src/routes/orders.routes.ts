@@ -515,7 +515,10 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
       p_buyer_fee_amount: number;
       p_seller_commission_amount: number | null;
     } = {
-      p_buyer_user_id: null, p_wallet_debit_amount: 0, p_buyer_wallet_currency: null,
+      // ✅ L'acheteur est TOUJOURS l'utilisateur authentifié (corrige le FK escrow buyer_id
+      //    en COD/carte/mobile money où p_buyer_user_id restait null → customer_id inséré).
+      //    Le débit wallet reste 0 ici ; il n'a lieu que dans le bloc payment_method='wallet'.
+      p_buyer_user_id: userId, p_wallet_debit_amount: 0, p_buyer_wallet_currency: null,
       p_exchange_rate_used: null, p_buyer_fee_amount: 0, p_seller_commission_amount: null,
     };
     let buyerFeePercentForLog = 0;

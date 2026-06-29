@@ -1,8 +1,17 @@
 import { Router, Request, Response } from "express";
+import { createHash } from "crypto";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { logger } from '../../config/logger.js';
 
 const router = Router();
+
+// Clé du cache serveur partagé = hash stable (texte source + langue cible).
+const cacheHash = (text: string, target: string): string =>
+  createHash("sha256").update(`${text} ${target}`).digest("hex");
+
+// Langues à faibles ressources : Whisper les transcrit mal → on ne force pas le
+// pipeline STT/IA/TTS (charabia). Message vocal NATIF (audio original transmis).
+const NON_TRANSCRIBABLE = new Set(["wo", "ff", "sus", "su", "ha", "bm", "yo", "dyu", "kr"]);
 
 // Noms de langues pour des traductions de meilleure qualité (codes ISO les plus courants)
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -143,6 +152,21 @@ router.post("/translate-audio", async (req: Request, res: Response) => {
   const context: string = b.context ?? "general";
 
   if (!audioUrl) return res.status(400).json({ success: false, error: "audioUrl requis" });
+
+  // COURT-CIRCUIT MESSAGE VOCAL NATIF (AMÉLIORATION 3) : si la langue source est
+  // explicitement = cible OU à faibles ressources (Whisper la transcrit mal →
+  // charabia), on NE lance PAS STT/IA/TTS. On transmet l'audio original tel quel
+  // avec un statut clair 'native'. Deux locuteurs de la même langue n'ont pas
+  // besoin de traduction.
+  const srcLang = String(sourceLanguage || "").toLowerCase().split("-")[0];
+  const tgtLang = String(targetLanguage || "").toLowerCase().split("-")[0];
+  if (srcLang && (srcLang === tgtLang || NON_TRANSCRIBABLE.has(srcLang))) {
+    if (messageId) {
+      try { await supabaseAdmin.from("messages").update({ audio_translation_status: "native", target_language: targetLanguage }).eq("id", messageId); } catch { /* best-effort */ }
+    }
+    return res.json({ success: true, wasTranslated: false, audio_translation_status: "native", transcribedText: null, translatedText: null, reason: srcLang === tgtLang ? "same_language" : "source_not_transcribable" });
+  }
+
   if (!process.env.OPENAI_API_KEY) return res.status(503).json({ success: false, error: "Traduction vocale indisponible (OPENAI_API_KEY non configurée)" });
 
   const markFailed = async () => {
@@ -224,6 +248,22 @@ router.post("/translate-message", async (req: Request, res: Response) => {
   }
   const detected = det.lang;
 
+  // ═══ CACHE SERVEUR PARTAGÉ (AMÉLIORATION 4) — 2e niveau, après le cache local.
+  // Phrases récurrentes ("Votre commande est prête") traduites une seule fois pour tous.
+  const cacheKey = cacheHash(content, targetLanguage);
+  try {
+    const { data: cacheRes } = await supabaseAdmin.rpc("translation_cache_get" as any, { p_hash: cacheKey, p_target: targetLanguage });
+    const hit = (cacheRes as any);
+    if (hit?.hit && hit.translated_text) {
+      if (messageId) {
+        try { await supabaseAdmin.from("messages").update({ translated_text: hit.translated_text, original_language: detected, target_language: targetLanguage }).eq("id", messageId); } catch { /* best-effort */ }
+      }
+      return res.json({ translatedContent: hit.translated_text, originalContent: content, sourceLanguage: detected, targetLanguage, wasTranslated: true, cached: true });
+    }
+  } catch (e: any) {
+    logger.warn("[translate-message] cache lookup ignoré:", e?.message);
+  }
+
   const translated = await translateText(content, detected, targetLanguage, context);
   if (!translated) {
     // Repli sûr : renvoyer l'original (le front affichera l'original)
@@ -234,6 +274,16 @@ router.post("/translate-message", async (req: Request, res: Response) => {
   const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
   if (norm(translated) === norm(content)) {
     return res.json({ translatedContent: content, originalContent: content, sourceLanguage: detected, targetLanguage, wasTranslated: false });
+  }
+
+  // Alimenter le cache serveur partagé (ON CONFLICT DO NOTHING via ignoreDuplicates).
+  try {
+    await supabaseAdmin.from("translation_cache").upsert(
+      { content_hash: cacheKey, source_text: content, target_language: targetLanguage, translated_text: translated },
+      { onConflict: "content_hash,target_language", ignoreDuplicates: true },
+    );
+  } catch (e: any) {
+    logger.warn("[translate-message] cache write ignoré:", e?.message);
   }
 
   // Persistance best-effort dans messages (cache serveur, évite de re-traduire)

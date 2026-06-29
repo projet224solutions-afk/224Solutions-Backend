@@ -25,6 +25,10 @@ const LANGUAGE_NAMES: Record<string, string> = {
   'wo': 'Wolof', 'ha': 'Hausa', 'bm': 'Bambara', 'yo': 'Yorùbá'
 };
 
+// Langues à faibles ressources NON transcriptibles de façon fiable par Google STT :
+// on ne force PAS le pipeline (il produirait du charabia) → message vocal NATIF.
+const NON_TRANSCRIBABLE = new Set(['wo', 'ff', 'sus', 'su', 'ha', 'bm', 'yo']);
+
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -63,6 +67,36 @@ serve(async (req: Request) => {
       return new Response(
         JSON.stringify({ error: "Audio requis (URL ou base64)" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // COURT-CIRCUIT : MESSAGE VOCAL NATIF (AMÉLIORATION 3)
+    // Si la langue source = cible OU n'est pas transcriptible (soussou/peul...),
+    // ne PAS lancer STT→IA→TTS (qui échouerait). On transmet l'audio ORIGINAL
+    // tel quel avec un statut clair 'native'. Deux locuteurs de la même langue
+    // n'ont pas besoin de traduction.
+    // ═══════════════════════════════════════════════════════════════
+    const srcLang = String(sourceLanguage || '').toLowerCase().split('-')[0];
+    const tgtLang = String(targetLanguage || '').toLowerCase().split('-')[0];
+    if (srcLang && (srcLang === tgtLang || NON_TRANSCRIBABLE.has(srcLang))) {
+      console.log(`🎙️ Audio natif (pas de traduction) : source=${srcLang} cible=${tgtLang}`);
+      if (messageId) {
+        await supabaseAdmin
+          .from('messages')
+          .update({ audio_translation_status: 'native', target_language: targetLanguage })
+          .eq('id', messageId);
+      }
+      return new Response(
+        JSON.stringify({
+          success: true,
+          wasTranslated: false,
+          audio_translation_status: 'native',
+          transcribedText: null,
+          translatedText: null,
+          reason: srcLang === tgtLang ? 'same_language' : 'source_not_transcribable',
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 

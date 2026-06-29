@@ -1384,7 +1384,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManage
  * GET /api/orders/:orderId/delivery-proof — URLs signées (1h) photo + vidéo.
  * Accessible au vendeur ET au client de la commande. Renvoie purged=true si purgée.
  */
-router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const orderId = req.params.orderId;
     const userId = req.user!.id;

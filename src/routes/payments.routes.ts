@@ -612,8 +612,10 @@ router.post('/secure/validate', optionalJWT, async (req: AuthenticatedRequest, r
       })
       .eq('id', transaction_id);
 
-    // Déclencher les commissions affiliées
-    await triggerAffiliateCommission(userId, Number(transaction.net_amount), 'wallet_deposit', transaction_id);
+    // ❌ PAS de commission agent sur un DÉPÔT (recharge wallet) : argent du client, pas un
+    // revenu ; la base était le montant TOTAL. La commission est désormais prélevée sur le PDG
+    // (fix moteur) → ponctionnerait le PDG à tort. Commission = achats en ligne (frais) uniquement.
+    // await triggerAffiliateCommission(userId, Number(transaction.net_amount), 'wallet_deposit', transaction_id);
 
     await ignoreSupabaseError(supabaseAdmin.from('financial_audit_logs').insert({
       transaction_id,

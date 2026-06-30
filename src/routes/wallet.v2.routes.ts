@@ -1166,8 +1166,11 @@ router.post('/deposit', verifyJWT, async (req: AuthenticatedRequest, res: Respon
       return;
     }
 
-    // Déclencher commissions affiliées
-    await triggerAffiliateCommission(userId, amount, 'deposit', ref);
+    // ❌ PAS de commission agent sur un DÉPÔT : c'est l'argent du client (pas un revenu
+    // plateforme), et la base passée était le montant TOTAL → 20% de chaque dépôt. Désormais
+    // la commission est PRÉLEVÉE SUR LE PDG (cf. fix moteur) → ponctionnerait le PDG à tort.
+    // Commission agent = uniquement sur les ACHATS en ligne (frais), pas les mouvements wallet.
+    // await triggerAffiliateCommission(userId, amount, 'deposit', ref);
 
     logger.info(`[WalletV2] Deposit: user=${userId}, amount=${amount}`);
     await emitCoreFeatureEvent({

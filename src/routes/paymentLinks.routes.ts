@@ -400,10 +400,12 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
         customer_phone: customerPhone || null,
       }).eq('id', link.id);
 
-      // Trigger affiliate commissions
-      if (userId) {
-        await triggerAffiliateCommission(userId, payAmount, 'payment_link', walletTxId || link.id);
-      }
+      // ❌ Commission agent NEUTRALISÉE ici : la base était payAmount (le MONTANT TOTAL) →
+      // avec le fix moteur (part agent prélevée sur le PDG), ça débiterait 20% du total au lieu
+      // de 20% des FRAIS. À re-câbler proprement via compute_payment_breakdown (base = frais nets).
+      // if (userId) {
+      //   await triggerAffiliateCommission(userId, payAmount, 'payment_link', walletTxId || link.id);
+      // }
 
       logger.info(`[PaymentLinks] Wallet payment completed: txId=${walletTxId}, net=${netAmount}`);
 

@@ -185,6 +185,22 @@ serve(async (req) => {
           .update({ payment_status: 'paid' })
           .eq('id', rideId);
 
+        // 💰 Recette plateforme (PDG) + commission agent sur la PART PLATEFORME (platformFee).
+        // Le wallet client a été débité du total, le chauffeur crédité de driverShare ; ici on
+        // reconnaît le platformFee au PDG puis on en débite 20% pour les agents (net 80/20).
+        // Non bloquant : un souci de commission ne casse pas le paiement de la course.
+        try {
+          await supabaseAdmin.rpc('apply_platform_commission', {
+            p_buyer_user_id: ride.customer_id,
+            p_platform_fee: platformFee,
+            p_source: 'taxi',
+            p_reference: rideId,
+            p_metadata: { flow: 'taxi', ride_id: rideId, method: 'wallet' },
+          });
+        } catch (e) {
+          logStep('apply_platform_commission (taxi) non bloquant', { error: String(e) });
+        }
+
         paymentResult = { success: true, method: 'wallet' };
         break;
       }

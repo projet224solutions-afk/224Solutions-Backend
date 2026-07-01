@@ -104,6 +104,13 @@ import { ipBlocklist, autoBlockGuard, refreshBlocklist } from './middlewares/ipB
 
 const app = express();
 
+// 🔒 Derrière nginx (VPS) + proxy Vercel : faire confiance à X-Forwarded-For pour
+// que req.ip = l'IP RÉELLE du client (pas 127.0.0.1 du proxy nginx). SANS ça, tous
+// les utilisateurs partagent la même clé de rate-limit (global:127.0.0.1) → la
+// limite saute pour tout le monde (« Trop de requêtes »). Indispensable au bon
+// fonctionnement du rate-limiting par IP.
+app.set('trust proxy', true);
+
 function originMatchesPattern(origin: string, pattern: string): boolean {
   if (!pattern) return false;
   if (pattern === '*') return true;

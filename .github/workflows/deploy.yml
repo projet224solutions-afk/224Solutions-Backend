@@ -35,6 +35,10 @@ jobs:
           cd /var/www/backend
           grep -q '^GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=' .env || echo "GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=${GCS_SA_B64}" >> .env
           grep -q '^GCS_BUCKET_NAME=' .env || echo "GCS_BUCKET_NAME=224solutions" >> .env
+          # Corriger la limite de requêtes (ancienne conf 100/15min = « Trop de requêtes »
+          # pour tout le monde). Cible : 6000 requêtes / 60 s par IP.
+          if grep -q '^RATE_LIMIT_MAX_REQUESTS=' .env; then sed -i 's|^RATE_LIMIT_MAX_REQUESTS=.*|RATE_LIMIT_MAX_REQUESTS=6000|' .env; else echo 'RATE_LIMIT_MAX_REQUESTS=6000' >> .env; fi
+          if grep -q '^RATE_LIMIT_WINDOW_MS=' .env; then sed -i 's|^RATE_LIMIT_WINDOW_MS=.*|RATE_LIMIT_WINDOW_MS=60000|' .env; else echo 'RATE_LIMIT_WINDOW_MS=60000' >> .env; fi
           git fetch origin main
           git reset --hard origin/main
           npm install --no-audit --no-fund

@@ -2,6 +2,13 @@ import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { logger } from "../../config/logger.js";
 import { sendSms } from "../../services/sms.service.js";
+import {
+  loadServiceAccount,
+  getBucketName,
+  generateUniqueFileName,
+  generateSignedUrl,
+  computeDeleteToken,
+} from "../../services/gcs.service.js";
 
 const router = Router();
 
@@ -706,13 +713,75 @@ router.post("/visual-search", async (req: any, res: any) => {
   }
 });
 
+// ☁️ GCS — vraie URL signée V4 (compte de service). Remplace l'ancien stub.
+// Contrat client (useStorageUpload / gcsUpload) : body { action, fileName, folder,
+// contentType, expiresInMinutes } → { signedUrl, publicUrl, objectPath }.
+// Si le compte de service n'est pas configuré → { fallback:true } (le client bascule
+// proprement sur Supabase Storage, jamais d'erreur bloquante).
 router.post("/gcs-signed-url", async (req: any, res: any) => {
   try {
-    const { bucket, file_path, expiry } = req.body || {};
-    const signed_url = `https://storage.googleapis.com/${bucket}/${file_path}?expiry=${expiry || 3600}`;
-    return res.json({ success: true, signed_url });
+    const {
+      action = "upload",
+      fileName,
+      folder,
+      expiresInMinutes,
+      deleteToken,
+    } = req.body || {};
+
+    const serviceAccount = loadServiceAccount();
+    const bucketName = getBucketName();
+
+    if (!serviceAccount) {
+      logger?.warn?.("[gcs-signed-url] Compte de service GCS absent/invalide → fallback Supabase");
+      return res.status(200).json({
+        success: false,
+        fallback: true,
+        error: "GCS not configured",
+        message:
+          "GOOGLE_CLOUD_SERVICE_ACCOUNT(_B64) absent ou invalide (client_email/private_key/project_id requis).",
+      });
+    }
+    if (!fileName) {
+      return res.status(400).json({ success: false, error: "fileName requis" });
+    }
+
+    const expiresInSeconds = Math.max(60, Math.min(Number(expiresInMinutes || 15) * 60, 604800)); // 1 min → 7 j
+
+    // Suppression atomique (rollback) : exige le jeton signé délivré à l'upload.
+    if (action === "delete") {
+      const delObjectPath = folder ? `${folder}/${fileName}` : fileName;
+      const expected = computeDeleteToken(serviceAccount.private_key_id, delObjectPath);
+      if (!deleteToken || deleteToken !== expected) {
+        return res.status(403).json({ success: false, error: "invalid_delete_token" });
+      }
+      const signedDeleteUrl = generateSignedUrl(serviceAccount, bucketName, delObjectPath, {
+        method: "DELETE",
+        expiresInSeconds: 120,
+      });
+      const delResp = await fetch(signedDeleteUrl, { method: "DELETE" });
+      const ok = delResp.ok || delResp.status === 404; // 404 = déjà absent → idempotent
+      return res.status(ok ? 200 : 502).json({ success: ok, status: delResp.status, objectPath: delObjectPath });
+    }
+
+    const uniqueName = action === "upload" ? generateUniqueFileName(fileName) : fileName;
+    const objectPath = folder ? `${folder}/${uniqueName}` : uniqueName;
+    const method = action === "upload" ? "PUT" : "GET";
+
+    const signedUrl = generateSignedUrl(serviceAccount, bucketName, objectPath, { method, expiresInSeconds });
+    const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectPath}`;
+    const deleteTokenOut = computeDeleteToken(serviceAccount.private_key_id, objectPath);
+
+    return res.json({
+      success: true,
+      signedUrl,
+      publicUrl,
+      objectPath,
+      bucket: bucketName,
+      deleteToken: deleteTokenOut,
+    });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
+    logger?.error?.("[gcs-signed-url] erreur:", err?.message || err);
+    return res.status(500).json({ success: false, error: err.message, fallback: true });
   }
 });
 

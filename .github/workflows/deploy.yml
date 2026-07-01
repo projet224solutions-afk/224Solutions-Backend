@@ -1,7 +1,7 @@
 name: Deploy Backend to VPS
 
-# Déploiement automatique : à chaque push sur main, GitHub se connecte au VPS,
-# récupère le code et redémarre le backend (pm2).
+# Déploiement automatique : à chaque push sur main, GitHub se connecte au VPS
+# via SSH (client natif), récupère le code et redémarre le backend (pm2).
 on:
   push:
     branches: [main]
@@ -16,21 +16,14 @@ jobs:
     name: Deploy over SSH
     runs-on: ubuntu-latest
     steps:
-      - name: SSH deploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          port: 22
-          command_timeout: 15m
-          script: |
-            set -e
-            echo "→ Déploiement dans /var/www/backend"
-            cd /var/www/backend
-            git fetch origin main
-            git reset --hard origin/main
-            npm install --no-audit --no-fund
-            pm2 restart 224-backend --update-env
-            pm2 save
-            echo "✅ Backend déployé et redémarré"
+      - name: Deploy to VPS
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" "cd /var/www/backend && git fetch origin main && git reset --hard origin/main && npm install --no-audit --no-fund && pm2 restart 224-backend --update-env && pm2 save && echo DEPLOY_OK"

@@ -21,9 +21,25 @@ jobs:
           SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          GCS_SA_B64: ${{ secrets.GCS_SA_B64 }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" "cd /var/www/backend && git fetch origin main && git reset --hard origin/main && npm install --no-audit --no-fund && pm2 restart 224-backend --update-env && pm2 save && echo DEPLOY_OK"
+          # Script exécuté sur le VPS via stdin (évite l'enfer des quotes).
+          # ${GCS_SA_B64} est développé ICI (runner) depuis le secret, puis écrit
+          # dans le .env du VPS s'il n'y est pas déjà (idempotent).
+          cat > /tmp/remote_deploy.sh <<REMOTE
+          set -e
+          cd /var/www/backend
+          grep -q '^GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=' .env || echo "GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=${GCS_SA_B64}" >> .env
+          grep -q '^GCS_BUCKET_NAME=' .env || echo "GCS_BUCKET_NAME=224solutions" >> .env
+          git fetch origin main
+          git reset --hard origin/main
+          npm install --no-audit --no-fund
+          pm2 restart 224-backend --update-env
+          pm2 save
+          echo DEPLOY_OK
+          REMOTE
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" 'bash -s' < /tmp/remote_deploy.sh

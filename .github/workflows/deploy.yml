@@ -2,6 +2,7 @@ name: Deploy Backend to VPS
 
 # Déploiement automatique : à chaque push sur main, GitHub se connecte au VPS,
 # récupère le code et redémarre le backend (pm2).
+# VPS_SSH_KEY = clé privée encodée en base64 (une seule ligne, copie fiable).
 on:
   push:
     branches: [main]
@@ -16,12 +17,20 @@ jobs:
     name: Deploy over SSH
     runs-on: ubuntu-latest
     steps:
+      - name: Decode SSH key
+        run: |
+          {
+            echo "SSH_KEY<<__EOF__"
+            echo "${{ secrets.VPS_SSH_KEY }}" | base64 -d
+            echo "__EOF__"
+          } >> "$GITHUB_ENV"
+
       - name: SSH deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          key: ${{ env.SSH_KEY }}
           port: 22
           command_timeout: 15m
           script: |

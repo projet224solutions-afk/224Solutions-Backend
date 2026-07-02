@@ -23,6 +23,19 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { orderCreateRateLimit, orderManageRateLimit } from '../middlewares/routeRateLimiter.js';
 import { cache } from '../config/redis.js';
+import { loadServiceAccount, getPrivateBucketName, generateSignedUrl } from '../services/gcs.service.js';
+
+// Preuve de livraison stockée sur GCS privé : le chemin est préfixé « gcs: » pour
+// distinguer GCS (bucket privé, URL signée) de Supabase (héritage). URL signée 1h.
+function signDeliveryProofUrl(storedPath: string | null): string | null {
+  if (!storedPath) return null;
+  if (storedPath.startsWith('gcs:')) {
+    const sa = loadServiceAccount();
+    if (!sa) return null;
+    return generateSignedUrl(sa, getPrivateBucketName(), storedPath.slice(4), { method: 'GET', expiresInSeconds: 3600 });
+  }
+  return null; // chemins Supabase gérés séparément (createSignedUrl asynchrone)
+}
 import { createNotification, createNotifications } from '../services/notification.service.js';
 import { buildOrderFinancialSummary } from '../services/marketplacePricing.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
@@ -1343,6 +1356,102 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
 });
 
 /**
+<<<<<<< Updated upstream
+=======
+ * POST /api/orders/:orderId/delivery-proof — le vendeur enregistre les chemins
+ * (fichiers déjà uploadés dans le bucket privé delivery-proofs). Réservé au vendeur.
+ */
+router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { photo_path, video_path, storage } = req.body || {};
+    if (!photo_path || typeof photo_path !== 'string') {
+      res.status(400).json({ success: false, error: 'photo_path requis' }); return;
+    }
+    const { data: order } = await supabaseAdmin
+      .from('orders').select('id, vendor_id').eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+    const { data: vendor } = await supabaseAdmin
+      .from('vendors').select('id').eq('id', order.vendor_id).eq('user_id', userId).maybeSingle();
+    if (!vendor) { res.status(403).json({ success: false, error: 'Action réservée au vendeur' }); return; }
+    // Anti-IDOR : les chemins DOIVENT être scopés à cette commande.
+    if (!photo_path.startsWith(`${orderId}/`) || (video_path && !String(video_path).startsWith(`${orderId}/`))) {
+      res.status(400).json({ success: false, error: 'Chemin de preuve invalide' }); return;
+    }
+    // Preuve stockée sur GCS privé → marquer le chemin « gcs: » (sinon Supabase, héritage).
+    const useGcs = storage === 'gcs';
+    const storedPhoto = useGcs ? `gcs:${photo_path}` : photo_path;
+    const storedVideo = video_path ? (useGcs ? `gcs:${video_path}` : video_path) : null;
+    const { error } = await supabaseAdmin.from('orders').update({
+      delivery_proof_photo_path: storedPhoto,
+      delivery_proof_video_path: storedVideo,
+      delivery_proof_uploaded_at: new Date().toISOString(),
+    } as any).eq('id', orderId);
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    logger.info(`Delivery proof attached to order ${orderId} by vendor ${vendor.id}`);
+    res.json({ success: true });
+  } catch (e: any) {
+    logger.error(`[delivery-proof] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+/**
+ * GET /api/orders/:orderId/delivery-proof — URLs signées (1h) photo + vidéo.
+ * Accessible au vendeur ET au client de la commande. Renvoie purged=true si purgée.
+ */
+router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { data: order } = await supabaseAdmin
+      .from('orders')
+      .select('id, vendor_id, customer_id, delivery_proof_photo_path, delivery_proof_video_path, delivery_proof_purged_at')
+      .eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+
+    const o = order as any;
+    const isCustomer = o.customer_id === userId;
+    let isVendor = false;
+    if (!isCustomer) {
+      const { data: vendor } = await supabaseAdmin
+        .from('vendors').select('id').eq('id', o.vendor_id).eq('user_id', userId).maybeSingle();
+      isVendor = !!vendor;
+    }
+    if (!isCustomer && !isVendor) { res.status(403).json({ success: false, error: 'Accès refusé' }); return; }
+
+    if (o.delivery_proof_purged_at) {
+      res.json({ success: true, purged: true, photo_url: null, video_url: null }); return;
+    }
+    let photo_url: string | null = null, video_url: string | null = null;
+    if (o.delivery_proof_photo_path) {
+      if (String(o.delivery_proof_photo_path).startsWith('gcs:')) {
+        photo_url = signDeliveryProofUrl(o.delivery_proof_photo_path);
+      } else {
+        const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+          .createSignedUrl(o.delivery_proof_photo_path, 3600);
+        photo_url = data?.signedUrl || null;
+      }
+    }
+    if (o.delivery_proof_video_path) {
+      if (String(o.delivery_proof_video_path).startsWith('gcs:')) {
+        video_url = signDeliveryProofUrl(o.delivery_proof_video_path);
+      } else {
+        const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+          .createSignedUrl(o.delivery_proof_video_path, 3600);
+        video_url = data?.signedUrl || null;
+      }
+    }
+    res.json({ success: true, purged: false, photo_url, video_url });
+  } catch (e: any) {
+    logger.error(`[delivery-proof GET] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+/**
+>>>>>>> Stashed changes
  * POST /api/orders/:orderId/request-refund
  * Ouvre un litige de remboursement (remplace l'Edge Function 'request-refund' — pas de mouvement
  * d'argent ici, juste la création du litige + notification vendeur). L'argent ne bouge qu'à la

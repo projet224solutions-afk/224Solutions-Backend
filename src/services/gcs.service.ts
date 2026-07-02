@@ -23,6 +23,11 @@ export function getBucketName(): string {
   return process.env.GCS_BUCKET_NAME || '224solutions';
 }
 
+/** Bucket PRIVÉ (données sensibles : preuves de livraison). Jamais public en lecture. */
+export function getPrivateBucketName(): string {
+  return process.env.GCS_PRIVATE_BUCKET_NAME || '224solutions-private';
+}
+
 /** Charge + valide le compte de service depuis l'env (base64 prioritaire, sinon JSON brut). */
 export function loadServiceAccount(): ServiceAccount | null {
   const b64 = process.env.GOOGLE_CLOUD_SERVICE_ACCOUNT_B64;

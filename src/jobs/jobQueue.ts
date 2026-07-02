@@ -21,6 +21,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
+import { loadServiceAccount, getPrivateBucketName, generateSignedUrl } from '../services/gcs.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
 
 const REDIS_JOBS_ENABLED = (process.env.REDIS_ENABLED ?? (env.isProduction ? 'true' : 'false')) === 'true';
@@ -189,6 +190,206 @@ registerHandler('idempotency.cleanup', async () => {
   logger.info(`Idempotency cleanup: deleted ${count || 0} expired keys`);
 });
 
+<<<<<<< Updated upstream
+=======
+// Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
+// supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
+registerHandler('delivery-proof.cleanup', async () => {
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const { data: orders, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, delivery_proof_photo_path, delivery_proof_video_path')
+    .lt('delivery_confirmed_at', cutoff)
+    .is('delivery_proof_purged_at', null)
+    .not('delivery_proof_photo_path', 'is', null)
+    .limit(200);
+  if (error) { logger.error(`[delivery-proof.cleanup] ${error.message}`); return; }
+  if (!orders?.length) { logger.info('Delivery proof cleanup: rien à purger'); return; }
+
+  let purged = 0;
+  for (const o of orders as any[]) {
+    // Séparer les chemins GCS privé (préfixe « gcs: ») des chemins Supabase (héritage).
+    const supabasePaths: string[] = [];
+    const gcsPaths: string[] = [];
+    for (const p of [o.delivery_proof_photo_path, o.delivery_proof_video_path]) {
+      if (!p) continue;
+      if (String(p).startsWith('gcs:')) gcsPaths.push(String(p).slice(4));
+      else supabasePaths.push(p);
+    }
+    let delOk = true;
+    if (supabasePaths.length) {
+      const { error: delErr } = await supabaseAdmin.storage.from('delivery-proofs').remove(supabasePaths);
+      if (delErr) { logger.error(`[delivery-proof.cleanup] supabase ${o.id}: ${delErr.message}`); delOk = false; }
+    }
+    if (gcsPaths.length) {
+      const sa = loadServiceAccount();
+      if (!sa) { logger.error(`[delivery-proof.cleanup] GCS non configuré, purge ${o.id} différée`); delOk = false; }
+      else {
+        for (const op of gcsPaths) {
+          try {
+            const url = generateSignedUrl(sa, getPrivateBucketName(), op, { method: 'DELETE', expiresInSeconds: 120 });
+            const r = await fetch(url, { method: 'DELETE' });
+            if (!(r.ok || r.status === 404)) { logger.error(`[delivery-proof.cleanup] GCS ${o.id}: HTTP ${r.status}`); delOk = false; }
+          } catch (e: any) { logger.error(`[delivery-proof.cleanup] GCS ${o.id}: ${e?.message}`); delOk = false; }
+        }
+      }
+    }
+    if (!delOk) continue; // ne pas marquer purgé si la suppression a échoué (réessai prochain run)
+    const { error: updErr } = await supabaseAdmin.from('orders').update({
+      delivery_proof_photo_path: null,
+      delivery_proof_video_path: null,
+      delivery_proof_purged_at: new Date().toISOString(),
+    } as any).eq('id', o.id);
+    if (updErr) { logger.error(`[delivery-proof.cleanup] db ${o.id}: ${updErr.message}`); continue; }
+    purged++;
+  }
+  logger.info(`Delivery proof cleanup: ${purged}/${orders.length} purgées`);
+});
+
+// 🧹 Annule les commandes CARTE 'pending' jamais confirmées par le webhook (client parti au
+// moment de payer). Au-delà de 30 min → annulation ; le trigger restore_stock_on_order_cancel
+// remet le stock automatiquement. JAMAIS COD (payment_method='cash'), JAMAIS 'paid'. Garde
+// optimiste anti-course (.eq payment_status 'pending' sur l'UPDATE).
+registerHandler('orders.cancel-abandoned-card', async () => {
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();   // 30 min
+  const { data: stale, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, created_at, payment_intent_id')
+    .eq('payment_method', 'card')
+    .eq('payment_status', 'pending')
+    .neq('status', 'cancelled')
+    .neq('status', 'delivered')
+    .lt('created_at', cutoff)
+    .limit(100);
+  if (error) { logger.error(`[orders.cancel-abandoned-card] ${error.message}`); return; }
+  if (!stale?.length) { logger.info('Abandoned card orders: rien à annuler'); return; }
+
+  let cancelled = 0;
+  for (const o of stale as any[]) {
+    // ⚠️ DOUBLE-CHECK anti-course : re-lire juste avant (un paiement peut aboutir entre-temps).
+    const { data: fresh } = await supabaseAdmin
+      .from('orders').select('payment_status, metadata').eq('id', o.id).maybeSingle();
+    if (!fresh || fresh.payment_status !== 'pending') continue;   // payée entre-temps → ne pas toucher
+
+    const { error: updErr } = await supabaseAdmin
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        payment_status: 'failed',
+        updated_at: new Date().toISOString(),
+        metadata: {
+          ...(fresh.metadata && typeof fresh.metadata === 'object' ? fresh.metadata : {}),
+          cancel_reason: 'card_payment_abandoned',
+        },
+      })
+      .eq('id', o.id)
+      .eq('payment_status', 'pending');   // garde optimiste : n'annule QUE si toujours pending
+    if (updErr) { logger.error(`[orders.cancel-abandoned-card] ${o.id}: ${updErr.message}`); continue; }
+    cancelled++;
+    // Le trigger restore_stock_on_order_cancel remet le stock automatiquement.
+  }
+  logger.info(`Abandoned card orders: ${cancelled}/${stale.length} annulées (stock remis par trigger)`);
+});
+
+// 🔁 RÉCONCILIATION Stripe : rattrape les webhooks MANQUÉS (downtime/réseau). Pour les commandes
+// carte 'pending' avec un PaymentIntent, âgées de 10-60 min, interroge l'API Stripe :
+//   - PI 'succeeded' → rejoue la MÊME logique idempotente (applyPaymentSucceeded, partagée avec
+//     le webhook) → marque 'paid' + confirme l'escrow, JAMAIS de double-traitement.
+//   - PI 'canceled'/'requires_payment_method' → annule la commande (restock auto).
+//   - sinon (processing/requires_action) → laisse pour un prochain passage.
+registerHandler('stripe.reconcile-pending', async () => {
+  const minAge = new Date(Date.now() - 10 * 60 * 1000).toISOString();   // ≥ 10 min (webhook aurait dû arriver)
+  const maxAge = new Date(Date.now() - 60 * 60 * 1000).toISOString();   // ≤ 60 min (encore pertinent)
+  const { data: pend, error } = await supabaseAdmin
+    .from('orders')
+    .select('id, payment_intent_id')
+    .eq('payment_method', 'card')
+    .eq('payment_status', 'pending')
+    .not('payment_intent_id', 'is', null)
+    .lt('created_at', minAge)
+    .gt('created_at', maxAge)
+    .limit(50);
+  if (error) { logger.error(`[stripe.reconcile-pending] ${error.message}`); return; }
+  if (!pend?.length) { logger.info('Stripe reconcile: rien à réconcilier'); return; }
+
+  const stripeKey = await getStripeSecretKey();
+  if (!stripeKey) { logger.warn('[stripe.reconcile-pending] clé Stripe indisponible — réconciliation ignorée'); return; }
+
+  let fixed = 0;
+  for (const o of pend as any[]) {
+    try {
+      const res = await fetch(`https://api.stripe.com/v1/payment_intents/${o.payment_intent_id}`,
+        { headers: { Authorization: `Bearer ${stripeKey}` } });
+      const pi: any = await res.json();
+      if (!res.ok) {
+        logger.warn(`[stripe.reconcile-pending] ${o.id}: Stripe ${res.status} ${pi?.error?.message || ''}`);
+        continue;
+      }
+
+      if (pi?.status === 'succeeded') {
+        // Webhook manqué mais paiement abouti → rejouer la logique de succès IDEMPOTENTE.
+        await applyPaymentSucceeded(pi, { source: 'reconcile' });
+        fixed++;
+      } else if (['canceled', 'requires_payment_method'].includes(pi?.status)) {
+        // Paiement échoué/abandonné côté Stripe → annuler (restock auto), avec garde optimiste.
+        const { data: fresh } = await supabaseAdmin
+          .from('orders').select('payment_status, metadata').eq('id', o.id).maybeSingle();
+        if (!fresh || fresh.payment_status !== 'pending') continue;
+        await supabaseAdmin.from('orders')
+          .update({
+            status: 'cancelled', payment_status: 'failed', updated_at: new Date().toISOString(),
+            metadata: {
+              ...(fresh.metadata && typeof fresh.metadata === 'object' ? fresh.metadata : {}),
+              cancel_reason: 'stripe_reconcile_not_paid',
+            },
+          })
+          .eq('id', o.id).eq('payment_status', 'pending');
+      }
+      // processing / requires_action → ne rien faire, réessayer plus tard.
+    } catch (e: any) {
+      logger.error(`[stripe.reconcile-pending] ${o.id}: ${e.message}`);
+    }
+  }
+  logger.info(`Stripe reconcile: ${fixed} paiement(s) rattrapé(s) sur ${pend.length}`);
+});
+
+// 🚕 Réattribution taxi : une course 'requested' sans chauffeur au-delà d'un délai laisse le
+// client dans le vide. Après 3 min sans acceptation → clôturée par le système
+// (cancel_reason 'no_driver_found') pour libérer le client. La re-proposition au chauffeur
+// suivant est gérée en temps réel (declined_drivers) ; ce job est le filet anti-attente infinie.
+registerHandler('taxi.reassign-stale-requests', async () => {
+  const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();   // 3 min sans chauffeur
+  const { data: stale, error } = await supabaseAdmin
+    .from('taxi_trips')
+    .select('id, customer_id, requested_at')
+    .eq('status', 'requested')
+    .is('driver_id', null)
+    .lt('requested_at', cutoff)
+    .limit(50);
+  if (error) { logger.error(`[taxi.reassign] ${error.message}`); return; }
+  if (!stale?.length) { logger.info('taxi.reassign: aucune course en attente'); return; }
+
+  let closed = 0;
+  for (const r of stale as any[]) {
+    const { error: updErr } = await supabaseAdmin
+      .from('taxi_trips')
+      .update({
+        status: 'cancelled',
+        cancelled_by: 'system',
+        cancel_reason: 'no_driver_found',
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', r.id)
+      .eq('status', 'requested')   // garde optimiste anti-course
+      .is('driver_id', null);
+    if (updErr) { logger.error(`[taxi.reassign] ${r.id}: ${updErr.message}`); continue; }
+    closed++;
+  }
+  logger.info(`taxi.reassign: ${closed}/${stale.length} course(s) sans chauffeur clôturée(s)`);
+});
+
+>>>>>>> Stashed changes
 registerHandler('escrow.auto-release', async () => {
   const now = new Date().toISOString();
   const { data: escrows } = await supabaseAdmin

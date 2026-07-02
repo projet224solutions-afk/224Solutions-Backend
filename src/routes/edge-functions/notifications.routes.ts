@@ -5,6 +5,7 @@ import { sendSms } from "../../services/sms.service.js";
 import {
   loadServiceAccount,
   getBucketName,
+  getPrivateBucketName,
   generateUniqueFileName,
   generateSignedUrl,
   computeDeleteToken,
@@ -726,10 +727,12 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
       folder,
       expiresInMinutes,
       deleteToken,
+      visibility, // 'private' → bucket privé (preuves de livraison), sinon public
     } = req.body || {};
 
     const serviceAccount = loadServiceAccount();
-    const bucketName = getBucketName();
+    const isPrivate = visibility === "private";
+    const bucketName = isPrivate ? getPrivateBucketName() : getBucketName();
 
     if (!serviceAccount) {
       logger?.warn?.("[gcs-signed-url] Compte de service GCS absent/invalide → fallback Supabase");
@@ -768,7 +771,8 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
     const method = action === "upload" ? "PUT" : "GET";
 
     const signedUrl = generateSignedUrl(serviceAccount, bucketName, objectPath, { method, expiresInSeconds });
-    const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectPath}`;
+    // Bucket privé → pas d'URL publique (accès uniquement via URL signée côté serveur).
+    const publicUrl = isPrivate ? null : `https://storage.googleapis.com/${bucketName}/${objectPath}`;
     const deleteTokenOut = computeDeleteToken(serviceAccount.private_key_id, objectPath);
 
     return res.json({
@@ -777,6 +781,7 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
       publicUrl,
       objectPath,
       bucket: bucketName,
+      private: isPrivate,
       deleteToken: deleteTokenOut,
     });
   } catch (err: any) {

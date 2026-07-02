@@ -407,16 +407,17 @@ serve(async (req) => {
     ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
     console.log('Deliveries found:', deliveries.length)
 
-    // 10. Récupérer les courses (rides)
+    // 10. Récupérer les courses taxi (table canonique taxi_trips ; ex-`rides` retirée,
+    // mêmes colonnes customer_id/driver_id/created_at → répare l'activité qui était vide)
     const { data: ridesAsCustomer } = await adminClient
-      .from('rides')
+      .from('taxi_trips')
       .select('*')
       .eq('customer_id', userId)
       .order('created_at', { ascending: false })
       .limit(50)
 
     const { data: ridesAsDriver } = await adminClient
-      .from('rides')
+      .from('taxi_trips')
       .select('*')
       .eq('driver_id', userId)
       .order('created_at', { ascending: false })

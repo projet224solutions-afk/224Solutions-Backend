@@ -1356,8 +1356,6 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
 });
 
 /**
-<<<<<<< Updated upstream
-=======
  * POST /api/orders/:orderId/delivery-proof — le vendeur enregistre les chemins
  * (fichiers déjà uploadés dans le bucket privé delivery-proofs). Réservé au vendeur.
  */
@@ -1451,7 +1449,6 @@ router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageR
 });
 
 /**
->>>>>>> Stashed changes
  * POST /api/orders/:orderId/request-refund
  * Ouvre un litige de remboursement (remplace l'Edge Function 'request-refund' — pas de mouvement
  * d'argent ici, juste la création du litige + notification vendeur). L'argent ne bouge qu'à la

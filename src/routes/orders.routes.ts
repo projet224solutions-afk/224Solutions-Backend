@@ -1321,6 +1321,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
       .update({
         status: 'delivered',
         updated_at: nowIso,
+        delivery_confirmed_at: nowIso, // ancre la rétention : purge de la preuve 7 j après
         metadata: {
           ...(fullOrder.metadata && typeof fullOrder.metadata === 'object' ? fullOrder.metadata : {}),
           delivered_at: nowIso,

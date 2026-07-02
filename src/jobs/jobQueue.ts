@@ -890,6 +890,8 @@ export const jobQueue = {
 
       recurringTimers.push(setInterval(() => this.enqueue('recommendations.recalculate', {}).catch(() => {}), every24Hours));
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
+      // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
+      recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
       recurringTimers.push(setInterval(() => this.enqueue('beauty.reminders', {}).catch(() => {}), 15 * 60 * 1000));
 
@@ -926,6 +928,8 @@ export const jobQueue = {
       // Daily: recommendations + rappels d'expiration d'abonnement
       await queue.add('recommendations.recalculate', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
+      // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
+      await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');

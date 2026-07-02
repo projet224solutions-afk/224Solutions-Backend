@@ -268,7 +268,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
         await safeDelete('order_items', 'order_id', o.id);
         await safeDelete('order_status_history', 'order_id', o.id);
         await safeDelete('delivery_tracking', 'order_id', o.id);
-        await safeDelete('china_logistics', 'order_id', o.id);
         await safeDelete('payment_schedules', 'order_id', o.id);
         await safeDelete('deliveries', 'order_id', o.id);
       }
@@ -302,7 +301,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
           await safeDelete('order_items', 'order_id', o.id);
           await safeDelete('order_status_history', 'order_id', o.id);
           await safeDelete('delivery_tracking', 'order_id', o.id);
-          await safeDelete('china_logistics', 'order_id', o.id);
           await safeDelete('payment_schedules', 'order_id', o.id);
         }
       }
@@ -343,8 +341,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
       await safeDelete('vendor_settings', 'vendor_id', vendorId);
       await safeDelete('vendor_analytics', 'vendor_id', vendorId);
       await safeDelete('vendor_subscriptions', 'vendor_id', vendorId);
-      await safeDelete('china_dropship_settings', 'vendor_id', vendorId);
-      await safeDelete('china_dropship_reports', 'vendor_id', vendorId);
       await safeDelete('dropship_settings', 'vendor_id', vendorId);
       await safeDelete('service_products', 'vendor_id', vendorId);
       await safeDelete('quotes', 'vendor_id', vendorId);

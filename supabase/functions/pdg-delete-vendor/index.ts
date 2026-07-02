@@ -179,7 +179,6 @@ serve(async (req) => {
         await safeDelete('order_items', 'order_id', order.id);
         await safeDelete('order_status_history', 'order_id', order.id);
         await safeDelete('delivery_tracking', 'order_id', order.id);
-        await safeDelete('china_logistics', 'order_id', order.id);
       }
     }
     
@@ -224,8 +223,6 @@ serve(async (req) => {
     // Supprimer les paramètres et analytics
     await safeDelete('vendor_settings', 'vendor_id', vendor.id);
     await safeDelete('vendor_analytics', 'vendor_id', vendor.id);
-    await safeDelete('china_dropship_settings', 'vendor_id', vendor.id);
-    await safeDelete('china_dropship_reports', 'vendor_id', vendor.id);
     await safeDelete('dropship_settings', 'vendor_id', vendor.id);
 
     // ÉTAPE 3: Tenter la suppression du vendeur

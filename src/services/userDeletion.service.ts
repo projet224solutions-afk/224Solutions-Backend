@@ -284,7 +284,6 @@ export async function deleteUserCompletely(userId: string, opts: DeleteUserOptio
       await safeDelete('order_items', 'order_id', o.id);
       await safeDelete('order_status_history', 'order_id', o.id);
       await safeDelete('delivery_tracking', 'order_id', o.id);
-      await safeDelete('china_logistics', 'order_id', o.id);
       await safeDelete('payment_schedules', 'order_id', o.id);
       await safeDelete('deliveries', 'order_id', o.id);
     }
@@ -310,7 +309,6 @@ export async function deleteUserCompletely(userId: string, opts: DeleteUserOptio
         await safeDelete('order_items', 'order_id', o.id);
         await safeDelete('order_status_history', 'order_id', o.id);
         await safeDelete('delivery_tracking', 'order_id', o.id);
-        await safeDelete('china_logistics', 'order_id', o.id);
         await safeDelete('payment_schedules', 'order_id', o.id);
       }
     }
@@ -356,8 +354,6 @@ export async function deleteUserCompletely(userId: string, opts: DeleteUserOptio
       () => safeDelete('vendor_settings', 'vendor_id', vendorId),
       () => safeDelete('vendor_analytics', 'vendor_id', vendorId),
       () => safeDelete('vendor_subscriptions', 'vendor_id', vendorId),
-      () => safeDelete('china_dropship_settings', 'vendor_id', vendorId),
-      () => safeDelete('china_dropship_reports', 'vendor_id', vendorId),
       () => safeDelete('dropship_settings', 'vendor_id', vendorId),
       () => safeDelete('service_products', 'vendor_id', vendorId),
       () => safeDelete('quotes', 'vendor_id', vendorId),

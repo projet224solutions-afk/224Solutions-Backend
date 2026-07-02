@@ -14,6 +14,7 @@ import { Router, Request, Response, raw } from "express";
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
 import { logger } from "../../config/logger.js";
+import { creditWallet } from "../../services/wallet.service.js";
 
 const router = Router();
 
@@ -1010,9 +1011,23 @@ router.post("/escrow-refund", async (req: Request, res: Response) => {
 router.post("/manual-credit-seller", async (req: Request, res: Response) => {
   try {
     const { seller_id, amount, reason } = req.body as any;
-    const { error } = await supabase.rpc("credit_wallet", { p_user_id: seller_id, p_amount: amount, p_reason: reason || "manual_credit" });
-    if (error) throw error;
-    return res.json({ success: true });
+    if (!seller_id || !amount || Number(amount) <= 0) {
+      return res.status(400).json({ success: false, error: "seller_id et amount (>0) requis" });
+    }
+    // Crédit via la primitive canonique (verrou wallet + plafond/quarantaine AML + ledger
+    // atomique). L'ancien appel rpc('credit_wallet', {p_reason}) ne matchait AUCUNE signature
+    // (404 silencieux) → le crédit ne se faisait jamais.
+    const adminId = (req as any).user?.id || "admin";
+    const result = await creditWallet(
+      seller_id,
+      Number(amount),
+      reason || "Crédit manuel vendeur (PDG)",
+      `manual_credit_${seller_id}_${Date.now()}`,
+      "deposit"
+    );
+    if (!result.success) throw new Error(result.error || "Crédit impossible");
+    logger.info(`[manual-credit-seller] ${seller_id} crédité de ${amount} par ${adminId}`);
+    return res.json({ success: true, quarantined: result.quarantined });
   } catch (error) {
     return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Manual credit failed" });
   }

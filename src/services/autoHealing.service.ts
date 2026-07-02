@@ -372,9 +372,12 @@ export async function applyRemediation(id: string, adminId: string): Promise<{ o
 }
 
 /** Ingest RAPIDE (sans LLM) des alertes actives + résumé des incidents ouverts (pour le panneau Surveillance). */
-export async function ingestAndSummarize(): Promise<{ open: number; detected: number; proposed: number; escalated: number; ingested: number }> {
-  const created = await ingestActiveAlerts();
-  await ingestFrontendErrorsBacklog();
+/**
+ * Résumé LÉGER (1 requête) des incidents ouverts — SANS ré-ingestion. Utilisé par l'endpoint HTTP
+ * PDG pour renvoyer les compteurs sans payer les ~100 aller-retours de ingestActiveAlerts (la
+ * ré-ingestion est déjà assurée par le cycle 24/7 toutes les 60s).
+ */
+export async function summarizeOpenIncidents(): Promise<{ open: number; detected: number; proposed: number; escalated: number; ingested: number }> {
   const { data } = await supabaseAdmin
     .from('auto_healing_incidents').select('status')
     .not('status', 'in', '(resolved,applied,failed)');
@@ -384,6 +387,13 @@ export async function ingestAndSummarize(): Promise<{ open: number; detected: nu
     detected: rows.filter((r) => r.status === 'detected').length,
     proposed: rows.filter((r) => r.status === 'proposed').length,
     escalated: rows.filter((r) => r.status === 'escalated').length,
-    ingested: created.length,
+    ingested: 0,
   };
+}
+
+export async function ingestAndSummarize(): Promise<{ open: number; detected: number; proposed: number; escalated: number; ingested: number }> {
+  const created = await ingestActiveAlerts();
+  await ingestFrontendErrorsBacklog();
+  const summary = await summarizeOpenIncidents();
+  return { ...summary, ingested: created.length };
 }

@@ -187,13 +187,32 @@ export async function syncDomainAlerts(
  *   relues depuis system_alerts). Évite le timeout serverless → plus de spinner infini côté PDG.
  * @param opts.timeoutMs      garde-fou par domaine (un RPC lent ne bloque pas tout le panneau).
  */
-export async function runPlatformMonitors(
-  opts: { skipFnDomains?: boolean; timeoutMs?: number } = {}
-): Promise<{
+type PlatformReport = {
   domains: { key: string; label: string; report: MonitorReport }[];
   alerts: any[];
-}> {
-  const { skipFnDomains = false, timeoutMs = 8000 } = opts;
+};
+
+// 🗄️ Cache mémoire du DERNIER rapport calculé — partagé (même process Node) entre l'endpoint HTTP
+// PDG et le cycle 24/7. Évite de relancer les 10 RPC à CHAQUE requête (refetch 20s + realtime +
+// plusieurs onglets) : la cause n°1 de la lenteur et des 500 par timeout serverless.
+let _lastPlatform: { at: number; data: PlatformReport } | null = null;
+
+/**
+ * Renvoie le dernier rapport plateforme si < maxAgeMs, sinon le recalcule (et met le cache à jour).
+ * L'endpoint HTTP l'utilise pour répondre en quelques ms tant qu'un calcul récent existe (produit
+ * soit par une requête précédente, soit par le cycle 24/7), au lieu de recalculer systématiquement.
+ */
+export async function getPlatformMonitorReport(maxAgeMs = 15000): Promise<PlatformReport> {
+  if (_lastPlatform && (Date.now() - _lastPlatform.at) < maxAgeMs) return _lastPlatform.data;
+  return runPlatformMonitors({ skipFnDomains: true });
+}
+
+export async function runPlatformMonitors(
+  opts: { skipFnDomains?: boolean; timeoutMs?: number } = {}
+): Promise<PlatformReport> {
+  // 3.5s/domaine : une RPC de surveillance saine répond en <1s ; garde la réponse totale bien sous
+  // la limite serverless (~10s) même si un domaine est lent (Promise.allSettled isole les échecs).
+  const { skipFnDomains = false, timeoutMs = 3500 } = opts;
   const withTimeout = <T>(p: Promise<T>, label: string): Promise<T> =>
     Promise.race([
       p,
@@ -224,7 +243,9 @@ export async function runPlatformMonitors(
     .order('created_at', { ascending: false })
     .limit(60);
 
-  return { domains, alerts: alerts || [] };
+  const result: PlatformReport = { domains, alerts: alerts || [] };
+  _lastPlatform = { at: Date.now(), data: result }; // alimente le cache partagé (endpoint + cycle 24/7)
+  return result;
 }
 
 /** Compat : surveillance escrow seule. */

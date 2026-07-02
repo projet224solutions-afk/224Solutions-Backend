@@ -20,7 +20,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createNotification, createNotifications } from '../services/notification.service.js';
 import { logger } from '../config/logger.js';
-import { runPlatformMonitors } from '../services/escrowMonitor.service.js';
+import { getPlatformMonitorReport } from '../services/escrowMonitor.service.js';
 import * as autoHealing from '../services/autoHealing.service.js';
 import { getAlertDetails } from '../services/alertDetails.service.js';
 import * as aml from '../services/aml.service.js';
@@ -742,10 +742,14 @@ router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: 
   try {
     // skipFnDomains : on évite le scan RÉSEAU sécurité-frontend dans la requête (timeout serverless →
     // spinner infini). Ses alertes restent visibles (relues depuis system_alerts, écrites par le cycle 24/7).
-    const data = await runPlatformMonitors({ skipFnDomains: true });
-    // Connexion à l'auto-réparation : ingestion RAPIDE des alertes actives en incidents (sans LLM ici).
+    // Rapport depuis le CACHE (recalcul uniquement s'il date de > 15s) → réponse rapide, plus de 500
+    // par timeout serverless quand plusieurs onglets PDG rafraîchissent (refetch 20s + realtime).
+    const data = await getPlatformMonitorReport(15000);
+    // Auto-réparation : la ré-ingestion (~100 aller-retours séquentiels) est DÉJÀ faite par le cycle
+    // 24/7 (60s) → fire-and-forget HORS chemin de réponse + on renvoie le résumé LÉGER (1 requête).
+    void autoHealing.ingestAndSummarize().catch(() => { /* best-effort, hors chemin de réponse */ });
     let autoHealingSummary: { open: number; proposed: number; escalated: number; detected: number } | undefined;
-    try { autoHealingSummary = await autoHealing.ingestAndSummarize(); } catch { /* best-effort */ }
+    try { autoHealingSummary = await autoHealing.summarizeOpenIncidents(); } catch { /* best-effort */ }
     res.json({ success: true, data: { ...data, autoHealing: autoHealingSummary } });
   } catch (error: any) {
     logger.error(`[admin/platform-monitor] ${error.message}`);
@@ -1137,7 +1141,7 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
     const userId = req.user!.id;
     const { data: esc, error: e1 } = await supabaseAdmin
       .from('escrow_transactions')
-      .select('id, status, commission_percent, receiver_id, order_id')
+      .select('id, status, receiver_id, order_id')
       .eq('id', escrowId).maybeSingle();
     if (e1) throw e1;
     if (!esc) { res.status(404).json({ success: false, error: 'Transaction escrow introuvable' }); return; }
@@ -1145,16 +1149,29 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
       res.status(409).json({ success: false, error: `Déjà traité (statut: ${(esc as any).status})` }); return;
     }
 
-    const commission = Number((esc as any).commission_percent) || 2.5;
-    const { error: rpcErr } = await supabaseAdmin.rpc('release_escrow', {
+    // 🧱 PRIMITIVE CANONIQUE release_escrow_to_seller (même RPC que le job auto-release) :
+    // FOR UPDATE + idempotente + CONVERSION de devise (credit_user_wallet_safe) + commission PDG
+    // + ligne wallet_transactions 'escrow_release', tout-ou-rien. Remplace l'ancienne release_escrow
+    // qui (1) ne traitait QUE 'pending' → RETURN FALSE MUET sur 'held' (statut normal après paiement) :
+    // le vendeur n'était pas crédité alors que la commande passait 'paid' ; (2) n'écrivait AUCUN
+    // ledger 'escrow_release' → fausse alerte de surveillance « Escrow libéré sans trace ». La
+    // commission est calculée par la RPC (modèle frais-acheteur), plus besoin de commission_percent.
+    const { data: relData, error: rpcErr } = await supabaseAdmin.rpc('release_escrow_to_seller', {
       p_escrow_id: escrowId,
-      p_commission_percent: commission,
-      p_released_by: userId,
+      p_reason: `pdg_manual_release:${userId}`,
     });
     if (rpcErr) {
       const msg = String(rpcErr.message || '');
       logger.warn(`[escrow/release] ${escrowId}: ${msg}`);
       res.status(/not.*held|already|status/i.test(msg) ? 409 : 400).json({ success: false, error: `Libération impossible: ${msg}` });
+      return;
+    }
+    // La RPC renvoie { success:false, error } si elle refuse (vendeur manquant…) : ne PAS marquer
+    // la commande payée dans ce cas (c'était le bug de l'ancien chemin qui ignorait le retour).
+    const rel = relData as any;
+    if (rel && rel.success === false) {
+      logger.warn(`[escrow/release] ${escrowId}: ${rel.error}`);
+      res.status(400).json({ success: false, error: `Libération impossible: ${rel.error || 'inconnu'}` });
       return;
     }
 
@@ -1168,7 +1185,7 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
       });
     } catch (e: any) { logger.warn(`[escrow/release] notif: ${e?.message}`); }
 
-    logger.info(`[escrow/release] ${escrowId} released by ${userId} (commission ${commission}%)`);
+    logger.info(`[escrow/release] ${escrowId} released by ${userId}${rel?.skipped ? ' (déjà libéré)' : ''}`);
     res.json({ success: true });
   } catch (error: any) {
     logger.error(`[escrow/release] ${error.message}`);

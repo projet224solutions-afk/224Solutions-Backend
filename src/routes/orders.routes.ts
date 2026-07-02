@@ -707,11 +707,11 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
     }
 
     // 💰 COMMISSION AGENT (affiliation) sur l'achat marketplace — best-effort, non bloquant.
-    // RÈGLE MÉTIER : l'agent (et son parent) touche un % des FRAIS DE TRANSACTION (la commission
-    // acheteur, ex. 2 %), et NON du montant brut. Ex : achat 100 000, frais 2 % = 2 000 ; sous-agent
-    // 15 % des frais = 300, agent principal 5 % = 100 (total 400 = 20 % des frais ; plateforme garde
-    // 80 %). Base = buyer fee converti en GNF (credit_agent_commission raisonne en GNF). Anti-doublon
-    // par order_id + plafonné. On ne déclenche que sur commande PAYÉE.
+    // RÈGLE MÉTIER : l'agent CRÉATEUR du service (= le VENDEUR, et son parent), PAS l'acheteur,
+    // touche un % des FRAIS DE TRANSACTION (la commission acheteur, ex. 2 %), et NON du montant
+    // brut. Ex : achat 100 000, frais 2 % = 2 000 ; sous-agent 15 % des frais = 300, agent principal
+    // 5 % = 100 (total 400 = 20 % des frais ; plateforme garde 80 %). Base = buyer fee converti en
+    // GNF (credit_agent_commission raisonne en GNF). Anti-doublon par order_id + plafonné. Commande PAYÉE.
     // ⚠️ Réserve : pas de reprise sur annulation/remboursement (même profil que record_pdg_revenue).
     if (finalPaymentStatus === 'paid') {
       try {
@@ -730,8 +730,9 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
           // Pas de taux dispo → on n'invente pas (commission ignorée plutôt que fausse).
           gnfFee = fx?.rate ? feeAmount * Number(fx.rate) : 0;
         }
-        if (gnfFee > 0) {
-          await triggerAffiliateCommission(userId, Math.round(gnfFee), 'achat_produit', result.order_id);
+        if (gnfFee > 0 && vendor.user_id) {
+          // ✅ Agent du CRÉATEUR (le vendeur), et non de l'acheteur.
+          await triggerAffiliateCommission(vendor.user_id, Math.round(gnfFee), 'achat_produit', result.order_id);
         }
       } catch (commErr: any) {
         logger.warn(`commission agent achat non bloquante (commande ${result.order_id}): ${commErr?.message || commErr}`);

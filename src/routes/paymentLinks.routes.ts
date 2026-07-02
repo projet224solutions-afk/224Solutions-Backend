@@ -400,9 +400,11 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
         customer_phone: customerPhone || null,
       }).eq('id', link.id);
 
-      // Trigger affiliate commissions
-      if (userId) {
-        await triggerAffiliateCommission(userId, payAmount, 'payment_link', walletTxId || link.id);
+      // Commission agent : l'agent du CRÉATEUR du lien (= le vendeur ownerUserId), PAS du payeur,
+      // touche un % des FRAIS (platformFee), et NON du brut (sinon l'agent > frais encaissés = fuite
+      // PDG). Non bloquant, idempotent par la transaction. Alignement sur le modèle marketplace.
+      if (ownerUserId && platformFee > 0) {
+        await triggerAffiliateCommission(ownerUserId, platformFee, 'payment_link', walletTxId || link.id);
       }
 
       logger.info(`[PaymentLinks] Wallet payment completed: txId=${walletTxId}, net=${netAmount}`);

@@ -50,6 +50,7 @@ serve(async (req) => {
       serviceId,
       memorySummary = "",
       pinnedFacts = [],
+      hasImageAttachment = false,
     } = body;
 
     // ── Phase 1 : service + profil + wallet (parallèle) ───────────────────────
@@ -286,6 +287,26 @@ Tu poursuis une conversation — NE la recommence PAS.
 🧠 MÉMOIRE DE SESSION
 - Résumé récent: ${memorySummary || "Aucun résumé fourni"}
 - Faits épinglés: ${Array.isArray(pinnedFacts) && pinnedFacts.length > 0 ? pinnedFacts.join(" | ") : "Aucun"}
+- Image jointe dans ce tour: ${hasImageAttachment ? "oui" : "non"}
+
+════════════════════════════════════════════════════════════════
+📷 MODE 5 — GESTION DES IMAGES (RÈGLE ABSOLUE)
+════════════════════════════════════════════════════════════════
+
+Le message utilisateur peut contenir un bloc commençant par [CONTEXTE_IMAGE].
+Ce bloc est la DESCRIPTION TEXTUELLE d'une photo envoyée par l'utilisateur,
+DÉJÀ ANALYSÉE en amont par un module de vision. Tu n'as pas besoin de voir la photo.
+
+TU DOIS :
+- Traiter le contenu de [CONTEXTE_IMAGE] comme si tu avais vu la photo toi-même.
+- Utiliser le nom du produit et les mots-clés fournis pour chercher, conseiller, comparer.
+- Si le bloc dit seulement "Photo jointe" sans détail (analyse indisponible),
+  demander UNE description courte du produit (type, marque, couleur) SANS t'excuser longuement.
+
+INTERDICTIONS ABSOLUES :
+- ❌ Ne JAMAIS dire "je ne peux pas voir les photos / images".
+- ❌ Ne JAMAIS dire que tu n'as pas accès aux images.
+- ❌ Ne JAMAIS mentionner le tag [CONTEXTE_IMAGE] ni le module de vision à l'utilisateur.
 
 ════════════════════════════════════════════════════════════════
 🎯 TES DOMAINES D'EXPERTISE

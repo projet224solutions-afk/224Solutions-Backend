@@ -720,7 +720,7 @@ Règles : keywords = 3 à 6 mots pour chercher ce produit ; inclure la couleur e
         temperature: 0.1,
         max_tokens: 300,
       }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!response.ok) throw new Error("Erreur gateway IA");
@@ -728,7 +728,15 @@ Règles : keywords = 3 à 6 mots pour chercher ce produit ; inclure la couleur e
     const data = (await response.json()) as any;
     const content: string = data?.choices?.[0]?.message?.content ?? "";
     const cleaned = content.replace(/```json?\n?/g, "").replace(/```\n?/g, "").trim();
-    const parsed = JSON.parse(cleaned);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      // Le modèle peut renvoyer du texte autour du JSON → extraire le premier objet.
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("Réponse vision non parsable");
+      parsed = JSON.parse(match[0]);
+    }
 
     return res.status(200).json({
       success: true,
@@ -740,9 +748,10 @@ Règles : keywords = 3 à 6 mots pour chercher ce produit ; inclure la couleur e
     });
   } catch (error) {
     logger.error("[Copilote Analyze Image]", error);
-    return res.status(500).json({
+    const isAbort = error instanceof Error && error.name === "TimeoutError";
+    return res.status(isAbort ? 504 : 500).json({
       success: false,
-      error: "Analyse d'image échouée",
+      error: isAbort ? "Analyse d'image trop lente, réessayez" : "Analyse d'image échouée",
     });
   }
 });

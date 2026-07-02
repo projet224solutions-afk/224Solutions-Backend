@@ -39,7 +39,7 @@ BEGIN
     PERFORM public.credit_user_wallet_safe(v_pdg, v_commission, 'GNF', 'artisan_commission', p_idempotency_key);
     -- Commission agent : débite 20% du PDG (Étape 1), ref distincte par phase, NON bloquante.
     BEGIN
-      PERFORM public.credit_agent_commission(p_client, v_commission, 'artisan', md5(p_idempotency_key)::uuid,
+      PERFORM public.credit_agent_commission(p_artisan, v_commission, 'artisan', md5(p_idempotency_key)::uuid,
         jsonb_build_object('currency', 'GNF', 'flow', 'artisan', 'intervention_id', p_intervention_id, 'phase', p_idempotency_key));
     EXCEPTION WHEN OTHERS THEN
       RAISE NOTICE 'commission agent artisan non appliquée (% / %): %', p_intervention_id, p_idempotency_key, SQLERRM;

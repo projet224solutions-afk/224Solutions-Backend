@@ -43,6 +43,11 @@ BEGIN
     -- prestataire à la libération). La commission est prélevée HORS escrow ici.
     IF v_pdg IS NOT NULL AND v_commission > 0 THEN
       PERFORM public.credit_user_wallet_safe(v_pdg, v_commission, 'GNF', 'quote_commission', p_quote_id::text);
+      -- Commission AGENT au créateur du service (= le prestataire v_provider), débitée du PDG. Non bloquante.
+      BEGIN
+        PERFORM public.credit_agent_commission(v_provider, v_commission, 'quote', md5('quote-'||p_quote_id::text)::uuid,
+          jsonb_build_object('currency','GNF','flow','quote','quote_id',p_quote_id));
+      EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'commission agent devis non appliquée (%): %', p_quote_id, SQLERRM; END;
     END IF;
     UPDATE public.service_quotes SET status = 'paid', escrow_status = 'held', paid_at = now(),
       client_user_id = COALESCE(client_user_id, p_actor_user_id) WHERE id = p_quote_id;
@@ -52,6 +57,11 @@ BEGIN
     PERFORM public.credit_user_wallet_safe(v_provider, q.total_amount, 'GNF', 'quote_payment', p_quote_id::text);
     IF v_pdg IS NOT NULL AND v_commission > 0 THEN
       PERFORM public.credit_user_wallet_safe(v_pdg, v_commission, 'GNF', 'quote_commission', p_quote_id::text);
+      -- Commission AGENT au créateur du service (= le prestataire v_provider), débitée du PDG. Non bloquante.
+      BEGIN
+        PERFORM public.credit_agent_commission(v_provider, v_commission, 'quote', md5('quote-'||p_quote_id::text)::uuid,
+          jsonb_build_object('currency','GNF','flow','quote','quote_id',p_quote_id));
+      EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'commission agent devis non appliquée (%): %', p_quote_id, SQLERRM; END;
     END IF;
     UPDATE public.service_quotes SET status = 'paid', paid_at = now(),
       client_user_id = COALESCE(client_user_id, p_actor_user_id) WHERE id = p_quote_id;

@@ -41,6 +41,11 @@ BEGIN
   PERFORM public.credit_user_wallet_safe(v_owner, v_rent, 'GNF', 'rent_payment', p_property_id::text);
   IF v_pdg IS NOT NULL AND v_commission > 0 THEN
     PERFORM public.credit_user_wallet_safe(v_pdg, v_commission, 'GNF', 'rent_commission', p_property_id::text);
+    -- Commission AGENT au créateur du service (= le bailleur), débitée du PDG. Non bloquante.
+    BEGIN
+      PERFORM public.credit_agent_commission(v_owner, v_commission, 'rent', md5('rent-start-'||p_property_id::text||'-'||p_actor_user_id::text)::uuid,
+        jsonb_build_object('currency','GNF','flow','rent','property_id',p_property_id,'phase','start'));
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'commission agent loyer(start) non appliquée (%): %', p_property_id, SQLERRM; END;
   END IF;
 
   INSERT INTO public.rental_leases (property_id, professional_service_id, tenant_user_id, tenant_name, tenant_phone,
@@ -86,6 +91,11 @@ BEGIN
   PERFORM public.credit_user_wallet_safe(v_owner, l.monthly_rent, 'GNF', 'rent_payment', p_lease_id::text);
   IF v_pdg IS NOT NULL AND v_commission > 0 THEN
     PERFORM public.credit_user_wallet_safe(v_pdg, v_commission, 'GNF', 'rent_commission', p_lease_id::text);
+    -- Commission AGENT au créateur du service (= le bailleur), débitée du PDG. Non bloquante.
+    BEGIN
+      PERFORM public.credit_agent_commission(v_owner, v_commission, 'rent', md5('rent-'||p_lease_id::text||'-'||p_period)::uuid,
+        jsonb_build_object('currency','GNF','flow','rent','lease_id',p_lease_id,'period',p_period));
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'commission agent loyer non appliquée (%): %', p_lease_id, SQLERRM; END;
   END IF;
 
   v_receipt := 'QUIT-' || p_period || '-' || upper(substr(replace(gen_random_uuid()::text,'-',''),1,8));

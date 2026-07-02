@@ -93,6 +93,11 @@ BEGIN
     INSERT INTO public.wallet_transactions (transaction_id, sender_user_id, receiver_user_id, amount, net_amount, currency, transaction_type, status, description, metadata)
     VALUES (generate_transaction_id(), p_client_id, v_pdg, v_commission, v_commission, v_cur, 'commission', 'completed', 'Commission restaurant',
       jsonb_build_object('professional_service_id', p_professional_service_id, 'source', 'restaurant_payment'));
+    -- Commission AGENT au créateur du service (= le restaurateur v_owner), débitée du PDG. Non bloquante.
+    BEGIN
+      PERFORM public.credit_agent_commission(v_owner, v_commission, 'restaurant', md5(p_idempotency_key)::uuid,
+        jsonb_build_object('currency', v_cur, 'flow', 'restaurant', 'professional_service_id', p_professional_service_id));
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'commission agent restaurant non appliquée (%): %', p_idempotency_key, SQLERRM; END;
   END IF;
   IF v_pdg IS NOT NULL AND v_client_fee > 0 THEN
     PERFORM public.credit_user_wallet_safe(v_pdg, v_client_fee, v_cur);

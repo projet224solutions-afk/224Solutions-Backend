@@ -662,125 +662,17 @@ router.post("/paypal/webhook", async (req: Request, res: Response) => {
  * Create escrow for order
  * Replaces: supabase/functions/escrow/create
  */
-router.post("/escrow/create", async (req: Request, res: Response) => {
-  try {
-    const { order_id, amount, buyer_id, seller_id, release_condition } = req.body;
-
-    if (!order_id || !amount || !buyer_id || !seller_id) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields",
-      });
-    }
-
-    // Create escrow record
-    const { data: escrow, error } = await supabase
-      .from("escrows")
-      .insert({
-        order_id,
-        amount,
-        buyer_id,
-        seller_id,
-        status: "held",
-        release_condition,
-        created_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({
-        success: false,
-        error: "Failed to create escrow",
-      });
-    }
-
-    return res.status(201).json({
-      success: true,
-      escrow: escrow,
-    });
-  } catch (error) {
-    logger.error("[escrow/create] Error:", error);
-    return res.status(500).json({
-      success: false,
-      error: "Escrow creation failed",
-    });
-  }
+// ⚠️ DÉPRÉCIÉ — doublons morts de la table fantôme `escrows` (retirée). Le flux escrow
+// canonique passe par `escrow_transactions` (RPC create_order_core + Edge Functions
+// escrow-create-stripe / escrow-release / escrow-dispute / escrow-refund). Preuve de
+// non-usage : `escrows` = 0 ligne alors que `escrow_transactions` en a 193. Routes non
+// atteintes (aucun `/api/escrow` monté ; front → Edge Deno ; RPC transfer_escrow_to_wallet inexistant).
+router.post("/escrow/create", async (_req: Request, res: Response) => {
+  return res.status(410).json({ success: false, error: "Route dépréciée. Escrow géré via escrow_transactions (Edge Functions escrow-*)." });
 });
 
-// ============ POST /escrow/release ============
-/**
- * Release escrowed funds to seller
- * Replaces: supabase/functions/escrow/release
- */
-router.post("/escrow/release", async (req: Request, res: Response) => {
-  try {
-    const { escrow_id, reason } = req.body;
-    const userId = (req as any).user?.id;
-
-    if (!escrow_id) {
-      return res.status(400).json({
-        success: false,
-        error: "Escrow ID required",
-      });
-    }
-
-    // Get escrow
-    const { data: escrow, error: getError } = await supabase
-      .from("escrows")
-      .select("*")
-      .eq("id", escrow_id)
-      .single();
-
-    if (getError || !escrow) {
-      return res.status(404).json({
-        success: false,
-        error: "Escrow not found",
-      });
-    }
-
-    // Only buyer or system can release
-    if (escrow.buyer_id !== userId && (req as any).user?.role !== "admin") {
-      return res.status(403).json({
-        success: false,
-        error: "Not authorized to release this escrow",
-      });
-    }
-
-    // Update escrow status
-    const { error: updateError } = await supabase
-      .from("escrows")
-      .update({
-        status: "released",
-        released_at: new Date().toISOString(),
-        release_reason: reason,
-      })
-      .eq("id", escrow_id);
-
-    if (updateError) {
-      return res.status(400).json({
-        success: false,
-        error: "Failed to release escrow",
-      });
-    }
-
-    // Transfer funds to seller wallet
-    await supabase.rpc("transfer_escrow_to_wallet", {
-      escrow_id,
-      seller_id: escrow.seller_id,
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Escrow released to seller",
-    });
-  } catch (error) {
-    logger.error("[escrow/release] Error:", error);
-    return res.status(500).json({
-      success: false,
-      error: "Escrow release failed",
-    });
-  }
+router.post("/escrow/release", async (_req: Request, res: Response) => {
+  return res.status(410).json({ success: false, error: "Route dépréciée. Escrow géré via escrow_transactions (Edge Functions escrow-*)." });
 });
 
 // ============ POST /wallet/transfer ============
@@ -885,19 +777,9 @@ router.get("/wallet/balance", async (req: Request, res: Response) => {
 });
 
 // Compatibility aliases (Supabase function names)
-router.post("/admin-release-funds", async (req: Request, res: Response) => {
-  try {
-    const { escrow_id, reason } = req.body as any;
-    if (!escrow_id) return res.status(400).json({ success: false, error: "escrow_id required" });
-    const { error } = await supabase
-      .from("escrows")
-      .update({ status: "released", released_at: new Date().toISOString(), release_reason: reason || "admin_release" })
-      .eq("id", escrow_id);
-    if (error) throw error;
-    return res.json({ success: true, message: "Funds released" });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Release failed" });
-  }
+router.post("/admin-release-funds", async (_req: Request, res: Response) => {
+  // DÉPRÉCIÉ (table `escrows` retirée) → libération réelle via Edge Function escrow-release / escrow_transactions.
+  return res.status(410).json({ success: false, error: "Route dépréciée. Libération via escrow_transactions (Edge Function escrow-release)." });
 });
 
 router.post("/admin-review-payment", async (req: Request, res: Response) => {
@@ -966,46 +848,19 @@ router.post("/secure-payment-validate", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/escrow-auto-release", async (req: Request, res: Response) => {
-  try {
-    const now = new Date().toISOString();
-    const { data: escrows } = await supabase
-      .from("escrows")
-      .select("id")
-      .eq("status", "held")
-      .lte("auto_release_date", now)
-      .limit(500);
-
-    const ids = (escrows || []).map((e: any) => e.id);
-    if (ids.length > 0) {
-      await supabase.from("escrows").update({ status: "released", released_at: now }).in("id", ids);
-    }
-    return res.json({ success: true, released_count: ids.length });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Auto release failed" });
-  }
+router.post("/escrow-auto-release", async (_req: Request, res: Response) => {
+  // DÉPRÉCIÉ (table `escrows` retirée). Auto-libération réelle = job escrow.auto-release → escrow_transactions.
+  return res.status(410).json({ success: false, error: "Route dépréciée. Auto-libération via escrow_transactions (job escrow.auto-release)." });
 });
 
-router.post("/escrow-dispute", async (req: Request, res: Response) => {
-  try {
-    const { escrow_id, reason } = req.body as any;
-    const { error } = await supabase.from("escrows").update({ status: "dispute", dispute_reason: reason }).eq("id", escrow_id);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Escrow dispute failed" });
-  }
+router.post("/escrow-dispute", async (_req: Request, res: Response) => {
+  // DÉPRÉCIÉ (table `escrows` retirée). Litige réel = Edge Function escrow-dispute → escrow_transactions.
+  return res.status(410).json({ success: false, error: "Route dépréciée. Litige via escrow_transactions (Edge Function escrow-dispute)." });
 });
 
-router.post("/escrow-refund", async (req: Request, res: Response) => {
-  try {
-    const { escrow_id } = req.body as any;
-    const { error } = await supabase.from("escrows").update({ status: "refunded", refunded_at: new Date().toISOString() }).eq("id", escrow_id);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Escrow refund failed" });
-  }
+router.post("/escrow-refund", async (_req: Request, res: Response) => {
+  // DÉPRÉCIÉ (table `escrows` retirée). Remboursement réel = Edge Function escrow-refund → escrow_transactions.
+  return res.status(410).json({ success: false, error: "Route dépréciée. Remboursement via escrow_transactions (Edge Function escrow-refund)." });
 });
 
 router.post("/manual-credit-seller", async (req: Request, res: Response) => {

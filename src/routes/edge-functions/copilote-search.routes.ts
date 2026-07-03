@@ -664,97 +664,10 @@ router.post("/search", async (req: Request, res: Response) => {
   }
 });
 
-// ─── Route analyse image ──────────────────────────────────────────────────────
-
-router.post("/analyze-image", async (req: Request, res: Response) => {
-  const { imageBase64 } = req.body ?? {};
-
-  if (!imageBase64 || typeof imageBase64 !== "string") {
-    return res.status(400).json({ success: false, error: "Image base64 requise" });
-  }
-
-  const apiKey = process.env.LOVABLE_API_KEY || process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(503).json({ success: false, error: "Service d'analyse non configuré" });
-  }
-
-  const isLovable = !!process.env.LOVABLE_API_KEY;
-  const endpoint = isLovable
-    ? "https://ai.gateway.lovable.dev/v1/chat/completions"
-    : "https://api.openai.com/v1/chat/completions";
-  const model = isLovable ? "google/gemini-2.5-flash" : "gpt-4o-mini";
-
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: imageBase64 },
-              },
-              {
-                type: "text",
-                text: `Tu identifies des produits sur photo pour une marketplace en Guinée Conakry (224Solutions).
-Réponds UNIQUEMENT avec un JSON valide, sans markdown :
-{
-  "name": "nom précis du produit détecté",
-  "description": "description courte de l'objet visible",
-  "keywords": ["mot1","mot2","mot3","mot4","mot5"],
-  "category": "electronics|fashion|beauty|food|appliance|furniture|other",
-  "confidence": 0.0
-}
-Règles : keywords = 3 à 6 mots pour chercher ce produit ; inclure la couleur et le style pour les vêtements ; la marque si visible pour l'électronique.`,
-              },
-            ],
-          },
-        ],
-        temperature: 0.1,
-        max_tokens: 300,
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!response.ok) throw new Error("Erreur gateway IA");
-
-    const data = (await response.json()) as any;
-    const content: string = data?.choices?.[0]?.message?.content ?? "";
-    const cleaned = content.replace(/```json?\n?/g, "").replace(/```\n?/g, "").trim();
-    let parsed: any;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      // Le modèle peut renvoyer du texte autour du JSON → extraire le premier objet.
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("Réponse vision non parsable");
-      parsed = JSON.parse(match[0]);
-    }
-
-    return res.status(200).json({
-      success: true,
-      name: parsed.name ?? "",
-      description: parsed.description ?? "",
-      keywords: Array.isArray(parsed.keywords) ? parsed.keywords : [],
-      category: parsed.category ?? "other",
-      confidence: parsed.confidence ?? 0.5,
-    });
-  } catch (error) {
-    logger.error("[Copilote Analyze Image]", error);
-    const isAbort = error instanceof Error && error.name === "TimeoutError";
-    return res.status(isAbort ? 504 : 500).json({
-      success: false,
-      error: isAbort ? "Analyse d'image trop lente, réessayez" : "Analyse d'image échouée",
-    });
-  }
-});
+// ─── Route analyse image : SUPPRIMÉE (2026-07-03) ────────────────────────────
+// Remplacée par la vision native de POST /api/v2/copilot (req.body.image).
+// Vérifié : aucun consommateur (frontend web + mobile Capacitor construits depuis
+// le même repo vista-flows ; zéro référence à /analyze-image hors de cette route).
 
 // ─── Route transcription audio — OpenAI Whisper ───────────────────────────────
 

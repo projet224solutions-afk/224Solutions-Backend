@@ -1,6 +1,7 @@
 /**
  * 🤖 COPILOT 224 — assistant IA contextuel par service (PHASE 2).
- * POST /api/v2/copilot { service, message, history? } → { reply }.
+ * POST /api/v2/copilot { service, message, history?, image? } → { success, data: { reply, products, actions, … } }.
+ * image = dataURL JPEG/PNG/WebP compressée côté client (≤1024px) → vision native des 3 providers.
  * System prompt DÉDIÉ par métier (expert virtuel, ne remplace pas le diagnostic humain).
  * Utilise la passerelle IA (LOVABLE_API_KEY) ou OpenAI en repli. Clé serveur uniquement.
  */
@@ -10,6 +11,7 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
+import { ok, fail } from '../utils/apiResponse.js';
 import * as autoHealing from '../services/autoHealing.service.js';
 import { getSystemMap, getLiveObservation } from '../services/systemContext.service.js';
 
@@ -148,13 +150,41 @@ function fallbackReply(service: string, message: string): string {
   return FALLBACK_TIPS[service] || GENERIC_TIP;
 }
 
+// 📷 VISION — conversion multimodale par provider. Le DERNIER message user peut porter `__image`
+// (photo du tour courant, jamais l'historique) ; convertie ici au format de chaque API.
+// Les messages sans __image passent inchangés (zéro régression sur le chat texte).
+const toAnthropicMsg = (m: any) => {
+  if (m.__image) {
+    return {
+      role: m.role,
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: m.__image.mediaType, data: m.__image.base64 } },
+        { type: 'text', text: typeof m.content === 'string' ? m.content : '' },
+      ],
+    };
+  }
+  return { role: m.role, content: m.content };
+};
+const toOpenAIMsg = (m: any) => {
+  if (m.__image) {
+    return {
+      role: m.role,
+      content: [
+        { type: 'text', text: typeof m.content === 'string' ? m.content : '' },
+        { type: 'image_url', image_url: { url: m.__image.dataUrl } },
+      ],
+    };
+  }
+  return { role: m.role, content: m.content };
+};
+
 // Providers IA en REDONDANCE : chacun renvoie une réponse ou null (→ on passe au suivant).
 async function callAnthropic(key: string, sys: string, chat: any[]): Promise<string | null> {
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: chat }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: chat.map(toAnthropicMsg) }),
     });
     if (!r.ok) { logger.warn(`[copilot] anthropic ${r.status}`); return null; }
     const data: any = await r.json();
@@ -169,7 +199,7 @@ async function callOpenAILike(key: string, isLovable: boolean, sys: string, chat
     const r = await fetch(endpoint, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, temperature: 0.4, max_tokens: 600, messages: [{ role: 'system', content: sys }, ...chat] }),
+      body: JSON.stringify({ model, temperature: 0.4, max_tokens: 600, messages: [{ role: 'system', content: sys }, ...chat.map(toOpenAIMsg)] }),
     });
     if (!r.ok) { logger.warn(`[copilot] ${isLovable ? 'lovable' : 'openai'} ${r.status}`); return null; }
     const data: any = await r.json();
@@ -267,7 +297,7 @@ function buildProposedAction(name: string, input: any): any | null {
 // Boucle d'outils Anthropic (max 4 tours). Exécute search_products côté serveur, collecte les
 // propose_* comme cartes de confirmation. Renvoie texte + produits trouvés + actions proposées.
 async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools: any[]): Promise<{ text: string | null; products: any[]; actions: any[] }> {
-  const messages: any[] = chat.map((m) => ({ role: m.role, content: m.content }));
+  const messages: any[] = chat.map(toAnthropicMsg);
   const products: any[] = [];
   const actions: any[] = [];
   try {
@@ -360,8 +390,24 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     const message = String(req.body?.message ?? '').trim();
     const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
     const context = (req.body?.context && typeof req.body.context === 'object') ? req.body.context : null;
+    // 📷 VISION : photo compressée côté client (dataURL JPEG ≤1024px). Validée strictement,
+    // ignorée (avec log) si invalide — on répond alors en texte, on ne bloque jamais.
+    const rawImage = typeof req.body?.image === 'string' ? req.body.image : '';
+    const imageMatch = rawImage.match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+    const MAX_IMAGE_B64 = 2_800_000; // ~2 Mo décodés — large pour du 1024px JPEG q0.8
+    let imageBlock: { mediaType: string; base64: string; dataUrl: string } | null = null;
+    if (rawImage && imageMatch && imageMatch[2].length <= MAX_IMAGE_B64) {
+      imageBlock = {
+        mediaType: `image/${imageMatch[1] === 'jpg' ? 'jpeg' : imageMatch[1]}`,
+        base64: imageMatch[2],
+        dataUrl: rawImage,
+      };
+    } else if (rawImage) {
+      logger.warn(`[copilot] image rejetée (format ou taille) len=${rawImage.length}`);
+    }
+    const hasImage = !!imageBlock;
     const userId = req.user!.id;
-    if (!message) { res.status(400).json({ success: false, error: 'message requis' }); return; }
+    if (!message) { fail(res, 400, 'message requis'); return; }
 
     // Contexte utilisateur temps réel (Phase 1, optionnel) — injecté dans le system prompt.
     const ctxLine = context ? [
@@ -410,13 +456,18 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
       + (memLine ? `\n\n${memLine}` : '')
       + (guide ? `\n\n${guide}` : '')
       + (web ? `\n\nINFO TROUVÉE SUR INTERNET (à reformuler, cite que c'est une info web si pertinent) :\n${web}` : '')
-      + pdgContext;
+      + pdgContext
+      + (hasImage ? "\n\n📷 L'utilisateur a joint une PHOTO à ce message : tu la VOIS. Identifie le produit/objet (nom, caractéristiques visibles), puis propose des correspondances sur le marketplace (utilise l'outil de recherche produits si disponible). INTERDIT de dire que tu ne peux pas voir les images." : '');
 
     // Messages de conversation (sans le rôle system — géré séparément pour Anthropic).
+    // L'image ne concerne que le tour courant — jamais l'historique. Sans image, le dernier
+    // message reste une string (format inchangé) ; avec image, il porte __image (mappé par provider).
+    const lastUserMsg: any = { role: 'user', content: message.slice(0, 2000) };
+    if (hasImage) lastUserMsg.__image = imageBlock;
     const chat = [
       ...history.filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
         .map((m: any) => ({ role: m.role, content: String(m.content).slice(0, 2000) })),
-      { role: 'user', content: message.slice(0, 2000) },
+      lastUserMsg,
     ];
 
     // CHAÎNE RÉSILIENTE : Anthropic (avec OUTILS) → Lovable(Gemini) → OpenAI → repli (web/contextuel).
@@ -435,12 +486,19 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     if (!reply && openaiKey) { reply = await callOpenAILike(openaiKey, false, sys, chat); if (reply) provider = 'openai'; }
 
     const fallback = !reply;
-    const finalReply = reply || web || fallbackReply(service, message);
+    // Repli honnête : si une photo était jointe et qu'AUCUN provider n'a répondu, ne jamais
+    // laisser le repli générique (web/tips) répondre à côté de la photo.
+    const finalReply = reply
+      || (hasImage
+        ? "Je n'ai pas pu analyser la photo pour le moment. Décris-moi le produit en quelques mots (type, marque, couleur) et je le cherche tout de suite."
+        : (web || fallbackReply(service, message)));
+    // remember() ne reçoit QUE le texte du message — jamais le dataUrl (pas de base64 en DB).
     await remember(userId, service, message, finalReply);
-    res.json({ success: true, reply: finalReply, fallback, source: fallback ? (web ? 'web' : 'local') : provider, products, actions });
+    // Contrat API : enveloppe { success, data } (migration 2026-07-03, consommateurs frontend mis à jour ensemble).
+    ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, actions });
   } catch (e: any) {
     logger.error(`[copilot] ${e?.message}`);
-    res.status(500).json({ success: false, error: 'Erreur Copilot' });
+    fail(res, 500, 'Erreur Copilot');
   }
 });
 
@@ -449,10 +507,11 @@ router.post('/search', verifyJWT, async (req: AuthenticatedRequest, res: Respons
   try {
     const q = String(req.body?.q ?? '').trim();
     const products = await runProductSearch(q);
-    res.json({ success: true, products });
+    ok(res, { products });
   } catch (e: any) {
+    // Contrat API : un échec remonte (plus de liste vide en success:true).
     logger.warn(`[copilot/search] ${e?.message}`);
-    res.json({ success: true, products: [] });
+    fail(res, 500, 'Recherche produits indisponible');
   }
 });
 
@@ -470,10 +529,11 @@ router.get('/history', verifyJWT, async (req: AuthenticatedRequest, res: Respons
     if (service) q = q.eq('service', service);
     const { data } = await q;
     // …puis remis en ordre chronologique pour l'affichage.
-    res.json({ success: true, history: (data || []).reverse() });
+    ok(res, { history: (data || []).reverse() });
   } catch (e: any) {
+    // Contrat API : un échec remonte (plus d'historique vide en success:true).
     logger.warn(`[copilot/history] ${e?.message}`);
-    res.json({ success: true, history: [] });
+    fail(res, 500, 'Historique Copilot indisponible');
   }
 });
 

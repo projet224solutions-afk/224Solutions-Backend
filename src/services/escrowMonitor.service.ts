@@ -147,13 +147,32 @@ export async function syncDomainAlerts(
 
   for (const c of checks) {
     try {
-      const { data: existing } = await supabaseAdmin
+      // Ligne CANONIQUE du contrôle = la plus ancienne active (garde la date de 1re détection).
+      // ⚠️ Jamais maybeSingle() ici : dès qu'un doublon existe (course entre instances/cycles),
+      // il renvoie une erreur → data null → chaque cycle RÉINSÉRAIT un doublon de plus
+      // (emballement constaté : ~36 000 alertes actives dupliquées).
+      const { data: keptRows } = await supabaseAdmin
         .from('system_alerts')
         .select('id')
         .eq('module', module)
         .eq('status', 'active')
         .filter('metadata->>alert_key', 'eq', c.key)
-        .maybeSingle();
+        .order('created_at', { ascending: true })
+        .limit(1);
+      const kept = keptRows?.[0] || null;
+
+      // Purge des doublons actifs du même contrôle (artefacts du bug ci-dessus) : on ne garde
+      // que la canonique — l'historique (status='resolved') n'est jamais touché.
+      if (kept) {
+        const { count: dupes } = await supabaseAdmin
+          .from('system_alerts')
+          .delete({ count: 'exact' })
+          .eq('module', module)
+          .eq('status', 'active')
+          .filter('metadata->>alert_key', 'eq', c.key)
+          .neq('id', kept.id);
+        if (dupes) logger.warn(`[Monitor:${module}] ${dupes} doublon(s) d'alerte active purgé(s) (${c.key})`);
+      }
 
       if (c.count > 0) {
         const payload = {
@@ -165,12 +184,14 @@ export async function syncDomainAlerts(
           suggested_fix: SUGGESTED_FIX[c.key] || '',
           metadata: { alert_key: c.key, count: c.count, observed: c.observed, source: 'platform_monitor', last_seen: nowIso },
         };
-        if (existing) await supabaseAdmin.from('system_alerts').update(payload).eq('id', existing.id);
+        if (kept) await supabaseAdmin.from('system_alerts').update(payload).eq('id', kept.id);
         else await supabaseAdmin.from('system_alerts').insert(payload);
-      } else if (existing) {
+      } else if (kept) {
+        // Anomalie corrigée → l'alerte passe 'resolved' et RESTE en base : c'est l'historique
+        // consultable côté PDG (panneau Surveillance, section « Historique »).
         await supabaseAdmin.from('system_alerts')
           .update({ status: 'resolved', resolved_at: nowIso })
-          .eq('id', existing.id);
+          .eq('id', kept.id);
       }
     } catch (e: any) {
       logger.warn(`[Monitor:${module}] alert sync failed (${c.key}): ${e?.message || e}`);
@@ -246,14 +267,20 @@ export async function runPlatformMonitors(
   });
 
   const modules = MONITOR_DOMAINS.map((d) => d.module);
-  const { data: alerts } = await supabaseAdmin
-    .from('system_alerts')
-    .select('id, title, message, severity, status, module, suggested_fix, created_at, metadata')
-    .in('module', modules)
-    .order('created_at', { ascending: false })
-    .limit(60);
+  // Alertes COURANTES (active/acknowledged) et HISTORIQUE (resolved) en 2 requêtes séparées :
+  // une vague de résolutions ne peut pas évincer les alertes actives d'une limite partagée, et
+  // l'historique reste visible côté PDG même quand l'anomalie est corrigée (auto-résolution).
+  const ALERT_COLS = 'id, title, message, severity, status, module, suggested_fix, created_at, resolved_at, metadata';
+  const [{ data: currentAlerts }, { data: resolvedAlerts }] = await Promise.all([
+    supabaseAdmin.from('system_alerts').select(ALERT_COLS)
+      .in('module', modules).neq('status', 'resolved')
+      .order('created_at', { ascending: false }).limit(60),
+    supabaseAdmin.from('system_alerts').select(ALERT_COLS)
+      .in('module', modules).eq('status', 'resolved')
+      .order('resolved_at', { ascending: false }).limit(60),
+  ]);
 
-  const result: PlatformReport = { domains, alerts: alerts || [] };
+  const result: PlatformReport = { domains, alerts: [...(currentAlerts || []), ...(resolvedAlerts || [])] };
   _lastPlatform = { at: Date.now(), data: result }; // alimente le cache partagé (endpoint + cycle 24/7)
   return result;
 }

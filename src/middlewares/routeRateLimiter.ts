@@ -137,9 +137,12 @@ export const authRateLimit = routeRateLimit({
   maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true,
 });
 
-/** Create order: 5 req / min per user */
+/** Create order: 20 req / min per user (un checkout génère plusieurs POST légitimes :
+ *  paiement mobile money retenté, cross-currency re-soumis, double-clic). 5/min bloquait
+ *  des clients honnêtes. Combiné à idempotencyGuard AVANT ce middleware → seules les
+ *  créations réellement nouvelles comptent. */
 export const orderCreateRateLimit = routeRateLimit({
-  maxRequests: 5, windowSeconds: 60, keyPrefix: 'order:create', perUser: true, perIp: true,
+  maxRequests: 20, windowSeconds: 60, keyPrefix: 'order:create', perUser: true, perIp: true,
 });
 
 /** Manage existing orders: 10 req / min per user */

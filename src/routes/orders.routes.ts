@@ -465,7 +465,9 @@ async function syncOrderMarketingContacts(params: {
  *   - DB calls: 6+N → 2 (-80%)
  *   - Orders/sec: 10-25 → 40-80 per instance (+3x)
  */
-router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+// Ordre : idempotence AVANT rate-limit → un rejeu (même Idempotency-Key) renvoie la réponse
+// stockée sans consommer de quota ; seules les créations réellement nouvelles comptent.
+router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   const startTime = Date.now();
 
   try {
@@ -528,7 +530,11 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
       p_buyer_fee_amount: number;
       p_seller_commission_amount: number | null;
     } = {
-      p_buyer_user_id: null, p_wallet_debit_amount: 0, p_buyer_wallet_currency: null,
+      // 🔴 p_buyer_user_id = IDENTITÉ de l'acheteur (auth.uid()), PAS un paramètre wallet. Doit être
+      // renseigné pour TOUS les moyens de paiement, sinon escrow.payer_id/buyer_id restaient NULL
+      // (carte/mobile money/COD) → confirm-delivery « Non autorisé » + refund crédite un mauvais id
+      // → « Échec de la libération/du remboursement ». Les RLS escrow exigent payer_id = auth.uid().
+      p_buyer_user_id: userId, p_wallet_debit_amount: 0, p_buyer_wallet_currency: null,
       p_exchange_rate_used: null, p_buyer_fee_amount: 0, p_seller_commission_amount: null,
     };
     let buyerFeePercentForLog = 0;
@@ -834,7 +840,7 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
   }
 });
 
-router.post('/digital', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/digital', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const customerId = await getOrCreateCustomerId(userId);

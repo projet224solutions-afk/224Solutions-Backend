@@ -1208,7 +1208,9 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     const { amount, description, idempotency_key, pin } = req.body || {};
 
     if (!amount || typeof amount !== 'number' || amount <= 0) {
-      res.status(400).json({ success: false, error: 'Montant invalide' });
+      // error_code = démonstrateur i18n (docs/API_CONTRACT.md § Erreurs et i18n) :
+      // le frontend traduit t('errors.<code>') et garde `error` (FR) comme repli.
+      res.status(400).json({ success: false, error: 'Montant invalide', error_code: 'AMOUNT_INVALID' });
       return;
     }
 
@@ -1246,7 +1248,11 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         : result.error === 'Wallet bloqué' ? 403
           : result.error?.includes('activité suspecte') ? 403
             : 400;
-      res.status(statusCode).json({ success: false, error: result.error });
+      // error_code machine (i18n frontend) — additif, le message FR reste le repli.
+      const errorCode = result.error === 'Solde insuffisant' ? 'INSUFFICIENT_BALANCE'
+        : result.error === 'Wallet bloqué' ? 'WALLET_BLOCKED'
+          : undefined;
+      res.status(statusCode).json({ success: false, error: result.error, ...(errorCode ? { error_code: errorCode } : {}) });
       return;
     }
 

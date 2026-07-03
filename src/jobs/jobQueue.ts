@@ -349,6 +349,14 @@ registerHandler('affiliate.confirm-digital', async () => {
   }
 });
 
+// ☎️ Appels : filet « pas de réponse » — tout appel resté 'ringing' > 60 s passe en 'missed'
+// via la RPC expire_stale_ringing_calls (migration 20260703130000). Doublonne volontairement
+// le pg_cron éventuel : la RPC est idempotente, deux exécutions/minute sont sans effet de bord.
+registerHandler('calls.expire-ringing', async () => {
+  const { error } = await supabaseAdmin.rpc('expire_stale_ringing_calls' as any);
+  if (error) logger.warn(`[calls] expire-ringing: ${error.message}`);
+});
+
 // Restaurant : annule + rembourse (atomique) les commandes payées mais NON acceptées après 3 min.
 registerHandler('restaurant.auto-cancel', async () => {
   const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();
@@ -882,6 +890,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('restaurant.auto-cancel', {}).catch(() => {}), 60 * 1000));
       // Campagnes programmées : check toutes les 60s pour lancer celles arrivées à échéance
       recurringTimers.push(setInterval(() => this.enqueue('campaigns.dispatch-scheduled', {}).catch(() => {}), 60 * 1000));
+      // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
+      recurringTimers.push(setInterval(() => this.enqueue('calls.expire-ringing', {}).catch(() => {}), 60 * 1000));
 
       recurringTimers.push(setInterval(() => this.enqueue('escrow.auto-release', {}).catch(() => {}), every6Hours));
       recurringTimers.push(setInterval(() => this.enqueue('affiliate.confirm-digital', {}).catch(() => {}), every6Hours));
@@ -918,6 +928,8 @@ export const jobQueue = {
       await queue.add('restaurant.auto-cancel', {}, { repeat: { every: 60 * 1000 } });
       // Campagnes programmées : lancement automatique à l'échéance (check toutes les 60s)
       await queue.add('campaigns.dispatch-scheduled', {}, { repeat: { every: 60 * 1000 } });
+      // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
+      await queue.add('calls.expire-ringing', {}, { repeat: { every: 60 * 1000 } });
 
       // Every 6 hours: escrow + subscriptions + POS
       await queue.add('escrow.auto-release', {}, { repeat: { every: 6 * 3600000 } });

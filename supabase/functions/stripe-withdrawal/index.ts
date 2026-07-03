@@ -72,8 +72,11 @@ serve(async (req) => {
       throw new Error("IBAN/numéro de compte invalide (10 caractères minimum)");
     }
 
-    if (!amount || amount < 50000) {
-      throw new Error(`Montant minimum de retrait: 50 000 ${currency.toUpperCase()}`);
+    // Minimum par devise (50 000 GNF ≈ 6 USD : un seuil unique GNF n'a pas de sens en EUR/USD).
+    const MIN_WITHDRAWAL: Record<string, number> = { GNF: 50000, XOF: 5000, USD: 10, EUR: 10 };
+    const minAmount = MIN_WITHDRAWAL[currency.toUpperCase()] ?? 50000;
+    if (!amount || amount < minAmount) {
+      throw new Error(`Montant minimum de retrait: ${minAmount.toLocaleString('fr-FR')} ${currency.toUpperCase()}`);
     }
 
     logStep("Calling atomic RPC", { 

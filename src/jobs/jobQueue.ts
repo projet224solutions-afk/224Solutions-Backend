@@ -349,6 +349,50 @@ registerHandler('affiliate.confirm-digital', async () => {
   }
 });
 
+// 🧹 224Guard : auto-résolution des erreurs ÉTEINTES — une famille (même error_message)
+// sans AUCUNE réapparition depuis 7 jours = bug corrigé → 'resolved'. Sans ce job, les
+// compteurs du Command Center cumulaient l'historique (ex. « 50 critiques » dont 0 active)
+// et fabriquaient de fausses urgences à chaque rapport IA. Les familles actives sont intactes.
+registerHandler('errors.auto-resolve-stale', async () => {
+  const STALE_DAYS = 7;
+  const cutoff = new Date(Date.now() - STALE_DAYS * 86400000).toISOString();
+  const { data: detected } = await supabaseAdmin
+    .from('system_errors')
+    .select('id, error_message, created_at')
+    .eq('status', 'detected')
+    .order('created_at', { ascending: false })
+    .limit(1000);
+  if (!detected?.length) return;
+
+  // Famille = error_message ; éteinte si sa DERNIÈRE occurrence est plus vieille que le cutoff.
+  const families = new Map<string, { last: string; ids: string[] }>();
+  for (const e of detected as any[]) {
+    const k = e.error_message || '(vide)';
+    const f = families.get(k) || { last: e.created_at, ids: [] };
+    if (e.created_at > f.last) f.last = e.created_at;
+    f.ids.push(e.id);
+    families.set(k, f);
+  }
+
+  let resolved = 0;
+  for (const [, f] of families) {
+    if (f.last >= cutoff) continue; // famille encore active → on n'y touche pas
+    for (let i = 0; i < f.ids.length; i += 100) {
+      const { error } = await supabaseAdmin
+        .from('system_errors')
+        .update({
+          status: 'resolved',
+          fixed_at: new Date().toISOString(),
+          fix_description: `Auto-résolue : famille éteinte depuis > ${STALE_DAYS} j (aucune réapparition)`,
+        })
+        .in('id', f.ids.slice(i, i + 100));
+      if (error) { logger.warn(`[errors] auto-resolve-stale: ${error.message}`); return; }
+      resolved += Math.min(100, f.ids.length - i);
+    }
+  }
+  if (resolved > 0) logger.info(`[errors] auto-resolve-stale: ${resolved} erreur(s) éteinte(s) résolue(s)`);
+});
+
 // ☎️ Appels : filet « pas de réponse » — tout appel resté 'ringing' > 60 s passe en 'missed'
 // via la RPC expire_stale_ringing_calls (migration 20260703130000). Doublonne volontairement
 // le pg_cron éventuel : la RPC est idempotente, deux exécutions/minute sont sans effet de bord.
@@ -902,6 +946,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
+      // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
+      recurringTimers.push(setInterval(() => this.enqueue('errors.auto-resolve-stale', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
       recurringTimers.push(setInterval(() => this.enqueue('beauty.reminders', {}).catch(() => {}), 15 * 60 * 1000));
 
@@ -942,6 +988,8 @@ export const jobQueue = {
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
+      // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
+      await queue.add('errors.auto-resolve-stale', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');

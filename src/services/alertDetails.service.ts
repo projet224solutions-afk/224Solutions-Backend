@@ -81,7 +81,10 @@ const DETAILS: Record<string, DetailFetcher> = {
     return Promise.all((data || []).map(async (w: any) => ({ ...w, user: await enrichUser(w.user_id) })));
   },
 
-  // ESCROW — libéré sans trace d'historique (vendeur potentiellement non payé)
+  // ESCROW — libéré sans trace d'historique (vendeur potentiellement non payé).
+  // Même définition que la RPC escrow_monitor_report (migration 20260704120000) : une trace
+  // HÉRITÉE de l'ancienne Edge ('payment' + « Libération escrow… ») compte comme historique
+  // — le vendeur a été payé, le cas n'est PAS une anomalie.
   released_no_ledger: async () => {
     const since = new Date(Date.now() - 7 * 864e5).toISOString();
     const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
@@ -89,11 +92,19 @@ const DETAILS: Record<string, DetailFetcher> = {
       .eq('status', 'released').gt('released_at', since).order('released_at', { ascending: false }).limit(100);
     const out: any[] = [];
     for (const e of escrows || []) {
-      const { count } = await supabaseAdmin.from('wallet_transactions')
+      const { count: modern } = await supabaseAdmin.from('wallet_transactions')
         .select('id', { count: 'exact', head: true })
         .eq('transaction_type', 'escrow_release')
         .or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
-      if (!count) { out.push({ ...e, user: await enrichUser(e.seller_id) }); if (out.length >= 50) break; }
+      if (modern) continue;
+      const { count: legacy } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'payment')
+        .like('description', 'Libération escrow%')
+        .or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
+      if (legacy) continue;
+      out.push({ ...e, user: await enrichUser(e.seller_id) });
+      if (out.length >= 50) break;
     }
     return out;
   },

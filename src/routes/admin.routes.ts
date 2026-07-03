@@ -744,7 +744,7 @@ router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: 
     // spinner infini). Ses alertes restent visibles (relues depuis system_alerts, écrites par le cycle 24/7).
     // Rapport depuis le CACHE (recalcul uniquement s'il date de > 15s) → réponse rapide, plus de 500
     // par timeout serverless quand plusieurs onglets PDG rafraîchissent (refetch 20s + realtime).
-    const data = await getPlatformMonitorReport(15000);
+    const data = await getPlatformMonitorReport(45000); // > refetch front 20s → cache couvre les refetch
     // Auto-réparation : la ré-ingestion (~100 aller-retours séquentiels) est DÉJÀ faite par le cycle
     // 24/7 (60s) → fire-and-forget HORS chemin de réponse + on renvoie le résumé LÉGER (1 requête).
     void autoHealing.ingestAndSummarize().catch(() => { /* best-effort, hors chemin de réponse */ });

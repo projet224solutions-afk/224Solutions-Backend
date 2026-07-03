@@ -198,13 +198,23 @@ type PlatformReport = {
 let _lastPlatform: { at: number; data: PlatformReport } | null = null;
 
 /**
- * Renvoie le dernier rapport plateforme si < maxAgeMs, sinon le recalcule (et met le cache à jour).
- * L'endpoint HTTP l'utilise pour répondre en quelques ms tant qu'un calcul récent existe (produit
- * soit par une requête précédente, soit par le cycle 24/7), au lieu de recalculer systématiquement.
+ * Renvoie le dernier rapport plateforme si < maxAgeMs, sinon le recalcule.
+ * ⚠️ maxAge DOIT être > l'intervalle de refetch du front (20s) sinon CHAQUE refetch rate le cache
+ * et recalcule les 10 RPC → lenteur/échec en boucle. 45s : le cache couvre les refetch 20s ET les
+ * invalidations realtime, tout en restant frais (le cycle 24/7 le rafraîchit aussi toutes les 60s).
+ * STALE-WHILE-REVALIDATE : si le recalcul échoue (RPC lente, réseau), on SERT le dernier rapport connu
+ * plutôt que de faire échouer le panneau PDG (fini « Dernière actualisation échouée »). On ne lève
+ * QUE s'il n'existe AUCUN cache (tout premier appel qui échoue).
  */
-export async function getPlatformMonitorReport(maxAgeMs = 15000): Promise<PlatformReport> {
+export async function getPlatformMonitorReport(maxAgeMs = 45000): Promise<PlatformReport> {
   if (_lastPlatform && (Date.now() - _lastPlatform.at) < maxAgeMs) return _lastPlatform.data;
-  return runPlatformMonitors({ skipFnDomains: true });
+  try {
+    return await runPlatformMonitors({ skipFnDomains: true });
+  } catch (e: any) {
+    logger.warn(`[Monitor] recalcul échoué → service du dernier cache (stale): ${e?.message || e}`);
+    if (_lastPlatform) return _lastPlatform.data;
+    throw e;
+  }
 }
 
 export async function runPlatformMonitors(

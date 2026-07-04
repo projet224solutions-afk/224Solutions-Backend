@@ -232,6 +232,11 @@ router.post('/', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: 
 
     if (assignErr) {
       logger.error('shareholders.create - assignment error:', assignErr.message);
+      // Le trigger BEFORE (check_shareholder_percent_sum) refuse si la somme des parts > 100 %.
+      if (/> 100 %|check_violation/i.test(assignErr.message) || (assignErr as any).code === '23514') {
+        res.status(400).json({ success: false, error: 'La somme des parts actionnaires dépasserait 100 % pour cette catégorie/portée.', error_code: 'SHAREHOLDER_PERCENT_OVERFLOW' });
+        return;
+      }
       res.status(500).json({ success: false, error: assignErr.message });
       return;
     }

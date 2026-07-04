@@ -18,6 +18,7 @@ import { Router, Response } from 'express';
 import { verifyJWT, requireRole } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { ok, fail } from '../utils/apiResponse.js';
 import { createNotification, createNotifications } from '../services/notification.service.js';
 import { logger } from '../config/logger.js';
 import { getPlatformMonitorReport } from '../services/escrowMonitor.service.js';
@@ -754,6 +755,26 @@ router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: 
   } catch (error: any) {
     logger.error(`[admin/platform-monitor] ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la surveillance plateforme' });
+  }
+});
+
+/**
+ * GET /api/admin/pdg/revenue?granularity=&from=&to=
+ * Reporting du coffre PDG : total, ventilation par source, série temporelle, solde, redistribué.
+ */
+router.get('/pdg/revenue', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const granularity = String(req.query.granularity || 'day');
+    const from = req.query.from ? new Date(String(req.query.from)).toISOString() : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)).toISOString() : undefined;
+    const { data, error } = await supabaseAdmin.rpc('get_pdg_revenue_report', {
+      p_granularity: granularity, ...(from ? { p_from: from } : {}), ...(to ? { p_to: to } : {}),
+    });
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[admin/pdg/revenue] ${e?.message}`);
+    return fail(res, 500, 'Erreur lors du reporting revenus');
   }
 });
 

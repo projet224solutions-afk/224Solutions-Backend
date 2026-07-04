@@ -85,34 +85,11 @@ async function findPaymentLinkByPublicId(publicId: string) {
   return { data: null, error: byToken.error || byPaymentId.error };
 }
 
-async function getConfiguredStripeSecretKey(): Promise<string | null> {
-  const envKey = process.env.STRIPE_SECRET_KEY?.trim();
-  if (envKey) {
-    return envKey;
-  }
-
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('stripe_config')
-      .select('stripe_secret_key')
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      logger.warn(`[PaymentLinks] stripe_config inaccessible: ${error.message}`);
-      return null;
-    }
-
-    const dbKey = data?.stripe_secret_key?.trim();
-    if (dbKey) {
-      logger.warn('[PaymentLinks] STRIPE_SECRET_KEY absent du runtime, fallback stripe_config activé');
-      return dbKey;
-    }
-  } catch (error: any) {
-    logger.warn(`[PaymentLinks] Fallback stripe_config échoué: ${error?.message || 'unknown'}`);
-  }
-
-  return null;
+// 🔒 Le secret Stripe vit UNIQUEMENT en process.env — jamais en base (voir CLAUDE.md).
+// Le fallback DB (stripe_config.stripe_secret_key) a été RETIRÉ : un secret ne doit
+// jamais résider en table. Si la clé env est absente, échec explicite en amont.
+function getConfiguredStripeSecretKey(): string | null {
+  return process.env.STRIPE_SECRET_KEY?.trim() || null;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -422,9 +399,9 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
 
     // ──────── CARD PAYMENT (Stripe) ────────
     if (paymentMethod === 'card') {
-      const stripeKey = await getConfiguredStripeSecretKey();
+      const stripeKey = getConfiguredStripeSecretKey();
       if (!stripeKey) {
-        res.status(500).json({ success: false, error: 'Paiement par carte non disponible (Stripe non configuré)' });
+        res.status(503).json({ success: false, error: 'Paiement par carte non disponible (Stripe non configuré)', error_code: 'STRIPE_NOT_CONFIGURED' });
         return;
       }
 

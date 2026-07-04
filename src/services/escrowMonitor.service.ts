@@ -48,6 +48,7 @@ export const MONITOR_DOMAINS: DomainDef[] = [
   { key: 'pos', module: 'pos', label: 'POS (caisse vendeur)', rpc: 'pos_monitor_report' },
   { key: 'aml', module: 'aml', label: 'Provenance & plafonds wallet', rpc: 'wallet_provenance_report' },
   { key: 'money_integrity', module: 'money_integrity', label: 'Intégrité Argent (drift fonctions)', rpc: 'money_integrity_report' },
+  { key: 'pdg_treasury', module: 'pdg_treasury', label: 'Coffre PDG (trésorerie)', rpc: 'pdg_treasury_monitor_report' },
   { key: 'frontend_security', module: 'frontend_security', label: 'Sécurité Frontend', fn: scanFrontendSecurity },
 ];
 
@@ -102,6 +103,15 @@ const SUGGESTED_FIX: Record<string, string> = {
   pos_stock_pending: 'Vente POS enregistrée sans décrément de stock (file pos_stock_reconciliation). Relancer le job de réconciliation ; risque de sur-vente.',
   pos_negative_stock: 'GRAVE : produit au stock négatif. Décrément concurrent incohérent. Vérifier le verrou FOR UPDATE / GREATEST(0,...) dans create_pos_sale_complete et le trigger commande.',
   pos_sale_incoherent: 'Vente POS dont total ≠ sous-total + taxe − remise. Vérifier le calcul server-side (create_pos_sale_complete) — un total client a pu être stocké à la place.',
+  pos_items_without_stock_movement: 'Ventes POS créées par l\'ancien fallback direct (retiré) : order_items SANS décrément de stock → inventaire faux. Corriger le stock des produits concernés à la main (le drill-down liste les commandes). Ne pas régulariser automatiquement.',
+  // 🏦 Coffre PDG
+  revenue_not_credited: 'Revenus journalisés (revenus_pdg) non crédités au coffre depuis > 5 min : le trigger a échoué ou aucun PDG/wallet GNF actif au moment du revenu. Vérifier pdg_management + le wallet GNF PDG, puis réconcilier (backfill idempotent).',
+  treasury_balance_vs_ledger: 'INVARIANT ROMPU : solde du coffre ≠ crédits − débits tracés. Un mouvement a contourné les RPC/trigger (UPDATE direct, manipulation). observed = l\'écart. Auditer les wallet_transactions du coffre + platform_revenue.',
+  payout_without_treasury_debit: 'Versement actionnaire sent_to_wallet SANS débit du coffre (shareholder_payout:<id>) = argent créé ex nihilo. Historique (avant ce chantier) = à lister pour décision PDG ; toute NOUVELLE occurrence = régression à corriger.',
+  commission_without_treasury_debit: 'Commission agent versée SANS trace de débit coffre (platform_revenue agent_commission_payout) = mint pré-ledger. Historique connu ; toute nouvelle occurrence = bug de credit_agent_commission.',
+  shareholder_percent_overflow: 'Somme des parts actionnaires actives > 100 % pour une (catégorie, portée, pays) : sur-distribution. Le trigger BEFORE le bloque en base ; s\'il apparaît, le trigger a été contourné/désactivé — le rétablir.',
+  treasury_low_balance: 'Solde du coffre sous le seuil (pdg_wallet_low_threshold) : risque de blocage des commissions/versements. Approvisionner le coffre.',
+  subscription_revenue_missing: 'Abonnements payés (> 10 min) SANS ligne revenus_pdg : un flux d\'abonnement n\'appelle pas record_pdg_revenue. Brancher le revenu AVANT la commission au site concerné.',
   pos_credit_overdue: 'Ventes à crédit échues impayées. Relancer le recouvrement vendeur (vendor_credit_sales).',
   pos_rapid_sales: 'Rafale de ventes POS en 5 min. Vérifier un bot / abus de synchronisation (posSyncRateLimit).',
   // aml (provenance & plafonds wallet)

@@ -21,7 +21,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
-import { loadServiceAccount, getPrivateBucketName, generateSignedUrl } from '../services/gcs.service.js';
+import { loadServiceAccount, getPrivateBucketName, getBucketName, generateSignedUrl } from '../services/gcs.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
 import { autoReconcileMonitorCases } from '../services/escrowMonitor.service.js';
 
@@ -243,6 +243,43 @@ registerHandler('delivery-proof.cleanup', async () => {
     purged++;
   }
   logger.info(`Delivery proof cleanup: ${purged}/${orders.length} purgées`);
+});
+
+// 🎥 Live shopping : purge des replays expirés (> 30 j). purge_expired_replays() renvoie
+// les (id, replay_url) échus → suppression de l'objet GCS (bucket public 224solutions) puis
+// replay_url = null. Canonique côté VPS (le job réel). L'app ne planifie pas de Supabase
+// scheduled functions ; ce handler EST le planificateur de purge.
+registerHandler('live-replays.purge', async () => {
+  const { data: expired, error } = await supabaseAdmin.rpc('purge_expired_replays');
+  if (error) { logger.error(`[live-replays.purge] ${error.message}`); return; }
+  const rows = (expired || []) as Array<{ id: string; replay_url: string | null }>;
+  if (!rows.length) { logger.info('Live replays purge: rien à purger'); return; }
+
+  const sa = loadServiceAccount();
+  let purged = 0;
+  for (const r of rows) {
+    let delOk = true;
+    if (r.replay_url && sa) {
+      // Extraire l'objectPath après le nom de bucket dans l'URL publique GCS.
+      const marker = `/${getBucketName()}/`;
+      const idx = r.replay_url.indexOf(marker);
+      const objectPath = idx >= 0 ? r.replay_url.slice(idx + marker.length).split('?')[0] : null;
+      if (objectPath) {
+        try {
+          const url = generateSignedUrl(sa, getBucketName(), decodeURIComponent(objectPath), { method: 'DELETE', expiresInSeconds: 120 });
+          const resp = await fetch(url, { method: 'DELETE' });
+          if (!(resp.ok || resp.status === 404)) { logger.error(`[live-replays.purge] GCS ${r.id}: HTTP ${resp.status}`); delOk = false; }
+        } catch (e: any) { logger.error(`[live-replays.purge] GCS ${r.id}: ${e?.message}`); delOk = false; }
+      }
+    } else if (r.replay_url && !sa) {
+      logger.error(`[live-replays.purge] GCS non configuré, purge ${r.id} différée`); delOk = false;
+    }
+    if (!delOk) continue; // réessai au prochain run
+    const { error: updErr } = await supabaseAdmin.from('live_streams').update({ replay_url: null }).eq('id', r.id);
+    if (updErr) { logger.error(`[live-replays.purge] db ${r.id}: ${updErr.message}`); continue; }
+    purged++;
+  }
+  logger.info(`Live replays purge: ${purged}/${rows.length} purgés`);
 });
 
 registerHandler('escrow.auto-release', async () => {
@@ -983,6 +1020,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
+      // Live shopping : purge quotidienne des replays expirés (> 30 j) — objet GCS + replay_url=null
+      recurringTimers.push(setInterval(() => this.enqueue('live-replays.purge', {}).catch(() => {}), every24Hours));
       // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
       recurringTimers.push(setInterval(() => this.enqueue('errors.auto-resolve-stale', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
@@ -1027,6 +1066,8 @@ export const jobQueue = {
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
+      // Live shopping : purge quotidienne des replays expirés (> 30 j)
+      await queue.add('live-replays.purge', {}, { repeat: { every: 24 * 3600000 } });
       // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
       await queue.add('errors.auto-resolve-stale', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });

@@ -69,6 +69,10 @@ export const env = {
   TWILIO_PHONE_NUMBER: optionalEnv('TWILIO_PHONE_NUMBER', ''),
   TWILIO_MESSAGING_SERVICE_SID: optionalEnv('TWILIO_MESSAGING_SERVICE_SID', ''),
 
+  // Live shopping : fournisseur du transport vidéo (agora en Vague 1, livekit en Vague 2).
+  // Doit rester aligné avec VITE_LIVE_PROVIDER côté frontend.
+  LIVE_PROVIDER: optionalEnv('LIVE_PROVIDER', 'agora'),
+
   // OAuth (Google)
   OAUTH_CLIENT_ID: optionalEnv('OAUTH_CLIENT_ID', ''),
   OAUTH_CLIENT_SECRET: optionalEnv('OAUTH_CLIENT_SECRET', ''),

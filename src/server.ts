@@ -47,6 +47,8 @@ import notificationDispatchRoutes from './routes/notificationDispatch.routes.js'
 import countryPricingRoutes from './routes/countryPricing.routes.js';
 import authFailoverRoutes from './routes/auth.failover.routes.js';
 import realtimeRoutes from './routes/realtime.routes.js';
+import liveRoutes from './routes/live.routes.js';
+import turnRoutes from './routes/turn.routes.js';
 import shareholderRoutes from './routes/shareholders.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import identityRoutes from './routes/identity.routes.js';
@@ -272,6 +274,8 @@ app.use('/api/v2/notifications', notificationDispatchRoutes);
 app.use('/api/v2/country-pricing', countryPricingRoutes);
 app.use('/api/auth/failover', authFailoverRoutes);
 app.use('/api/v2/realtime', realtimeRoutes);
+app.use('/api/v2/live', liveRoutes);
+app.use('/api/v2', turnRoutes);
 app.use('/api/shareholders', shareholderRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/identity', identityRoutes);

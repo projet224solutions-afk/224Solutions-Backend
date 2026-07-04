@@ -22,7 +22,9 @@ export interface MonitorCheck {
 export interface MonitorReport {
   generated_at: string;
   checks: MonitorCheck[];
-  overall: 'ok' | 'warning' | 'critical';
+  // 'unavailable' = la RPC du domaine a échoué ou dépassé le timeout : les compteurs sont
+  // INCONNUS (pas « zéro anomalie ») — le panneau PDG doit l'afficher distinctement du vert.
+  overall: 'ok' | 'warning' | 'critical' | 'unavailable';
 }
 
 interface DomainDef {
@@ -78,6 +80,7 @@ const SUGGESTED_FIX: Record<string, string> = {
   transfer_rapid: 'Volume anormal de transferts en 5 min. Vérifier une attaque / un blanchiment.',
   // commissions
   commission_revenue_gap: 'Commission acheteur prélevée mais absente de revenus_pdg. Vérifier le log backend record_pdg_revenue.',
+  order_missing_buyer_fee: 'Commande wallet payée SANS frais acheteur : la commission plateforme n\'a jamais été facturée (revenu perdu). Vérifier buildOrderFinancialSummary / create_order_core (p_buyer_fee_amount) — ou acquitter si le vendeur a légitimement un taux 0.',
   agent_bad_rate: 'Taux de commission agent hors [0,100]. Corriger la configuration de l\'agent.',
   revenue_nonpositive: 'Revenu PDG ≤ 0 enregistré. Vérifier la source du revenu.',
   agent_commission_leak: 'GRAVE : commission agent > base (frais). Vérifier le plafond dans credit_agent_commission et max_total_agent_commission_percentage.',
@@ -263,7 +266,9 @@ export async function runPlatformMonitors(
   const domains = settled.map((s, i) => {
     if (s.status === 'fulfilled') return s.value;
     logger.warn(`[Monitor] domaine ${targets[i].key} échoué: ${s.reason?.message || s.reason}`);
-    return { key: targets[i].key, label: targets[i].label, report: { generated_at: new Date().toISOString(), checks: [], overall: 'ok' as const } };
+    // ⚠️ JAMAIS 'ok' ici : une RPC en panne affichée verte = angle mort (le PDG croirait
+    // « zéro anomalie » alors que le gardien est mort). 'unavailable' = compteurs inconnus.
+    return { key: targets[i].key, label: targets[i].label, report: { generated_at: new Date().toISOString(), checks: [], overall: 'unavailable' as const } };
   });
 
   const modules = MONITOR_DOMAINS.map((d) => d.module);

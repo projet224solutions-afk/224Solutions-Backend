@@ -73,6 +73,33 @@ const DETAILS: Record<string, DetailFetcher> = {
     return Promise.all((data || []).map(async (w: any) => ({ ...w, user: await enrichUser(w.user_id) })));
   },
 
+  // COMMISSION — commande wallet payée SANS frais acheteur facturés (revenu plateforme perdu).
+  // Même définition que la RPC commission_monitor_report (migration 20260704150000).
+  order_missing_buyer_fee: async () => {
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const { data: orders } = await supabaseAdmin.from('orders')
+      .select('id, order_number, status, payment_method, total_amount, subtotal, currency, customer_id, vendor_id, created_at')
+      .gt('created_at', since).neq('status', 'cancelled').gt('total_amount', 0)
+      .order('created_at', { ascending: false }).limit(200);
+    const out: any[] = [];
+    for (const o of orders || []) {
+      const { count: hasEscrow } = await supabaseAdmin.from('escrow_transactions')
+        .select('id', { count: 'exact', head: true }).eq('order_id', o.id);
+      if (!hasEscrow) continue;
+      const { count: fee } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'commission')
+        .filter('metadata->>source', 'eq', 'buyer_commission')
+        .filter('metadata->>order_id', 'eq', o.id);
+      if (fee) continue;
+      const { data: vendor } = await supabaseAdmin.from('vendors')
+        .select('user_id').eq('id', (o as any).vendor_id).maybeSingle();
+      out.push({ ...o, vendor_user: await enrichUser(vendor?.user_id) });
+      if (out.length >= 50) break;
+    }
+    return out;
+  },
+
   // WALLET — solde négatif (sur-débit)
   wallet_negative_balance: async () => {
     const { data } = await supabaseAdmin.from('wallets')

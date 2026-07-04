@@ -1364,6 +1364,50 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
 });
 
 /**
+ * POST /api/orders/:orderId/delivery-proof-upload-url — URL d'upload SIGNÉE vers le bucket
+ * PRIVÉ Supabase `delivery-proofs`. Réservé au VENDEUR de la commande.
+ * Remplace la voie GCS (Edge gcs-signed-url) qui échoue en 503 tant qu'aucun service
+ * account Google n'est configuré : la chaîne Supabase est complète sans AUCUN secret
+ * supplémentaire (upload signé → POST des chemins → lecture via URL signée 1 h).
+ */
+router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof-upload-url', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { file_name } = req.body || {};
+    if (!file_name || typeof file_name !== 'string') {
+      res.status(400).json({ success: false, error: 'file_name requis' }); return;
+    }
+    const ext = String(file_name).split('.').pop()?.toLowerCase() || '';
+    const ALLOWED = ['jpg', 'jpeg', 'png', 'webp', 'heic', 'mp4', 'webm', 'mov'];
+    if (!ALLOWED.includes(ext)) {
+      res.status(400).json({ success: false, error: `Extension non autorisée (${ALLOWED.join(', ')})` }); return;
+    }
+
+    const { data: order } = await supabaseAdmin
+      .from('orders').select('id, vendor_id').eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+    const { data: vendor } = await supabaseAdmin
+      .from('vendors').select('id').eq('id', (order as any).vendor_id).eq('user_id', userId).maybeSingle();
+    if (!vendor) { res.status(403).json({ success: false, error: 'Action réservée au vendeur' }); return; }
+
+    // Chemin scopé à la commande (même règle anti-IDOR que le POST delivery-proof).
+    const objectPath = `${orderId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { data: signed, error: signErr } = await supabaseAdmin.storage
+      .from('delivery-proofs')
+      .createSignedUploadUrl(objectPath);
+    if (signErr || !signed?.token) {
+      logger.error(`[delivery-proof upload-url] ${signErr?.message}`);
+      res.status(500).json({ success: false, error: "Impossible de préparer l'upload" }); return;
+    }
+    res.json({ success: true, data: { path: objectPath, token: signed.token } });
+  } catch (e: any) {
+    logger.error(`[delivery-proof upload-url] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+/**
  * POST /api/orders/:orderId/delivery-proof — le vendeur enregistre les chemins
  * (fichiers déjà uploadés dans le bucket privé delivery-proofs). Réservé au vendeur.
  */

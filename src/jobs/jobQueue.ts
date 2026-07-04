@@ -271,11 +271,24 @@ registerHandler('escrow.auto-release', async () => {
         order?.payment_method === 'cash' &&
         (orderMetadata.is_cod === true || shippingAddress.is_cod === true || orderMetadata.payment_type === 'cash_on_delivery');
 
+      // 🛑 Commande ANNULÉE avec escrow encore 'held' = argent acheteur coincé (constaté :
+      // ORD-MR2KTMCB-WXNQ). On REMBOURSE atomiquement au lieu d'ignorer en silence —
+      // sinon l'escrow reste bloqué à vie (et l'ancien code prod le libérait au vendeur).
+      if (order?.status === 'cancelled') {
+        const { data: refRes, error: refErr } = await supabaseAdmin.rpc('refund_order_escrow', { p_order_id: escrow.order_id });
+        if (refErr || (refRes && (refRes as any).success === false)) {
+          logger.warn(`[escrow] auto-refund commande annulée ${order?.order_number || escrow.order_id}: ${refErr?.message || (refRes as any)?.error}`);
+        } else {
+          logger.info(`[escrow] escrow ${escrow.id} REMBOURSÉ (commande annulée ${order?.order_number || escrow.order_id})`);
+        }
+        continue;
+      }
+
       if (
         !order ||
         !escrow.seller_confirmed_at ||
         isCashOnDelivery ||
-        ['pending', 'cancelled', 'completed'].includes(order.status) ||
+        ['pending', 'completed'].includes(order.status) ||
         orderMetadata.buyer_confirmed_delivery === true
       ) {
         continue;

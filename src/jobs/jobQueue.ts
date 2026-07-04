@@ -23,6 +23,7 @@ import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../s
 import { createNotification } from '../services/notification.service.js';
 import { loadServiceAccount, getPrivateBucketName, generateSignedUrl } from '../services/gcs.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
+import { autoReconcileMonitorCases } from '../services/escrowMonitor.service.js';
 
 const REDIS_JOBS_ENABLED = (process.env.REDIS_ENABLED ?? (env.isProduction ? 'true' : 'false')) === 'true';
 
@@ -412,6 +413,14 @@ registerHandler('errors.auto-resolve-stale', async () => {
 registerHandler('calls.expire-ringing', async () => {
   const { error } = await supabaseAdmin.rpc('expire_stale_ringing_calls' as any);
   if (error) logger.warn(`[calls] expire-ringing: ${error.message}`);
+});
+
+// 🤖 Surveillance : réconciliation automatique — un cas signalé dont la CORRECTION est
+// PROUVÉE en base (trace de frais apparue, régularisation liée, mouvement documenté) est
+// acquitté AUTOMATIQUEMENT → compteur retombe → pastille verte + alerte en Historique,
+// sans aucun clic PDG. Idempotent (upsert par clé) ; ce qui n'est pas prouvable reste signalé.
+registerHandler('monitor.auto-reconcile', async () => {
+  await autoReconcileMonitorCases();
 });
 
 // Restaurant : annule + rembourse (atomique) les commandes payées mais NON acceptées après 3 min.
@@ -949,6 +958,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('campaigns.dispatch-scheduled', {}).catch(() => {}), 60 * 1000));
       // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
       recurringTimers.push(setInterval(() => this.enqueue('calls.expire-ringing', {}).catch(() => {}), 60 * 1000));
+      // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
+      recurringTimers.push(setInterval(() => this.enqueue('monitor.auto-reconcile', {}).catch(() => {}), 5 * 60 * 1000));
 
       recurringTimers.push(setInterval(() => this.enqueue('escrow.auto-release', {}).catch(() => {}), every6Hours));
       recurringTimers.push(setInterval(() => this.enqueue('affiliate.confirm-digital', {}).catch(() => {}), every6Hours));
@@ -989,6 +1000,8 @@ export const jobQueue = {
       await queue.add('campaigns.dispatch-scheduled', {}, { repeat: { every: 60 * 1000 } });
       // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
       await queue.add('calls.expire-ringing', {}, { repeat: { every: 60 * 1000 } });
+      // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
+      await queue.add('monitor.auto-reconcile', {}, { repeat: { every: 5 * 60 * 1000 } });
 
       // Every 6 hours: escrow + subscriptions + POS
       await queue.add('escrow.auto-release', {}, { repeat: { every: 6 * 3600000 } });

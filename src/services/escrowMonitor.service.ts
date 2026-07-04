@@ -294,3 +294,97 @@ export async function runPlatformMonitors(
 export async function runEscrowMonitor(): Promise<MonitorReport> {
   return runDomainMonitor('escrow_monitor_report', 'escrow');
 }
+
+/**
+ * 🤖 RÉCONCILIATION AUTOMATIQUE — le système s'auto-acquitte quand il PROUVE la correction.
+ * Pour chaque cas signalé par un contrôle « fait historique », on cherche une PREUVE en base
+ * que l'argent a été réglé (trace de frais apparue, trace de régularisation liée à la
+ * commande/l'escrow, mouvement documenté après coup). Preuve trouvée → acquittement AUTO
+ * (money_integrity_acknowledged, reason 'AUTO: …') → le compteur retombe au cycle suivant →
+ * pastille VERTE + alerte basculée en Historique. AUCUN clic PDG.
+ * Ce que le système ne peut PAS prouver corrigé RESTE signalé : c'est un vrai problème.
+ * (Le bouton « Marquer comme traité » ne sert plus que de secours pour les cas non prouvables.)
+ */
+export async function autoReconcileMonitorCases(): Promise<{ acked: number }> {
+  let acked = 0;
+  const since = new Date(Date.now() - 7 * 864e5).toISOString();
+
+  // ── 1) order_missing_buyer_fee : preuve = trace buyer_commission apparue OU trace de
+  //       régularisation (metadata.regularization) référençant la commande / son escrow ──
+  try {
+    const { data: orders } = await supabaseAdmin.from('orders')
+      .select('id, order_number, total_amount, status')
+      .gt('created_at', since).neq('status', 'cancelled').gt('total_amount', 0).limit(300);
+    for (const o of (orders || []) as any[]) {
+      const { count: isAcked } = await supabaseAdmin.from('money_integrity_acknowledged')
+        .select('ref_id', { count: 'exact', head: true })
+        .eq('check_key', 'order_missing_buyer_fee').eq('ref_id', o.id);
+      if (isAcked) continue;
+      const { data: escrow } = await supabaseAdmin.from('escrow_transactions')
+        .select('id').eq('order_id', o.id).maybeSingle();
+      if (!escrow) continue;
+      const { count: fee } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'commission')
+        .filter('metadata->>source', 'eq', 'buyer_commission')
+        .filter('metadata->>order_id', 'eq', o.id);
+      if (fee) continue; // non signalé par le contrôle → rien à réconcilier
+      const { data: proof } = await supabaseAdmin.from('wallet_transactions')
+        .select('transaction_id')
+        .filter('metadata->>regularization', 'eq', 'true')
+        .or(`metadata->>order_id.eq.${o.id},metadata->>escrow_id.eq.${(escrow as any).id},metadata->>order_number.eq.${o.order_number}`)
+        .limit(1);
+      if (proof?.length) {
+        await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+          check_key: 'order_missing_buyer_fee', ref_id: String(o.id),
+          reason: `AUTO: régularisation vérifiée (${(proof[0] as any).transaction_id})`,
+        }, { onConflict: 'check_key,ref_id' });
+        acked++;
+      }
+    }
+  } catch (e: any) {
+    logger.warn(`[Monitor] auto-réconciliation order_missing_buyer_fee: ${e?.message || e}`);
+  }
+
+  // ── 2) untraced_increase : preuve = mouvement documenté APRÈS COUP — une trace du même
+  //       montant (±0,01) pour le même utilisateur dans une fenêtre élargie (±48 h) ──────
+  try {
+    const { data: audits } = await supabaseAdmin.from('wallet_balance_audit')
+      .select('id, user_id, delta, changed_at')
+      .gt('delta', 0).gt('changed_at', since).limit(500);
+    for (const a of (audits || []) as any[]) {
+      const { count: isAcked } = await supabaseAdmin.from('money_integrity_acknowledged')
+        .select('ref_id', { count: 'exact', head: true })
+        .eq('check_key', 'untraced_increase').eq('ref_id', String(a.id));
+      if (isAcked) continue;
+      const t = new Date(a.changed_at).getTime();
+      // Déjà couvert par le matching de base (±10 min) ? Rien à faire.
+      const { count: near } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('receiver_user_id', a.user_id)
+        .gte('created_at', new Date(t - 10 * 60000).toISOString())
+        .lte('created_at', new Date(t + 10 * 60000).toISOString());
+      if (near) continue;
+      const { data: proof } = await supabaseAdmin.from('wallet_transactions')
+        .select('transaction_id, amount')
+        .eq('receiver_user_id', a.user_id)
+        .gte('created_at', new Date(t - 48 * 3600000).toISOString())
+        .lte('created_at', new Date(t + 48 * 3600000).toISOString())
+        .gte('amount', Number(a.delta) - 0.01)
+        .lte('amount', Number(a.delta) + 0.01)
+        .limit(1);
+      if (proof?.length) {
+        await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+          check_key: 'untraced_increase', ref_id: String(a.id),
+          reason: `AUTO: mouvement documenté (${(proof[0] as any).transaction_id}, ${(proof[0] as any).amount})`,
+        }, { onConflict: 'check_key,ref_id' });
+        acked++;
+      }
+    }
+  } catch (e: any) {
+    logger.warn(`[Monitor] auto-réconciliation untraced_increase: ${e?.message || e}`);
+  }
+
+  if (acked) logger.info(`[Monitor] auto-réconciliation : ${acked} cas prouvés corrigés → acquittés automatiquement`);
+  return { acked };
+}

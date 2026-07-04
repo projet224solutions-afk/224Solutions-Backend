@@ -793,6 +793,21 @@ router.post('/platform-monitor/acknowledge', verifyJWT, requireRole(PDG_ROLES), 
     if (!ACKABLE.has(check_key)) {
       res.status(400).json({ success: false, error: 'Ce contrôle ne s\'acquitte pas par un clic — traitez la cause réelle.' }); return;
     }
+    // 🛡️ Blindage : la référence doit EXISTER réellement pour le contrôle visé —
+    // interdit d'acquitter préventivement un id arbitraire (angle mort volontaire).
+    const REF_TABLE: Record<string, { table: string; col: string }> = {
+      order_missing_buyer_fee: { table: 'orders', col: 'id' },
+      untraced_increase: { table: 'wallet_balance_audit', col: 'id' },
+      escrow_released_zero_credit: { table: 'wallet_transactions', col: 'id' },
+    };
+    const refCfg = REF_TABLE[check_key];
+    const { count: refExists } = await supabaseAdmin
+      .from(refCfg.table)
+      .select(refCfg.col, { count: 'exact', head: true })
+      .eq(refCfg.col, ref_id);
+    if (!refExists) {
+      res.status(404).json({ success: false, error: `Référence introuvable pour ${check_key}` }); return;
+    }
     const { error } = await supabaseAdmin.from('money_integrity_acknowledged').upsert({
       check_key,
       ref_id,

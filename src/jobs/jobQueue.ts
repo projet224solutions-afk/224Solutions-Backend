@@ -418,8 +418,21 @@ registerHandler('calls.expire-ringing', async () => {
 // 🤖 Surveillance : réconciliation automatique — un cas signalé dont la CORRECTION est
 // PROUVÉE en base (trace de frais apparue, régularisation liée, mouvement documenté) est
 // acquitté AUTOMATIQUEMENT → compteur retombe → pastille verte + alerte en Historique,
-// sans aucun clic PDG. Idempotent (upsert par clé) ; ce qui n'est pas prouvable reste signalé.
+// sans aucun clic PDG. Ce qui n'est pas prouvable reste signalé.
+// ⚛️ Chemin principal = RPC SQL auto_reconcile_monitor_cases (migration 20260704170000) :
+// UNE transaction set-based, ON CONFLICT DO NOTHING — atomique et sans N+1. Le repli JS
+// (équivalent, idempotent) n'est utilisé QUE si la RPC n'est pas encore appliquée, et il
+// est LOGGÉ à chaque fois — jamais silencieux.
 registerHandler('monitor.auto-reconcile', async () => {
+  const { data, error } = await supabaseAdmin.rpc('auto_reconcile_monitor_cases' as any);
+  if (!error) {
+    const d = data as any;
+    if (d?.acked_missing_fee || d?.acked_untraced) {
+      logger.info(`[Monitor] auto-réconciliation SQL : ${d.acked_missing_fee} frais + ${d.acked_untraced} hausses acquittés`);
+    }
+    return;
+  }
+  logger.warn(`[Monitor] RPC auto_reconcile_monitor_cases indisponible (${error.message}) → repli JS équivalent — appliquer la migration 20260704170000`);
   await autoReconcileMonitorCases();
 });
 

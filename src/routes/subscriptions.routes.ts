@@ -939,6 +939,8 @@ router.post('/confirm', verifyJWT, subscriptionRateLimit, async (req: Authentica
 
     const pricePaid = Number(subscription.price_paid_gnf || updated.price_paid_gnf || 0);
     if (pricePaid > 0) {
+      // 🏦 6e site : revenu AVANT commission (table 'subscriptions' = vendeur).
+      await recordSubscriptionRevenue('abonnement_vendeur', pricePaid, subscription_id, userId);
       const commissionResult = await triggerAffiliateCommission(
         userId,
         pricePaid,

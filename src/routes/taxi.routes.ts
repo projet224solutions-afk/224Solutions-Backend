@@ -240,4 +240,41 @@ router.post('/rate', verifyJWT, async (req: AuthenticatedRequest, res: Response)
   }
 });
 
+/**
+ * POST /api/v2/taxi/rides — créer une course à PRIX SERVEUR.
+ * Le prix est recalculé serveur (create_taxi_ride → calculate_taxi_fare) ; un prix/part/commission
+ * venu du client est IGNORÉ. p_rider_id = req.user.id (jamais du body).
+ */
+router.post('/rides', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const riderId = req.user!.id;
+    const b = req.body || {};
+    const { data, error } = await supabaseAdmin.rpc('create_taxi_ride', {
+      p_rider_id: riderId,
+      p_pickup_lat: b.pickupLat, p_pickup_lng: b.pickupLng,
+      p_dropoff_lat: b.dropoffLat, p_dropoff_lng: b.dropoffLng,
+      p_pickup_address: b.pickupAddress || '', p_dropoff_address: b.dropoffAddress || '',
+      p_vehicle_type: b.vehicleType || 'moto',
+      p_payment_method: b.paymentMethod || 'cash',
+      p_client_distance_km: b.clientDistanceKm ?? null,
+      p_client_duration_min: b.clientDurationMin ?? null,
+      p_metadata: b.phoneNumber ? { orange_money_phone: b.phoneNumber } : {},
+    });
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    const r = data as any;
+    if (!r?.success) {
+      const codeMap: Record<string, number> = {
+        INVALID_COORDINATES: 400, INVALID_DISTANCE: 400, RIDE_ALREADY_ACTIVE: 409,
+        RIDER_REQUIRED: 400, FARE_CALCULATION_FAILED: 500,
+      };
+      res.status(codeMap[r?.error] || 400).json({ success: false, error: r?.error || 'RIDE_CREATE_FAILED', error_code: r?.error });
+      return;
+    }
+    res.json({ success: true, data: { ride: r.ride, price_total: r.price_total, distance_km: r.distance_km, duration_min: r.duration_min } });
+  } catch (e: any) {
+    logger.error(`[Taxi] create ride error: ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de la création de la course' });
+  }
+});
+
 export default router;

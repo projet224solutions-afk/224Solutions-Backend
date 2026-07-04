@@ -759,6 +759,54 @@ router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: 
 });
 
 /**
+ * POST /api/admin/withdrawals — traitement admin/PDG des demandes de retrait bancaire.
+ * Remplace l'Edge Function 'admin-process-withdrawal' (souvent non déployée → « Failed to send
+ * a request to the Edge Function »). Le virement bancaire reste MANUEL : aucun payout auto,
+ * 'complete' ne fait que transitionner le statut via le RPC atomique admin_process_withdrawal.
+ */
+const WITHDRAWAL_ACTIONS = ['approve', 'reject', 'mark_sent', 'complete', 'fail'];
+router.post('/withdrawals', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const adminId = req.user!.id;
+    const { action, withdrawalId, notes } = req.body || {};
+
+    if (action === 'list') {
+      const { data: rows, error } = await supabaseAdmin
+        .from('stripe_withdrawals')
+        .select('id, user_id, amount, fee, net_amount, currency, status, bank_account_name, bank_account_number, bank_details, admin_notes, created_at, reviewed_at, processed_at')
+        .in('status', ['pending_review', 'approved', 'processing'])
+        .order('created_at', { ascending: true });
+      if (error) return fail(res, 400, error.message);
+
+      const userIds = [...new Set((rows || []).map((r: any) => r.user_id).filter(Boolean))];
+      const profiles: Record<string, unknown> = {};
+      if (userIds.length) {
+        const { data: profs } = await supabaseAdmin
+          .from('profiles').select('id, first_name, last_name, email, phone').in('id', userIds);
+        for (const p of (profs || []) as Array<{ id: string }>) profiles[p.id] = p;
+      }
+      const withdrawals = (rows || []).map((r: any) => ({ ...r, requester: profiles[r.user_id] || null }));
+      return ok(res, { withdrawals });
+    }
+
+    if (!WITHDRAWAL_ACTIONS.includes(action)) return fail(res, 400, `Action invalide: ${action}`);
+    if (!withdrawalId || typeof withdrawalId !== 'string') return fail(res, 400, 'withdrawalId requis');
+
+    const { data: result, error: rpcError } = await supabaseAdmin.rpc('admin_process_withdrawal', {
+      p_admin_id: adminId,          // id vérifié de l'appelant, jamais du body
+      p_withdrawal_id: withdrawalId,
+      p_action: action,
+      p_notes: notes ? String(notes) : null,
+    });
+    if (rpcError) return fail(res, 400, rpcError.message);
+    return ok(res, result);
+  } catch (e: any) {
+    logger.error(`[admin/withdrawals] ${e?.message}`);
+    return fail(res, 500, 'Erreur lors du traitement du retrait');
+  }
+});
+
+/**
  * GET /api/admin/pdg/revenue?granularity=&from=&to=
  * Reporting du coffre PDG : total, ventilation par source, série temporelle, solde, redistribué.
  */

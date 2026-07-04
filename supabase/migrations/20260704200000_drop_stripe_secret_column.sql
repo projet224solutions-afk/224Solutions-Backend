@@ -29,10 +29,11 @@ BEGIN
     RAISE EXCEPTION 'Abandon : % vue(s) référencent stripe_config.stripe_secret_key — les adapter avant le DROP', v_refs;
   END IF;
 
-  -- Fonctions dont le corps mentionne la colonne
+  -- Fonctions dont le corps mentionne la colonne. prokind='f' UNIQUEMENT : pg_get_functiondef
+  -- lève une erreur sur les agrégats (ex. st_memunion PostGIS) — on ne scanne que les fonctions normales.
   SELECT count(*) INTO v_refs
   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-  WHERE n.nspname = 'public' AND pg_get_functiondef(p.oid) ILIKE '%stripe_secret_key%';
+  WHERE n.nspname = 'public' AND p.prokind = 'f' AND pg_get_functiondef(p.oid) ILIKE '%stripe_secret_key%';
   IF v_refs > 0 THEN
     RAISE EXCEPTION 'Abandon : % fonction(s) référencent stripe_secret_key — les adapter avant le DROP', v_refs;
   END IF;

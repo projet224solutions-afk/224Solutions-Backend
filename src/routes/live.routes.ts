@@ -247,7 +247,9 @@ router.get('/streams/counts', async (_req, res: Response) => {
       .from('live_streams')
       .select('country_code, vendor_kind')
       .eq('status', 'live');
-    if (error) return fail(res, 400, error.message);
+    // Tolérant : tant que la migration live_shopping n'est pas appliquée (table absente),
+    // on renvoie des compteurs vides plutôt qu'une erreur (le bouton Live reste sans pastille).
+    if (error) return ok(res, { byCountry: [], totalPhysical: 0, totalDigital: 0, total: 0 });
 
     const map: Record<string, { country_code: string; physical: number; digital: number }> = {};
     let totalPhysical = 0, totalDigital = 0;

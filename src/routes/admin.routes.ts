@@ -775,6 +775,39 @@ router.get('/platform-monitor/details', verifyJWT, requireRole(PDG_ROLES), async
   }
 });
 
+/**
+ * POST /api/admin/platform-monitor/acknowledge — « Marquer comme traité ».
+ * Acquitte UN cas précis d'un contrôle (check_key + ref_id) : le contrôle SQL exclut
+ * les cas acquittés → le compteur retombe, la pastille redevient VERTE, et l'alerte
+ * part automatiquement dans l'Historique (résolue au cycle suivant). Ne s'applique
+ * qu'aux contrôles qui constatent des FAITS HISTORIQUES (liste blanche) — les états
+ * vivants (plafond dépassé, quarantaine) se résolvent par une vraie action, pas un clic.
+ */
+router.post('/platform-monitor/acknowledge', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { check_key, ref_id, reason } = req.body || {};
+    const ACKABLE = new Set(['order_missing_buyer_fee', 'untraced_increase', 'escrow_released_zero_credit']);
+    if (!check_key || typeof check_key !== 'string' || !ref_id || typeof ref_id !== 'string') {
+      res.status(400).json({ success: false, error: 'check_key et ref_id requis' }); return;
+    }
+    if (!ACKABLE.has(check_key)) {
+      res.status(400).json({ success: false, error: 'Ce contrôle ne s\'acquitte pas par un clic — traitez la cause réelle.' }); return;
+    }
+    const { error } = await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+      check_key,
+      ref_id,
+      reason: typeof reason === 'string' && reason.trim() ? reason.trim() : 'Traité par le PDG (panneau Surveillance)',
+      acknowledged_by: req.user!.id,
+    }, { onConflict: 'check_key,ref_id' });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    logger.info(`[platform-monitor] cas acquitté ${check_key}/${ref_id} par ${req.user!.id}`);
+    res.json({ success: true });
+  } catch (error: any) {
+    logger.error(`[admin/platform-monitor ack] ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de l\'acquittement' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTO-RÉPARATION SUPERVISÉE (dual-IA : OpenAI propose → Claude vérifie) — réservé PDG/admin.
 // FONDATION : diagnostic + proposition uniquement (aucune exécution automatique).

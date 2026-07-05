@@ -79,9 +79,18 @@ router.post('/streams/:id/start', verifyJWT, async (req: AuthenticatedRequest, r
     const userId = req.user!.id;
     const streamId = req.params.id;
     const { data: stream } = await supabaseAdmin
-      .from('live_streams').select('id, vendor_user_id, channel').eq('id', streamId).maybeSingle();
+      .from('live_streams').select('id, vendor_id, vendor_user_id, channel').eq('id', streamId).maybeSingle();
     if (!stream) return fail(res, 404, 'Live introuvable');
     if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    // Un seul live actif par vendeur : clôturer les AUTRES lives encore `live` de ce vendeur
+    // (fantômes d'un onglet fermé sans clôture) AVANT de démarrer celui-ci → plus de doublons.
+    await supabaseAdmin
+      .from('live_streams')
+      .update({ status: 'ended', ended_at: new Date().toISOString() })
+      .eq('vendor_id', (stream as any).vendor_id)
+      .eq('status', 'live')
+      .neq('id', streamId);
 
     const { error: rpcErr } = await supabaseAdmin.rpc('start_live_stream', { p_stream_id: streamId });
     if (rpcErr) return fail(res, 400, rpcErr.message);

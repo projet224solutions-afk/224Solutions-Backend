@@ -452,6 +452,23 @@ registerHandler('calls.expire-ringing', async () => {
   if (error) logger.warn(`[calls] expire-ringing: ${error.message}`);
 });
 
+// Live : FILET DE SÉCURITÉ anti-fantômes. Clôture les lives restés `live` anormalement
+// longtemps — cas d'un hôte crashé qui n'est jamais revenu (ni /end explicite, ni beacon
+// d'unload). La clôture NORMALE se fait côté client (pagehide/unmount) + à chaque nouveau
+// live du vendeur (un seul actif). Ce reaper ne rattrape que les crashes. Seuil : LIVE_MAX_HOURS.
+registerHandler('live.reap-orphans', async () => {
+  const maxHours = Number(process.env.LIVE_MAX_HOURS || 3);
+  const cutoff = new Date(Date.now() - maxHours * 3600 * 1000).toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('live_streams')
+    .update({ status: 'ended', ended_at: new Date().toISOString() })
+    .eq('status', 'live')
+    .lt('started_at', cutoff)
+    .select('id');
+  if (error) { logger.warn(`[live] reap-orphans: ${error.message}`); return; }
+  if (data && data.length) logger.info(`[live] ${data.length} live(s) orphelin(s) clôturé(s) (> ${maxHours}h sans fin)`);
+});
+
 // 🤖 Surveillance : réconciliation automatique — un cas signalé dont la CORRECTION est
 // PROUVÉE en base (trace de frais apparue, régularisation liée, mouvement documenté) est
 // acquitté AUTOMATIQUEMENT → compteur retombe → pastille verte + alerte en Historique,
@@ -1008,6 +1025,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('campaigns.dispatch-scheduled', {}).catch(() => {}), 60 * 1000));
       // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
       recurringTimers.push(setInterval(() => this.enqueue('calls.expire-ringing', {}).catch(() => {}), 60 * 1000));
+      // Live : reaper des fantômes (hôte crashé) toutes les heures
+      recurringTimers.push(setInterval(() => this.enqueue('live.reap-orphans', {}).catch(() => {}), everyHour));
       // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
       recurringTimers.push(setInterval(() => this.enqueue('monitor.auto-reconcile', {}).catch(() => {}), 5 * 60 * 1000));
 
@@ -1052,6 +1071,8 @@ export const jobQueue = {
       await queue.add('campaigns.dispatch-scheduled', {}, { repeat: { every: 60 * 1000 } });
       // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
       await queue.add('calls.expire-ringing', {}, { repeat: { every: 60 * 1000 } });
+      // Live : reaper des fantômes (hôte crashé) toutes les heures
+      await queue.add('live.reap-orphans', {}, { repeat: { every: 3600000 } });
       // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
       await queue.add('monitor.auto-reconcile', {}, { repeat: { every: 5 * 60 * 1000 } });
 

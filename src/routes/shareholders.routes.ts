@@ -9,6 +9,7 @@ import { Router, Response } from 'express';
 import { verifyJWT, requireRole } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { createAuthUserWithPhone } from '../services/authPhone.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
@@ -152,21 +153,25 @@ router.post('/', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: 
     const first_name = nameParts[0] || full_name;
     const last_name  = nameParts.slice(1).join(' ') || '';
 
-    // 1. Créer le compte auth (service_role bypass RLS)
-    const { data: authData, error: authErr } = await supabaseAdmin.auth.admin.createUser({
+    // 1. Créer le compte auth (service_role bypass RLS) — téléphone = identifiant (login
+    //    email OU téléphone). residence_country = code pays ISO (get_currency_for_country).
+    //    Dégrade en email-only si le numéro est déjà pris.
+    const authCreate = await createAuthUserWithPhone({
       email: email.toLowerCase(),
       password: temp_password,
-      email_confirm: true,
+      phone: phone || null,
+      countryCode: residence_country,
       user_metadata: { full_name, first_name, last_name, role: 'actionnaire', phone: phone || null },
     });
 
-    if (authErr || !authData?.user) {
-      logger.error('shareholders.create - auth error:', authErr?.message);
-      res.status(400).json({ success: false, error: authErr?.message || 'Erreur création compte' });
+    if (authCreate.error || !authCreate.user) {
+      logger.error('shareholders.create - auth error:', authCreate.error?.message);
+      res.status(400).json({ success: false, error: authCreate.error?.message || 'Erreur création compte' });
       return;
     }
 
-    const userId = authData.user.id;
+    const userId = authCreate.user.id;
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // 2. Upsert profil (service_role bypass "Only system can create profiles" RLS)
     // residence_country → country + detected_currency sur le profil (détermine la devise du wallet)
@@ -250,8 +255,13 @@ router.post('/', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: 
       new_value:   { full_name, email, category, action_scope, country, percentage },
     });
 
-    logger.info(`shareholders.create - success: ${sh.id} by ${req.user!.id}`);
-    res.json({ success: true, shareholder_id: sh.id });
+    logger.info(`shareholders.create - success: ${sh.id} by ${req.user!.id} (phone_login=${phoneLoginAvailable})`);
+    res.json({
+      success: true,
+      shareholder_id: sh.id,
+      phone_login_available: phoneLoginAvailable,
+      ...(phoneLoginAvailable ? {} : { message: 'Ce numéro est déjà lié à un autre compte — connexion par email uniquement.' }),
+    });
   } catch (err: any) {
     logger.error('shareholders.create - unhandled:', err.message);
     res.status(500).json({ success: false, error: 'Erreur interne' });

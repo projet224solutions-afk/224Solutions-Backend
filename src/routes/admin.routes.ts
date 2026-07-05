@@ -1419,6 +1419,48 @@ router.put('/aml/caps', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA, asy
 });
 
 // ============================================================================
+// 💸 NOTIFICATIONS SMS — politique COÛT : quels types de notifications déclenchent un
+// SMS (le reste reste email + in-app). Réglage pdg_settings clé `sms_notification_types`
+// (jsonb liste). Piloté par le PDG. Le dispatcher lit ce réglage (cache mémoire ~60s).
+// ➜ UI PDG (cases à cocher) à câbler sur ces 2 endpoints.
+// ============================================================================
+const DEFAULT_SMS_NOTIFICATION_TYPES = ['transfer', 'withdrawal', 'security', 'otp', 'payment_received'];
+
+router.get('/sms-notification-types', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings').select('setting_value').eq('setting_key', 'sms_notification_types').maybeSingle();
+    const raw: any = data?.setting_value;
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.types) ? raw.types : Array.isArray(raw?.value) ? raw.value : null;
+    const types = (arr && arr.length ? arr : DEFAULT_SMS_NOTIFICATION_TYPES).map((s: any) => String(s));
+    res.json({ success: true, data: { types, defaults: DEFAULT_SMS_NOTIFICATION_TYPES } });
+  } catch (error: any) {
+    logger.error(`[admin/sms-notification-types GET] ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lecture réglage SMS' });
+  }
+});
+
+router.put('/sms-notification-types', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const types = req.body?.types;
+    if (!Array.isArray(types)) { res.status(400).json({ success: false, error: 'types (liste) requis' }); return; }
+    const clean = Array.from(new Set(types.map((s: any) => String(s).toLowerCase().trim()).filter(Boolean)));
+    const { error } = await supabaseAdmin.from('pdg_settings').upsert({
+      setting_key: 'sms_notification_types',
+      setting_value: clean,
+      description: 'Types de notifications qui déclenchent un SMS (politique coût). Les autres restent email + in-app.',
+      updated_by: req.user!.id,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'setting_key' });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, data: { types: clean } });
+  } catch (error: any) {
+    logger.error(`[admin/sms-notification-types PUT] ${error.message}`);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================================
 // 🔐 2FA ADMIN — gestion du step-up TOTP (enrôlement / activation / step-up)
 // Tout est vérifié SERVEUR (speakeasy). Le secret ne transite jamais en clair vers
 // le client après l'enrôlement initial (QR/secret affichés une seule fois).

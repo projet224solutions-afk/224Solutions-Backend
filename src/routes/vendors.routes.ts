@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { createAuthUserWithPhone } from '../services/authPhone.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
@@ -68,17 +69,20 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
       return;
     }
 
-    // 1) Créer le compte auth
-    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+    // 1) Créer le compte auth — téléphone = identifiant (login email OU téléphone). Dégrade si doublon.
+    const authCreate = await createAuthUserWithPhone({
       email: emailLc,
       password,
-      email_confirm: true,
+      phone,
+      countryCode: (req.body?.country_code as string | undefined),
       user_metadata: { full_name: name, phone, role: 'vendor_agent' },
     });
-    if (authError || !authData.user) {
-      res.status(500).json({ success: false, error: authError?.message || 'Erreur création compte' });
+    if (authCreate.error || !authCreate.user) {
+      res.status(500).json({ success: false, error: authCreate.error?.message || 'Erreur création compte' });
       return;
     }
+    const authData = { user: authCreate.user };
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // 2) Insérer l'agent ; ROLLBACK du compte auth si échec
     const agentCode = `VAG${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
@@ -119,8 +123,12 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
     });
     if (profErr) logger.warn(`[vendors/agents] profile upsert: ${profErr.message}`);
 
-    logger.info(`[vendors/agents] agent ${agentRow.id} créé pour vendor ${vendor.id}`);
-    res.json({ success: true, data: { agent: { id: agentRow.id, agent_code: agentCode, access_token: accessToken, email: emailLc } } });
+    logger.info(`[vendors/agents] agent ${agentRow.id} créé pour vendor ${vendor.id} (phone_login=${phoneLoginAvailable})`);
+    res.json({
+      success: true,
+      data: { agent: { id: agentRow.id, agent_code: agentCode, access_token: accessToken, email: emailLc }, phone_login_available: phoneLoginAvailable },
+      ...(phoneLoginAvailable ? {} : { message: 'Ce numéro est déjà lié à un autre compte — connexion par email uniquement.' }),
+    });
   } catch (err: any) {
     logger.error(`[vendors/agents] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur serveur interne' });

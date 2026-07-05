@@ -112,6 +112,13 @@ const CreateOrderSchema = z.object({
     country: z.string().trim().min(2).max(100),
     postal_code: z.string().max(20).nullish(),
     notes: z.string().max(500).nullish(),
+    // Position GPS du client (capturée au checkout, jamais 0/0). Persistée ICI pour que le
+    // livreur navigue vers le client (DeliveryGPSNavigation lit shipping_address.lat/lng).
+    // Optionnelle + nullable (refus/échec de géoloc → null explicite, jamais bloquant).
+    lat: z.number().min(-90).max(90).nullish(),
+    lng: z.number().min(-180).max(180).nullish(),
+    accuracy: z.number().nonnegative().nullish(),
+    captured_at: z.string().max(40).nullish(),
   }),
   payment_method: z.enum(['card', 'mobile_money', 'wallet', 'cash']),
   payment_intent_id: z.string().max(500).nullish(),
@@ -168,7 +175,7 @@ async function attachEscrowToOrders<T extends { id: string }>(orders: T[]) {
 
   const { data: escrows, error } = await supabaseAdmin
     .from('escrow_transactions')
-    .select('id, order_id, status, amount, currency, auto_release_date, released_at, seller_confirmed_at')
+    .select('id, order_id, status, amount, currency, commission_amount, metadata, auto_release_date, released_at, seller_confirmed_at')
     .in('order_id', orders.map(order => order.id))
     .order('created_at', { ascending: false });
 

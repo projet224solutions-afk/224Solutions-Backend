@@ -145,6 +145,35 @@ router.post('/streams/:id/end', verifyJWT, async (req: AuthenticatedRequest, res
   }
 });
 
+// ── POST /streams/:id/thumbnail (host) — vignette du replay (best-effort) ───
+// Capturée côté client PENDANT le direct puis uploadée (GCS). Aucune action vendeur.
+// Host revérifié : seul le vendeur hôte peut écrire la vignette de SON stream.
+router.post('/streams/:id/thumbnail', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const { thumbnail_url } = req.body || {};
+    // Validation URL basique : http(s) uniquement, longueur bornée.
+    if (typeof thumbnail_url !== 'string' || !/^https?:\/\/.+/i.test(thumbnail_url) || thumbnail_url.length > 2048) {
+      return fail(res, 400, 'URL de vignette invalide');
+    }
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const { error } = await supabaseAdmin
+      .from('live_streams')
+      .update({ thumbnail_url })
+      .eq('id', streamId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { streamId, thumbnailUrl: thumbnail_url });
+  } catch (e: any) {
+    logger.error(`[live/thumbnail] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
 // ── POST /streams/:id/products (host) — ajoute / épingle (exclusif) ─────────
 router.post('/streams/:id/products', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {

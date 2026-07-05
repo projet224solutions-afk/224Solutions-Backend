@@ -186,7 +186,7 @@ router.post("/security-alert", async (req: any, res: any) => {
 
 router.post("/sms", async (req: any, res: any) => {
   try {
-    const { phone_number, message_body, user_id } = req.body;
+    const { phone_number, message_body, user_id, country_code } = req.body;
     if (!phone_number || !message_body) return res.status(400).json({ success: false, error: "phone_number et message_body requis" });
     // Store as in_app notification (SMS provider à configurer via TWILIO_API_KEY ou autre)
     if (user_id) {
@@ -199,7 +199,8 @@ router.post("/sms", async (req: any, res: any) => {
       });
     }
     // Envoi RÉEL via le service SMS (Twilio backend → repli Edge Function send-sms).
-    const smsResult = await sendSms(phone_number, message_body);
+    // country_code (ISO-2) optionnel : format E.164 pan-africain (sinon repli GN + warn).
+    const smsResult = await sendSms(phone_number, message_body, country_code);
     if (!smsResult.ok) {
       logger.warn(`[notifications/sms] Échec envoi SMS à ${phone_number}: ${smsResult.error}`);
       return res.status(503).json({ success: false, error: smsResult.error || "Service SMS indisponible" });

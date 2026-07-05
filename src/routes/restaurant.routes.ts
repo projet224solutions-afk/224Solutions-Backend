@@ -16,6 +16,7 @@ import { randomUUID } from 'crypto';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { createAuthUserWithPhone } from '../services/authPhone.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
@@ -510,11 +511,14 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
     const { data: authList } = await supabaseAdmin.auth.admin.listUsers();
     if (authList?.users?.some((u: any) => u.email === email)) { res.status(409).json({ success: false, error: 'Cet email a déjà un compte' }); return; }
 
-    // 1) Compte auth.
-    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
-      email, password, email_confirm: true, user_metadata: { full_name: name, phone, role: 'restaurant_agent' },
+    // 1) Compte auth — téléphone = identifiant (login email OU téléphone). Dégrade si doublon.
+    const authCreate = await createAuthUserWithPhone({
+      email, password, phone, countryCode: b.country_code,
+      user_metadata: { full_name: name, phone, role: 'restaurant_agent' },
     });
-    if (authError || !authData.user) { res.status(500).json({ success: false, error: authError?.message || 'Création compte échouée' }); return; }
+    if (authCreate.error || !authCreate.user) { res.status(500).json({ success: false, error: authCreate.error?.message || 'Création compte échouée' }); return; }
+    const authData = { user: authCreate.user };
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // 2) Ligne agent ; rollback du compte si échec.
     const { data: agentRow, error: agentError } = await supabaseAdmin.from('restaurant_agents').insert({
@@ -533,8 +537,12 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
       last_name: name.split(' ').slice(1).join(' ') || '', phone, role: 'restaurant_agent',
     }).then(() => {}, () => {});
 
-    logger.info(`[restaurant/agents] agent ${agentRow.id} créé pour service ${serviceId}`);
-    res.json({ success: true, data: { id: agentRow.id, email } });
+    logger.info(`[restaurant/agents] agent ${agentRow.id} créé pour service ${serviceId} (phone_login=${phoneLoginAvailable})`);
+    res.json({
+      success: true,
+      data: { id: agentRow.id, email, phone_login_available: phoneLoginAvailable },
+      ...(phoneLoginAvailable ? {} : { message: 'Ce numéro est déjà lié à un autre compte — connexion par email uniquement.' }),
+    });
   } catch (e: any) { logger.error(`[restaurant/agents POST] ${e?.message}`); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 

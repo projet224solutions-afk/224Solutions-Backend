@@ -92,6 +92,48 @@ function getConfiguredStripeSecretKey(): string | null {
   return process.env.STRIPE_SECRET_KEY?.trim() || null;
 }
 
+// ── ESCROW (lien de paiement sécurisé) — helpers ────────────────────────────
+
+// La commande légère escrow exige un customer_id (orders.customer_id NOT NULL). On le
+// résout/crée à partir de l'acheteur connecté (identique à orders.routes.ts).
+async function getOrCreateEscrowCustomerId(userId: string): Promise<string> {
+  const { data: existing } = await supabaseAdmin
+    .from('customers').select('id').eq('user_id', userId).maybeSingle();
+  if (existing?.id) return existing.id;
+  const { data: created, error } = await supabaseAdmin
+    .from('customers').insert({ user_id: userId }).select('id').single();
+  if (error) throw error;
+  return created.id;
+}
+
+// La commande légère escrow exige un vendor_id (orders.vendor_id NOT NULL, FK vendors).
+// On le résout depuis le lien (vendeur_id) ou depuis le compte vendeur du propriétaire.
+async function resolveEscrowVendorId(link: any): Promise<string | null> {
+  if (link.vendeur_id) {
+    const { data: v } = await supabaseAdmin
+      .from('vendors').select('id').eq('id', link.vendeur_id).maybeSingle();
+    if (v?.id) return v.id;
+  }
+  if (link.owner_user_id) {
+    const { data: v } = await supabaseAdmin
+      .from('vendors').select('id').eq('user_id', link.owner_user_id).eq('is_active', true).maybeSingle();
+    if (v?.id) return v.id;
+  }
+  return null;
+}
+
+// Traduit un code d'erreur du RPC hold_payment_link_escrow en message + statut HTTP.
+function mapEscrowHoldError(rawMessage: string): { status: number; error: string } {
+  const m = String(rawMessage || '');
+  if (/INSUFFICIENT_FUNDS/.test(m)) return { status: 400, error: 'Solde insuffisant' };
+  if (/WALLET_BLOCKED/.test(m)) return { status: 403, error: 'Wallet bloqué' };
+  if (/OWN_LINK/.test(m)) return { status: 400, error: 'Vous ne pouvez pas payer votre propre lien de paiement' };
+  if (/BUYER_WALLET_NOT_FOUND/.test(m)) return { status: 400, error: 'Wallet introuvable dans cette devise' };
+  if (/BAD_AMOUNT|BAD_FEE/.test(m)) return { status: 400, error: 'Montant invalide' };
+  if (/NOT_ESCROW_LINK|LINK_NOT_FOUND/.test(m)) return { status: 400, error: 'Lien de paiement invalide' };
+  return { status: 400, error: 'Paiement sécurisé échoué' };
+}
+
 // ─────────────────────────────────────────────────────────
 // POST /api/payment-links/resolve
 // Résolution publique d'un lien de paiement par token
@@ -322,6 +364,40 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
 
     logger.info(`[PaymentLinks] Process: id=${publicId}, method=${paymentMethod}, amount=${payAmount}, fee=${platformFee}`);
 
+    // ──────── LIEN ESCROW (paiement sécurisé à la réception) ────────
+    // Compte OBLIGATOIRE vérifié CÔTÉ SERVEUR (jamais de paiement escrow anonyme). On
+    // pré-résout le vendeur (commande légère) AVANT tout encaissement pour ne jamais
+    // capturer d'argent qu'on ne pourrait pas mettre en séquestre.
+    const isEscrow = link.link_type === 'escrow';
+    let escrowVendorId: string | null = null;
+    let escrowCustomerId: string | null = null;
+    if (isEscrow) {
+      if (!userId) {
+        res.status(401).json({ success: false, error: 'Ce paiement sécurisé nécessite un compte 224Solutions.', error_code: 'ESCROW_ACCOUNT_REQUIRED' });
+        return;
+      }
+      if (!ownerUserId) {
+        res.status(400).json({ success: false, error: 'Ce lien sécurisé n\'a pas de bénéficiaire' });
+        return;
+      }
+      if (ownerUserId === userId) {
+        res.status(400).json({ success: false, error: 'Vous ne pouvez pas payer votre propre lien de paiement' });
+        return;
+      }
+      escrowVendorId = await resolveEscrowVendorId(link);
+      if (!escrowVendorId) {
+        res.status(400).json({ success: false, error: 'Le paiement sécurisé requiert un vendeur avec une boutique 224Solutions.', error_code: 'ESCROW_SELLER_NOT_VENDOR' });
+        return;
+      }
+      try {
+        escrowCustomerId = await getOrCreateEscrowCustomerId(userId);
+      } catch (e: any) {
+        logger.error(`[PaymentLinks] escrow customer resolve failed: ${e?.message}`);
+        res.status(500).json({ success: false, error: 'Erreur serveur' });
+        return;
+      }
+    }
+
     // ──────── WALLET PAYMENT ────────
     if (paymentMethod === 'wallet') {
       if (!userId) {
@@ -331,6 +407,48 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
 
       if (!ownerUserId) {
         res.status(400).json({ success: false, error: 'Ce lien n\'a pas de bénéficiaire wallet' });
+        return;
+      }
+
+      // ── LIEN ESCROW payé au wallet : SÉQUESTRE (débit acheteur, vendeur NON crédité) ──
+      // hold_payment_link_escrow débite l'acheteur, crée la commande légère + l'escrow HELD,
+      // et lie le tout au lien — ATOMIQUE + IDEMPOTENT (verrou lien + garde escrow_id).
+      if (isEscrow) {
+        const { data: hold, error: holdErr } = await supabaseAdmin.rpc('hold_payment_link_escrow', {
+          p_link_id: link.id,
+          p_buyer_user_id: userId,
+          p_customer_id: escrowCustomerId,
+          p_vendor_id: escrowVendorId,
+          p_seller_user_id: ownerUserId,
+          p_amount: payAmount,
+          p_commission: platformFee,
+          p_currency: link.devise || 'GNF',
+          p_payment_method: 'wallet',
+          p_payment_reference: null,
+          p_debit_wallet: true,
+          p_auto_release_days: 14,
+        });
+        if (holdErr || !hold || (hold as any).success === false) {
+          const { status, error } = mapEscrowHoldError(holdErr?.message || '');
+          logger.warn(`[PaymentLinks] escrow hold (wallet) échec link=${link.id}: ${holdErr?.message || 'unknown'}`);
+          res.status(status).json({ success: false, error });
+          return;
+        }
+        await supabaseAdmin.from('payment_links').update({
+          customer_name: customerName || null,
+          customer_email: customerEmail || null,
+          customer_phone: customerPhone || null,
+        }).eq('id', link.id);
+        logger.info(`[PaymentLinks] escrow held (wallet): escrow=${(hold as any).escrow_id}, order=${(hold as any).order_id}`);
+        res.json({
+          success: true,
+          paymentMethod: 'wallet',
+          escrow: true,
+          escrowId: (hold as any).escrow_id,
+          orderId: (hold as any).order_id,
+          transactionId: (hold as any).transaction_id || (hold as any).escrow_id,
+          amount: payAmount,
+        });
         return;
       }
 
@@ -425,6 +543,50 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
           });
           return;
         }
+
+        // ── LIEN ESCROW payé par carte : SÉQUESTRE (Stripe encaisse, vendeur NON crédité) ──
+        // L'argent est chez la plateforme (Stripe) ; on crée seulement la commande légère +
+        // l'escrow HELD. IDEMPOTENT : un rejeu (même PaymentIntent) → le garde escrow_id renvoie
+        // already_processed, jamais 2 escrows.
+        if (isEscrow) {
+          const { data: hold, error: holdErr } = await supabaseAdmin.rpc('hold_payment_link_escrow', {
+            p_link_id: link.id,
+            p_buyer_user_id: userId,
+            p_customer_id: escrowCustomerId,
+            p_vendor_id: escrowVendorId,
+            p_seller_user_id: ownerUserId,
+            p_amount: payAmount,
+            p_commission: platformFee,
+            p_currency: link.devise || 'GNF',
+            p_payment_method: 'card',
+            p_payment_reference: paymentIntent.id,
+            p_debit_wallet: false,
+            p_auto_release_days: 14,
+          });
+          if (holdErr || !hold || (hold as any).success === false) {
+            logger.error(`[PaymentLinks] escrow hold (card) échec link=${link.id}: ${holdErr?.message || 'unknown'}`);
+            res.status(500).json({ success: false, error: 'Paiement encaissé mais mise en séquestre impossible. Contactez le support.' });
+            return;
+          }
+          await supabaseAdmin.from('payment_links').update({
+            customer_name: customerName || null,
+            customer_email: customerEmail || null,
+            customer_phone: customerPhone || null,
+          }).eq('id', link.id);
+          logger.info(`[PaymentLinks] escrow held (card): escrow=${(hold as any).escrow_id}, order=${(hold as any).order_id}, intent=${paymentIntent.id}`);
+          res.json({
+            success: true,
+            paymentMethod: 'card',
+            confirmed: true,
+            escrow: true,
+            escrowId: (hold as any).escrow_id,
+            orderId: (hold as any).order_id,
+            paymentIntentId,
+            amount: payAmount,
+          });
+          return;
+        }
+
         await supabaseAdmin.from('payment_links').update({
           status: 'success',
           paid_at: new Date().toISOString(),
@@ -486,6 +648,17 @@ router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Resp
 
     // ──────── MOBILE MONEY ────────
     if (paymentMethod === 'orange_money' || paymentMethod === 'mtn_momo') {
+      // Escrow : pas de confirmation Mobile Money synchrone → on ne peut pas garantir le
+      // séquestre des fonds. On refuse EXPLICITEMENT (jamais de séquestre sans fonds confirmés).
+      // TODO : brancher un webhook Mobile Money puis autoriser l'escrow via hold_payment_link_escrow.
+      if (isEscrow) {
+        res.status(400).json({
+          success: false,
+          error: 'Le paiement sécurisé (escrow) n\'est pas disponible via Mobile Money. Utilisez le Wallet ou la carte bancaire.',
+          error_code: 'ESCROW_MOBILE_UNSUPPORTED',
+        });
+        return;
+      }
       if (!customerPhone) {
         res.status(400).json({ success: false, error: 'Numéro de téléphone requis pour Mobile Money' });
         return;

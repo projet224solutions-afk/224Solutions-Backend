@@ -15,16 +15,15 @@ import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
 
-export function formatPhoneIntl(raw: string): string {
-  // E.164 : on retire espaces, tirets, points et parenthèses (les numéros sont souvent
-  // stockés « +224 612… » → Twilio rejette les espaces). Le « + » initial est conservé.
-  let phone = String(raw || '').replace(/[\s().-]/g, '').trim();
-  if (!phone) return phone;
-  if (phone.startsWith('6')) phone = `+224${phone}`;
-  else if (phone.startsWith('00224')) phone = phone.replace('00224', '+224');
-  else if (!phone.startsWith('+')) phone = `+${phone}`;
-  return phone;
-}
+// Formatage E.164 pan-africain : logique pure extraite dans phoneFormat.ts (testable sans env).
+// Ré-exporté ici pour ne pas casser les imports existants (`from '../services/sms.service.js'`).
+export {
+  formatPhoneIntl,
+  dialCodeForCountry,
+  COUNTRY_DIAL_CODES,
+  DEFAULT_COUNTRY_ISO,
+} from './phoneFormat.js';
+import { formatPhoneIntl } from './phoneFormat.js';
 
 /** Envoi direct via l'API Twilio (clés backend). */
 async function sendViaBackendTwilio(toFormatted: string, message: string): Promise<{ ok: boolean; error?: string }> {
@@ -69,9 +68,9 @@ async function sendViaEdge(toFormatted: string, message: string): Promise<{ ok: 
   return { ok: true };
 }
 
-export async function sendSms(to: string, message: string): Promise<{ ok: boolean; error?: string }> {
+export async function sendSms(to: string, message: string, countryCode?: string): Promise<{ ok: boolean; error?: string }> {
   if (!to || !message) return { ok: false, error: 'Destinataire ou message manquant' };
-  const formattedPhone = formatPhoneIntl(to);
+  const formattedPhone = formatPhoneIntl(to, countryCode);
 
   const hasBackendTwilio = Boolean(
     env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && (env.TWILIO_MESSAGING_SERVICE_SID || env.TWILIO_PHONE_NUMBER)

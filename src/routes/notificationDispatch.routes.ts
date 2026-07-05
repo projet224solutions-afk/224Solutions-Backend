@@ -11,11 +11,49 @@ import { Router, Response } from 'express';
 import { authenticateInternal } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { sendEmail } from '../services/transactionEmail.service.js';
-import { sendSms } from '../services/sms.service.js';
+import { sendSms, formatPhoneIntl } from '../services/sms.service.js';
 import { enqueueRetry, processNotificationRetries } from '../services/notificationRetry.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
+
+/**
+ * 💸 POLITIQUE COÛT SMS — n'envoyer un SMS que pour les types CRITIQUES (configurable PDG).
+ *
+ * Réglage `pdg_settings` clé `sms_notification_types` (jsonb liste). Sans SMS ciblé, un blast
+ * SMS partirait pour CHAQUE notification (email + in-app restent, eux, toujours envoyés).
+ * Lu avec un cache mémoire ~60s pour éviter un SELECT par notification.
+ */
+const DEFAULT_SMS_TYPES = ['transfer', 'withdrawal', 'security', 'otp', 'payment_received'];
+const SMS_TYPES_TTL_MS = 60 * 1000;
+let smsTypesCache: { value: string[]; at: number } | null = null;
+
+async function getSmsNotificationTypes(): Promise<string[]> {
+  if (smsTypesCache && Date.now() - smsTypesCache.at < SMS_TYPES_TTL_MS) return smsTypesCache.value;
+  let value = DEFAULT_SMS_TYPES;
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings')
+      .select('setting_value')
+      .eq('setting_key', 'sms_notification_types')
+      .maybeSingle();
+    const raw: any = data?.setting_value;
+    // Tolère un array brut, {types:[...]} ou {value:[...]} (variantes de stockage pdg_settings).
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.types) ? raw.types : Array.isArray(raw?.value) ? raw.value : null;
+    if (arr && arr.length) value = arr.map((s: any) => String(s).toLowerCase().trim()).filter(Boolean);
+  } catch (e) {
+    logger.warn(`[notif-dispatch] lecture sms_notification_types échouée → défaut: ${(e as Error)?.message}`);
+  }
+  smsTypesCache = { value, at: Date.now() };
+  return value;
+}
+
+/** Un SMS est-il autorisé pour ce type de notification ? (membership + inclusion, ex: 'transfer_out' ⊇ 'transfer'). */
+function smsAllowedForType(type: string | undefined, allowed: string[]): boolean {
+  const t = String(type || '').toLowerCase().trim();
+  if (!t) return false; // type inconnu → non critique → pas de SMS (email + in-app conservés)
+  return allowed.some((a) => t === a || t.includes(a));
+}
 
 /**
  * Types EXCLUS de l'envoi email/SMS automatique : les campagnes/marketing gèrent DÉJÀ
@@ -104,10 +142,10 @@ router.post('/dispatch', authenticateInternal, async (req, res: Response): Promi
       return;
     }
 
-    // Destinataire : email + téléphone depuis profiles.
+    // Destinataire : email + téléphone (+ pays pour le format E.164 pan-africain) depuis profiles.
     const { data: profile } = await supabaseAdmin
       .from('profiles')
-      .select('email, phone')
+      .select('email, phone, country_code')
       .eq('id', user_id)
       .maybeSingle();
 
@@ -134,20 +172,28 @@ router.post('/dispatch', authenticateInternal, async (req, res: Response): Promi
       catch (e) { logger.warn(`[notif-dispatch] email: ${(e as Error)?.message}`); }
     }
 
-    // SMS (Twilio) — best-effort. Template contextuel selon le type, tronqué.
+    // SMS (Twilio) — best-effort, UNIQUEMENT pour les types critiques (politique coût PDG).
     if (profile.phone) {
-      try {
-        // ✅ Template contextuel selon le type de notification
-        const smsText = buildSmsText(type || '', title || '', message || '').slice(0, 320);
-        const r = await sendSms(profile.phone, smsText);
-        out.sms = r.ok;
+      const allowedTypes = await getSmsNotificationTypes();
+      if (!smsAllowedForType(type, allowedTypes)) {
+        // Hors liste : email + in-app conservés, pas de SMS (évite le blast SMS).
+        logger.debug(`[notif-dispatch] SMS ignoré (type '${type || '?'}' hors liste critique) user=${user_id}`);
+      } else {
+        try {
+          // Numéro normalisé E.164 selon le pays du profil (pan-africain).
+          const e164 = formatPhoneIntl(profile.phone, (profile as any).country_code || undefined);
+          // ✅ Template contextuel selon le type de notification
+          const smsText = buildSmsText(type || '', title || '', message || '').slice(0, 320);
+          const r = await sendSms(e164, smsText);
+          out.sms = r.ok;
 
-        // ✅ Si SMS échoue → enfile en retry
-        if (!r.ok) {
-          await enqueueRetry(user_id, profile.phone, smsText);
-          logger.warn(`[notif-dispatch] SMS échoué → retry enfilé: ${r.error}`);
-        }
-      } catch (e) { logger.warn(`[notif-dispatch] sms: ${(e as Error)?.message}`); }
+          // ✅ Si SMS échoue → enfile en retry (numéro déjà E.164 pour le worker sans pays).
+          if (!r.ok) {
+            await enqueueRetry(user_id, e164, smsText);
+            logger.warn(`[notif-dispatch] SMS échoué → retry enfilé: ${r.error}`);
+          }
+        } catch (e) { logger.warn(`[notif-dispatch] sms: ${(e as Error)?.message}`); }
+      }
     }
 
     logger.info(`[notif-dispatch] user=${user_id} type=${type || '?'} email=${out.email} sms=${out.sms}`);

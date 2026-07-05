@@ -100,6 +100,26 @@ async function getVendorId(userId: string): Promise<string | null> {
   return resolveVendorId(userId);
 }
 
+/**
+ * Pays (ISO-2) du vendeur, pour formater les SMS de campagne en E.164 pan-africain.
+ * Source fiable : `profiles.country_code` du propriétaire du vendeur. Cache 5 min.
+ */
+const vendorCountryCache = new Map<string, { code: string | null; at: number }>();
+async function getVendorCountryCode(vendorId: string): Promise<string | undefined> {
+  const cached = vendorCountryCache.get(vendorId);
+  if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.code || undefined;
+  let code: string | null = null;
+  try {
+    const { data: v } = await supabaseAdmin.from('vendors').select('user_id').eq('id', vendorId).maybeSingle();
+    if (v?.user_id) {
+      const { data: p } = await supabaseAdmin.from('profiles').select('country_code').eq('id', v.user_id).maybeSingle();
+      code = (p?.country_code as string | null) || null;
+    }
+  } catch { /* repli : pas de pays → formatPhoneIntl utilisera le défaut GN + warn */ }
+  vendorCountryCache.set(vendorId, { code, at: Date.now() });
+  return code || undefined;
+}
+
 async function isAdminUser(userId: string): Promise<boolean> {
   const { data } = await supabaseAdmin
     .from('profiles')
@@ -403,6 +423,7 @@ router.post('/broadcast', verifyJWT, async (req: CampaignRequest, res: CampaignR
     const contacts = await loadAudienceContacts(vendorId);
     const emails = doEmail ? contacts.filter(c => c.email && c.marketing_email_opt_in !== false) : [];
     const phones = doSms ? contacts.filter(c => c.phone && c.marketing_sms_opt_in !== false) : [];
+    const vendorCountry = doSms ? await getVendorCountryCode(vendorId) : undefined;
 
     if (emails.length === 0 && phones.length === 0) {
       res.status(400).json({ success: false, error: 'Aucun contact joignable pour ce canal.' });
@@ -427,7 +448,7 @@ router.post('/broadcast', verifyJWT, async (req: CampaignRequest, res: CampaignR
     }
     for (const c of phones) {
       tasks.push(async () => {
-        const r = await sendSms(c.phone as string, message);
+        const r = await sendSms(c.phone as string, message, vendorCountry);
         if (r.ok) smsSent++; else { smsFailed++; if (!smsError) smsError = r.error; }
       });
     }
@@ -1283,9 +1304,12 @@ async function sendEmail(recipient: any, campaign: any): Promise<boolean> {
 async function sendSMS(recipient: any, campaign: any): Promise<boolean> {
   if (!recipient.phone) return false;
   // FIX : envoi via le service SMS backend (Twilio) au lieu de l'Edge Function.
+  // Pays du vendeur → format E.164 pan-africain (numéros contacts souvent locaux).
+  const vendorCountry = await getVendorCountryCode(campaign.vendor_id);
   const { ok, error } = await sendSms(
     recipient.phone,
     `${campaign.title}\n${String(campaign.message_body || '').substring(0, 140)}`,
+    vendorCountry,
   );
   if (!ok && error) logger.warn(`[campaigns] SMS échec ${recipient.phone}: ${error}`);
 

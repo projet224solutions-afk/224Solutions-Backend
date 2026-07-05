@@ -22,6 +22,9 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           GCS_SA_B64: ${{ secrets.GCS_SA_B64 }}
+          ABLY_API_KEY: ${{ secrets.ABLY_API_KEY }}
+          AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
+          AGORA_APP_CERTIFICATE: ${{ secrets.AGORA_APP_CERTIFICATE }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
@@ -39,6 +42,15 @@ jobs:
           # pour tout le monde). Cible : 6000 requêtes / 60 s par IP.
           if grep -q '^RATE_LIMIT_MAX_REQUESTS=' .env; then sed -i 's|^RATE_LIMIT_MAX_REQUESTS=.*|RATE_LIMIT_MAX_REQUESTS=6000|' .env; else echo 'RATE_LIMIT_MAX_REQUESTS=6000' >> .env; fi
           if grep -q '^RATE_LIMIT_WINDOW_MS=' .env; then sed -i 's|^RATE_LIMIT_WINDOW_MS=.*|RATE_LIMIT_WINDOW_MS=60000|' .env; else echo 'RATE_LIMIT_WINDOW_MS=60000' >> .env; fi
+          # Ably (temps reel). Depuis le secret GitHub ABLY_API_KEY, developpe ICI (runner).
+          # Ecriture robuste : on supprime toute ancienne ligne puis on reecrit (gere la mise
+          # a jour de cle sans casse sed sur les caracteres speciaux). Ne fait rien si le secret
+          # est vide (backend reste alors sur Supabase Realtime par defaut).
+          if [ -n "${ABLY_API_KEY}" ]; then sed -i '/^ABLY_API_KEY=/d' .env; echo "ABLY_API_KEY=${ABLY_API_KEY}" >> .env; fi
+          # Agora (appels + live). Certificat = source de verite backend (token signe cote Node).
+          # Meme ecriture robuste que Ably (supprime puis reecrit ; ne fait rien si secret vide).
+          if [ -n "${AGORA_APP_ID}" ]; then sed -i '/^AGORA_APP_ID=/d' .env; echo "AGORA_APP_ID=${AGORA_APP_ID}" >> .env; fi
+          if [ -n "${AGORA_APP_CERTIFICATE}" ]; then sed -i '/^AGORA_APP_CERTIFICATE=/d' .env; echo "AGORA_APP_CERTIFICATE=${AGORA_APP_CERTIFICATE}" >> .env; fi
           git fetch origin main
           git reset --hard origin/main
           npm install --no-audit --no-fund

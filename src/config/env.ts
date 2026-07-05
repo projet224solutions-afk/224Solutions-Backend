@@ -73,6 +73,13 @@ export const env = {
   // Doit rester aligné avec VITE_LIVE_PROVIDER côté frontend.
   LIVE_PROVIDER: optionalEnv('LIVE_PROVIDER', 'agora'),
 
+  // Agora (appels + live) : App ID + Certificate signent les tokens RTC. Source de vérité =
+  // backend (jamais côté client). Quand présents, le backend génère le token NATIVEMENT
+  // (services/agoraToken.ts) au lieu de proxifier l'edge Supabase — le certificat vit ici,
+  // aligné sur la console Agora. Optionnels au boot ; si absents, repli sur l'edge (transition).
+  AGORA_APP_ID: optionalEnv('AGORA_APP_ID', ''),
+  AGORA_APP_CERTIFICATE: optionalEnv('AGORA_APP_CERTIFICATE', ''),
+
   // OAuth (Google)
   OAUTH_CLIENT_ID: optionalEnv('OAUTH_CLIENT_ID', ''),
   OAUTH_CLIENT_SECRET: optionalEnv('OAUTH_CLIENT_SECRET', ''),

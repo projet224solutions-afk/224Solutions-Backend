@@ -12,6 +12,26 @@
 
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
+import {
+  generateAgoraRtcToken,
+  sanitizeAgoraChannel,
+  uuidToNumericUid,
+  AgoraRole,
+} from './agoraToken.js';
+
+/** Extrait le `sub` (userId) d'un JWT sans vérifier la signature (déjà vérifiée par verifyJWT en amont). */
+function subFromJwt(jwt: string): string | null {
+  try {
+    const payload = jwt.split('.')[1];
+    if (!payload) return null;
+    const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=');
+    const json = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return typeof json?.sub === 'string' ? json.sub : null;
+  } catch {
+    return null;
+  }
+}
 
 export type LiveProvider = 'agora' | 'livekit';
 export type LiveTokenRole = 'host' | 'audience';
@@ -46,6 +66,27 @@ export async function issueLiveToken(
 
     case 'agora':
     default: {
+      // ── Chemin CANONIQUE : génération NATIVE Node quand le certificat est en env. ──
+      // Le certificat Agora vit dans le backend (source de vérité), on signe ici : Agora
+      // accepte le token au join. (L'edge Supabase signait avec un certificat périmé → rejet.)
+      const appId = env.AGORA_APP_ID;
+      const appCert = env.AGORA_APP_CERTIFICATE;
+      if (appId && appCert) {
+        const safeChannel = sanitizeAgoraChannel(channel);
+        const trimmed = typeof uid === 'string' ? uid.trim() : '';
+        const sub = subFromJwt(userJwt);
+        const uidStr =
+          trimmed.length > 0
+            ? trimmed.substring(0, 64)
+            : String(uuidToNumericUid(sub || '00000000-0000-0000-0000-000000000000'));
+        const expiresAt = Math.floor(Date.now() / 1000) + 86400; // 24 h, comme l'edge
+        const roleValue = role === 'host' ? AgoraRole.PUBLISHER : AgoraRole.SUBSCRIBER;
+        const token = generateAgoraRtcToken(appId, appCert, safeChannel, uidStr, roleValue, expiresAt);
+        return { provider: 'agora', token, channel: safeChannel, uid: uidStr, appId, expiresAt };
+      }
+
+      // ── Repli TRANSITOIRE : edge Supabase (si le certificat n'est pas encore en env). ──
+      logger.warn('[issueLiveToken] AGORA_APP_ID/CERTIFICATE absents du backend — repli sur l\'edge (certificat potentiellement périmé)');
       const supabaseUrl = env.SUPABASE_URL?.replace(/\/$/, '');
       if (!supabaseUrl) throw new Error('SUPABASE_URL manquant');
       const resp = await fetch(`${supabaseUrl}/functions/v1/agora-token`, {

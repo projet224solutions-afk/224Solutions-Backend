@@ -21,12 +21,19 @@ const num = (v: unknown): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // POST /api/v2/freight/quote — calcule un devis (aérien ou maritime) via la RPC serveur.
 router.post('/quote', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const b = req.body ?? {};
     // Le transitaire teste ses propres grilles par défaut ; un transitaire_id explicite
     // (devis chez un autre transitaire) reste possible pour un usage futur côté client.
+    // transitaire_id explicite (devis chez un autre transitaire) : valider le format UUID
+    // AVANT la RPC — sinon PostgREST renvoie une erreur uuid brute → 500 générique.
+    if (b.transitaire_id != null && b.transitaire_id !== '' && !UUID_RE.test(String(b.transitaire_id))) {
+      return fail(res, 400, 'Transitaire invalide', 'INVALID_TRANSITAIRE');
+    }
     const transitaireId: string = b.transitaire_id || req.user!.id;
     const mode: string = b.mode;
     const origin: string = b.origin;

@@ -220,7 +220,11 @@ router.get('/:id/contact', verifyJWT, async (req: AuthenticatedRequest, res: Res
           target_type: 'user',
           target_id: targetId,
         });
-      } catch { /* audit_logs peut ne pas exister — ne jamais bloquer le contact */ }
+      } catch (e: any) {
+        // Non bloquant (ne jamais bloquer le contact), mais l'échec d'une trace RGPD
+        // doit remonter en log serveur — jamais avalé silencieusement.
+        logger.warn(`[profiles/contact] audit insert failed: ${e?.message || e}`);
+      }
     }
 
     const p = profile as any;
@@ -298,12 +302,18 @@ async function resolveExactUserId(identifier: string): Promise<string | null> {
     if (data?.id) return data.id;
   }
 
-  // public_id / custom_id exact sur profiles
-  const { data: byCode } = await supabaseAdmin
-    .from('profiles').select('id')
-    .or(`public_id.eq.${upper},custom_id.eq.${upper}`)
-    .limit(1).maybeSingle();
-  if (byCode?.id) return byCode.id;
+  // public_id / custom_id exact sur profiles.
+  // 🔒 Anti-injection PostgREST : on ne compose JAMAIS un filtre .or() avec l'entrée brute
+  // (une virgule/point/parenthèse injecterait des conditions). Allowlist STRICT du code +
+  // deux .eq() paramétrés (les valeurs .eq sont échappées par le client Supabase).
+  if (/^[A-Za-z0-9_-]{1,32}$/.test(upper)) {
+    const { data: byPublicId } = await supabaseAdmin
+      .from('profiles').select('id').eq('public_id', upper).limit(1).maybeSingle();
+    if (byPublicId?.id) return byPublicId.id;
+    const { data: byCustomId } = await supabaseAdmin
+      .from('profiles').select('id').eq('custom_id', upper).limit(1).maybeSingle();
+    if (byCustomId?.id) return byCustomId.id;
+  }
 
   // email exact
   if (raw.includes('@')) {

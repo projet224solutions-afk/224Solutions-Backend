@@ -17,6 +17,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { creditWallet } from '../services/wallet.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
+import { paymentRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
@@ -301,7 +302,7 @@ router.post('/resolve', async (req: Request, res: Response) => {
 // Migré depuis process-payment-link Edge Function
 // ─────────────────────────────────────────────────────────
 
-router.post('/process', optionalJWT, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/process', paymentRateLimit, optionalJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.id || null;
     const {

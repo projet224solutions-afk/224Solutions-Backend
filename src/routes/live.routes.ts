@@ -12,6 +12,7 @@ import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { issueLiveToken, currentLiveProvider } from '../services/liveToken.service.js';
+import { uuidToNumericUid } from '../services/agoraToken.js';
 import { getBucketName, loadServiceAccount, generateSignedUrl } from '../services/gcs.service.js';
 
 const router = Router();
@@ -636,6 +637,150 @@ router.get('/my-streams', verifyJWT, async (req: AuthenticatedRequest, res: Resp
     return ok(res, { streams, totals });
   } catch (e: any) {
     logger.error(`[live/my-streams] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// CO-HOST / multi-diffuseur. Autorisation : acteur passé EXPLICITEMENT aux RPC
+// (service_role → auth.uid()=NULL) + re-vérif applicative dans la route.
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /streams/:id/cohosts (host) — invite un vendeur à co-diffuser.
+router.post('/streams/:id/cohosts', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const { cohost_vendor_id } = req.body || {};
+    if (!UUID_RE.test(streamId) || !UUID_RE.test(String(cohost_vendor_id || ''))) {
+      return fail(res, 400, 'Paramètres invalides');
+    }
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('id, vendor_user_id, status').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const { data, error } = await supabaseAdmin.rpc('invite_live_cohost', {
+      p_stream_id: streamId, p_cohost_vendor_id: cohost_vendor_id, p_actor_user_id: userId,
+    });
+    if (error) return fail(res, 400, error.message);
+    const cohostUserId = (data as any)?.cohost_user_id;
+    const cohostId = (data as any)?.cohost_id;
+
+    // Notification durable au co-hôte (deeplink dans metadata, pas de colonne dédiée).
+    if (cohostUserId) {
+      await supabaseAdmin.from('notifications').insert({
+        user_id: cohostUserId,
+        title: 'Invitation à co-animer un live',
+        message: 'Un vendeur vous invite à diffuser en direct avec lui.',
+        type: 'live_cohost',
+        read: false,
+        metadata: { entity_type: 'live_cohost', cohost_id: cohostId, stream_id: streamId },
+      });
+    }
+    return ok(res, { cohostId });
+  } catch (e: any) {
+    logger.error(`[live/cohost-invite] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /cohosts/:cohostId/respond (co-hôte) — accepte/refuse SON invitation.
+router.post('/cohosts/:cohostId/respond', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const cohostId = req.params.cohostId;
+    if (!UUID_RE.test(cohostId)) return fail(res, 400, 'id invalide');
+    const accept = req.body?.accept === true;
+    const { data, error } = await supabaseAdmin.rpc('respond_live_cohost', {
+      p_cohost_id: cohostId, p_accept: accept, p_actor_user_id: req.user!.id,
+    });
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[live/cohost-respond] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /cohosts/:cohostId/leave (co-hôte OU host) — fin de participation.
+router.post('/cohosts/:cohostId/leave', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const cohostId = req.params.cohostId;
+    if (!UUID_RE.test(cohostId)) return fail(res, 400, 'id invalide');
+    const { data, error } = await supabaseAdmin.rpc('end_live_cohost', {
+      p_cohost_id: cohostId, p_actor_user_id: req.user!.id,
+    });
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[live/cohost-leave] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /streams/:id/cohost-token (co-hôte accepté) — token HOST (publisher) pour le
+// MÊME channel, avec un uid DISTINCT de l'hôte (garde anti-collision de hash).
+router.post('/streams/:id/cohost-token', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('id, status, channel, vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).status !== 'live') return fail(res, 409, 'Le live n\'est pas en cours');
+
+    // L'appelant doit être un co-hôte ACCEPTÉ de ce live.
+    const { data: cohost } = await supabaseAdmin
+      .from('live_cohosts').select('id, status')
+      .eq('live_stream_id', streamId).eq('cohost_user_id', userId).maybeSingle();
+    if (!cohost || !['accepted', 'live'].includes((cohost as any).status)) {
+      return fail(res, 403, 'Invitation non acceptée');
+    }
+
+    const { error: rpcErr } = await supabaseAdmin.rpc('mark_cohost_live', {
+      p_stream_id: streamId, p_actor_user_id: userId,
+    });
+    if (rpcErr) return fail(res, 400, rpcErr.message);
+
+    // Garde anti-collision d'uid (hash %2147483647) : deux PUBLISHERS avec le même uid
+    // casseraient le channel Agora. Si collision avec l'hôte → décalage explicite.
+    const hostUid = uuidToNumericUid((stream as any).vendor_user_id);
+    let cohostUid = uuidToNumericUid(userId);
+    if (cohostUid === hostUid) cohostUid = hostUid === 2147483646 ? hostUid - 1 : hostUid + 1;
+
+    const provider = currentLiveProvider();
+    const issued = await issueLiveToken(provider, (stream as any).channel, 'host', String(cohostUid), bearer(req));
+    return ok(res, { token: issued.token, channel: issued.channel, provider, uid: issued.uid, appId: issued.appId, hostUid: String(hostUid) });
+  } catch (e: any) {
+    logger.error(`[live/cohost-token] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// GET /streams/:id/cohosts (public) — co-hôtes EN DIRECT (uid + nom, jamais l'uuid brut).
+router.get('/streams/:id/cohosts', async (req, res: Response) => {
+  try {
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    const hostUid = stream ? String(uuidToNumericUid((stream as any).vendor_user_id)) : null;
+
+    const { data, error } = await supabaseAdmin
+      .from('live_cohosts')
+      .select('cohost_user_id, cohost_vendor_id, status, vendors:cohost_vendor_id(business_name)')
+      .eq('live_stream_id', streamId).eq('status', 'live');
+    if (error) return fail(res, 400, error.message);
+    const cohosts = (data || []).map((c: any) => ({
+      uid: String(uuidToNumericUid(c.cohost_user_id)),
+      vendorId: c.cohost_vendor_id,
+      vendorName: c.vendors?.business_name || null,
+    }));
+    return ok(res, { hostUid, cohosts });
+  } catch (e: any) {
+    logger.error(`[live/cohosts] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

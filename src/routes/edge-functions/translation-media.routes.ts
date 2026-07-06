@@ -1,19 +1,9 @@
 import { Router, Request, Response } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { logger } from '../../config/logger.js';
+import { aiTranslate } from '../../services/aiTranslate.service.js';
 
 const router = Router();
-
-// Noms de langues pour des traductions de meilleure qualité (codes ISO les plus courants)
-const LANGUAGE_NAMES: Record<string, string> = {
-  fr: "French", en: "English", es: "Spanish", pt: "Portuguese", de: "German",
-  it: "Italian", nl: "Dutch", pl: "Polish", ru: "Russian", uk: "Ukrainian",
-  tr: "Turkish", ar: "Arabic", zh: "Chinese (Simplified)", ja: "Japanese",
-  ko: "Korean", hi: "Hindi", bn: "Bengali", vi: "Vietnamese", th: "Thai",
-  id: "Indonesian", sw: "Swahili", he: "Hebrew", fa: "Persian (Farsi)",
-  wo: "Wolof", ff: "Pulaar/Fulani", su: "Susu (Soussou)", ha: "Hausa",
-  yo: "Yoruba", ig: "Igbo", bm: "Bambara", ln: "Lingala", am: "Amharic",
-};
 
 /**
  * Détecte la langue source. `confident` = true seulement si un signal fort
@@ -38,51 +28,9 @@ function detectSourceLang(text: string): { lang: string; confident: boolean } {
   return { lang: "en", confident: false };
 }
 
-/** Traduit un texte via OpenAI (ou Lovable si configuré). Renvoie null en cas d'échec. */
+/** Traduit un texte : Anthropic (haiku) primaire → repli OpenAI, via aiTranslate (SANS Lovable). */
 async function translateText(content: string, sourceLanguage: string, targetLanguage: string, context = "general"): Promise<string | null> {
-  const apiKey = process.env.LOVABLE_API_KEY || process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-  const isLovable = !!process.env.LOVABLE_API_KEY;
-  const endpoint = isLovable ? "https://ai.gateway.lovable.dev/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
-  const model = isLovable ? "google/gemini-2.5-flash" : "gpt-4o-mini";
-  const tgt = LANGUAGE_NAMES[targetLanguage] || targetLanguage;
-  const src = LANGUAGE_NAMES[sourceLanguage] || sourceLanguage;
-
-  const sys = "You are a professional chat translator for the 224SOLUTIONS app (West African marketplace). Reply with ONLY the translation, no explanation, no quotes.";
-  const prompt = `Translate the following chat message from ${src} to ${tgt}.\nRULES: keep the exact meaning and tone; natural, fluent (not word-for-word); DO NOT translate proper nouns, amounts/currencies (e.g. 50000 GNF), phone numbers, reference codes/IDs; keep emojis as-is. Context: ${context}.\n\nMESSAGE:\n${content}\n\nTRANSLATION:`;
-
-  // Robustesse : l'API peut renvoyer 429 (rate limit) / 5xx transitoires — fréquent quand un
-  // gros job de traduction tourne en parallèle. On retente avec backoff au lieu d'abandonner
-  // (sinon le message retombe sur l'original → « ça ne traduit pas »).
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model, temperature: 0.3, max_tokens: 1000, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }] }),
-      });
-      if (res.ok) {
-        const data: any = await res.json();
-        return data.choices?.[0]?.message?.content?.trim() || null;
-      }
-      // 429 (rate limit) ou 5xx → transitoire : on attend et on retente.
-      if (res.status === 429 || res.status >= 500) {
-        const retryAfter = Number(res.headers.get("retry-after")) || 0;
-        const wait = retryAfter ? retryAfter * 1000 : 700 * Math.pow(2, attempt); // 0.7s,1.4s,2.8s…
-        logger.warn(`[translate-message] API ${res.status}, retry ${attempt + 1}/4 dans ${wait}ms`);
-        await sleep(wait);
-        continue;
-      }
-      // Erreur non transitoire (400/401…) → inutile de retenter.
-      logger.error("[translate-message] API", res.status, (await res.text()).slice(0, 200));
-      return null;
-    } catch (e: any) {
-      logger.error(`[translate-message] fetch error (tentative ${attempt + 1}):`, e?.message);
-      await sleep(700 * Math.pow(2, attempt));
-    }
-  }
-  return null;
+  return aiTranslate(content, sourceLanguage, targetLanguage, context);
 }
 
 // Mappe les noms de langue renvoyés par Whisper (verbose_json) vers des codes ISO.

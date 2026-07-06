@@ -55,8 +55,44 @@ async function getOwnedVendor(userId: string) {
 router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { media_url, media_type, thumbnail_url, caption, duration_ms } = req.body || {};
+    const { live_stream_id, media_url, media_type, thumbnail_url, caption, duration_ms } = req.body || {};
 
+    const vendor = await getOwnedVendor(userId);
+    if (!vendor) return fail(res, 403, 'Réservé aux vendeurs', 'VENDOR_REQUIRED');
+
+    // ── Chemin PRINCIPAL : partager un REPLAY en story ──────────────────────
+    // Le média est DÉRIVÉ du replay (côté serveur, source de vérité) après vérification
+    // que le live appartient au vendeur et possède bien un replay.
+    if (live_stream_id) {
+      if (!UUID_RE.test(String(live_stream_id))) return fail(res, 400, 'live_stream_id invalide');
+      const { data: live } = await supabaseAdmin
+        .from('live_streams')
+        .select('id, vendor_user_id, status, replay_url, thumbnail_url')
+        .eq('id', live_stream_id).maybeSingle();
+      const l = live as any;
+      if (!l) return fail(res, 404, 'Live introuvable');
+      if (l.vendor_user_id !== userId) return fail(res, 403, 'Réservé au propriétaire du live');
+      if (l.status !== 'ended' || !l.replay_url) return fail(res, 400, 'Ce live n\'a pas de replay');
+
+      const { data, error } = await supabaseAdmin
+        .from('vendor_stories')
+        .insert({
+          vendor_id: vendor.id,
+          vendor_user_id: userId,
+          live_stream_id: l.id,
+          media_url: l.replay_url,
+          media_type: 'video',
+          thumbnail_url: l.thumbnail_url || null,
+          caption: typeof caption === 'string' ? caption.slice(0, 300) : null,
+          duration_ms: null,
+          country_code: vendor.seller_country_code || vendor.country || null,
+        })
+        .select('id').maybeSingle();
+      if (error) return fail(res, 400, error.message);
+      return ok(res, { storyId: (data as any)?.id });
+    }
+
+    // ── Chemin SECONDAIRE : média libre (upload) ────────────────────────────
     if (media_type !== 'image' && media_type !== 'video') return fail(res, 400, 'media_type invalide');
     if (typeof media_url !== 'string' || !isAllowedMediaUrl(media_url)) {
       return fail(res, 400, 'media_url non autorisée');
@@ -64,9 +100,6 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     if (thumbnail_url != null && (typeof thumbnail_url !== 'string' || !isAllowedMediaUrl(thumbnail_url))) {
       return fail(res, 400, 'thumbnail_url non autorisée');
     }
-
-    const vendor = await getOwnedVendor(userId);
-    if (!vendor) return fail(res, 403, 'Réservé aux vendeurs', 'VENDOR_REQUIRED');
 
     // duration_ms borné côté serveur (valeur client non fiable).
     let dur: number | null = null;
@@ -138,13 +171,14 @@ router.get('/vendor/:vendorId', async (req, res: Response) => {
     if (!UUID_RE.test(vendorId)) return fail(res, 400, 'vendorId invalide');
     const { data, error } = await supabaseAdmin
       .from('vendor_stories')
-      .select('id, media_url, media_type, thumbnail_url, caption, duration_ms, created_at')
+      .select('id, live_stream_id, media_url, media_type, thumbnail_url, caption, duration_ms, created_at')
       .eq('vendor_id', vendorId)
       .gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: true }); // ordre chronologique pour la visionneuse
     if (error) return fail(res, 400, error.message);
     const stories = (data || []).map((s: any) => ({
-      id: s.id, mediaUrl: s.media_url, mediaType: s.media_type,
+      id: s.id, liveStreamId: s.live_stream_id || null,
+      mediaUrl: s.media_url, mediaType: s.media_type,
       thumbnailUrl: s.thumbnail_url, caption: s.caption,
       durationMs: s.duration_ms, createdAt: s.created_at,
     }));

@@ -12,7 +12,7 @@ import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { issueLiveToken, currentLiveProvider } from '../services/liveToken.service.js';
-import { getBucketName } from '../services/gcs.service.js';
+import { getBucketName, loadServiceAccount, generateSignedUrl } from '../services/gcs.service.js';
 
 const router = Router();
 
@@ -268,6 +268,7 @@ router.get('/streams/replays', async (req, res: Response) => {
   try {
     const country = typeof req.query.country === 'string' ? req.query.country : null;
     const before = typeof req.query.before === 'string' ? req.query.before : null;
+    const vendor = typeof req.query.vendor === 'string' && UUID_RE.test(req.query.vendor) ? req.query.vendor : null;
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '12'), 10) || 12, 1), 30);
     let q = supabaseAdmin
       .from('live_streams')
@@ -278,6 +279,7 @@ router.get('/streams/replays', async (req, res: Response) => {
       .order('ended_at', { ascending: false })
       .limit(limit);
     if (country) q = q.eq('country_code', country);
+    if (vendor) q = q.eq('vendor_id', vendor);
     if (before) q = q.lt('ended_at', before);
     const { data, error } = await q;
     if (error) return fail(res, 400, error.message);
@@ -331,6 +333,102 @@ router.get('/streams/counts', async (_req, res: Response) => {
   }
 });
 
+// ── GET /streams/:id/replay (public) — un replay pour la page dédiée ─────────
+router.get('/streams/:id/replay', async (req, res: Response) => {
+  try {
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const { data, error } = await supabaseAdmin
+      .from('live_streams')
+      .select('id, title, vendor_id, vendor_user_id, vendor_kind, country_code, thumbnail_url, replay_url, replay_expires_at, peak_viewer_count, total_likes, replay_views, started_at, ended_at, status, vendors(business_name, logo_url)')
+      .eq('id', streamId).maybeSingle();
+    if (error) return fail(res, 400, error.message);
+    const s = data as any;
+    if (!s || s.status !== 'ended' || !s.replay_url) return fail(res, 404, 'Replay indisponible');
+    if (s.replay_expires_at && new Date(s.replay_expires_at).getTime() <= Date.now()) {
+      return fail(res, 410, 'Replay expiré');
+    }
+    return ok(res, {
+      id: s.id, title: s.title, vendorId: s.vendor_id, vendorUserId: s.vendor_user_id,
+      vendorName: s.vendors?.business_name || null, vendorLogo: s.vendors?.logo_url || null,
+      vendorKind: s.vendor_kind, countryCode: s.country_code,
+      thumbnailUrl: s.thumbnail_url, replayUrl: s.replay_url, replayExpiresAt: s.replay_expires_at,
+      peakViewerCount: s.peak_viewer_count, totalLikes: s.total_likes ?? 0, replayViews: s.replay_views ?? 0,
+      durationSec: s.started_at && s.ended_at
+        ? Math.max(0, Math.round((new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 1000))
+        : null,
+      endedAt: s.ended_at,
+    });
+  } catch (e: any) {
+    logger.error(`[live/replay-get] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ── POST /streams/:id/replay-view (public) — +1 vue (débounce 1/session client) ─
+router.post('/streams/:id/replay-view', async (req, res: Response) => {
+  try {
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    await supabaseAdmin.rpc('increment_replay_view', { p_stream_id: streamId });
+    return ok(res, { recorded: true });
+  } catch (e: any) {
+    logger.error(`[live/replay-view] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+/** Admin/PDG ? (pour la modération des replays) */
+async function isAdminOrPdg(userId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
+  return ['admin', 'pdg', 'ceo'].includes(((data as any)?.role || '').toLowerCase());
+}
+
+// ── DELETE /streams/:id/replay — suppression du replay (propriétaire OU PDG) ─
+router.delete('/streams/:id/replay', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id, replay_url').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    const s = stream as any;
+    const isOwner = s.vendor_user_id === userId;
+    if (!isOwner && !(await isAdminOrPdg(userId))) return fail(res, 403, 'Non autorisé');
+
+    // Idempotent : si le replay est déjà vidé, on renvoie succès sans rien casser.
+    // 1) Purge best-effort du fichier GCS (le fichier orphelin ne bloque jamais l'opération).
+    if (s.replay_url) {
+      try {
+        const sa = loadServiceAccount();
+        const marker = `/${getBucketName()}/`;
+        const idx = s.replay_url.indexOf(marker);
+        const objectPath = idx >= 0 ? decodeURIComponent(s.replay_url.slice(idx + marker.length).split('?')[0]) : null;
+        if (sa && objectPath) {
+          const url = generateSignedUrl(sa, getBucketName(), objectPath, { method: 'DELETE', expiresInSeconds: 120 });
+          const r = await fetch(url, { method: 'DELETE' });
+          if (!(r.ok || r.status === 404)) logger.error(`[live/replay-delete] GCS ${streamId}: HTTP ${r.status}`);
+        }
+      } catch (e: any) { logger.error(`[live/replay-delete] GCS ${streamId}: ${e?.message}`); }
+    }
+
+    // 2) Retire les stories liées à ce replay (elles n'ont plus de cible).
+    await supabaseAdmin.from('vendor_stories').delete().eq('live_stream_id', streamId);
+
+    // 3) Vide le replay mais GARDE la ligne live_streams (stats : viewers, likes, ventes).
+    const { error } = await supabaseAdmin
+      .from('live_streams')
+      .update({ replay_url: null, replay_expires_at: null, thumbnail_url: null })
+      .eq('id', streamId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { deleted: true });
+  } catch (e: any) {
+    logger.error(`[live/replay-delete] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
 // ── POST /streams/:id/events — join/leave/purchase/reaction ─────────────────
 router.post('/streams/:id/events', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -364,6 +462,121 @@ router.post('/streams/:id/events', verifyJWT, async (req: AuthenticatedRequest, 
     return ok(res, { recorded: true, viewerCount, totalLikes });
   } catch (e: any) {
     logger.error(`[live/events] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// COMMENTAIRES DE REPLAY (persistants, modérés) — distinct du chat live éphémère.
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /streams/:id/comments (public) — commentaires visibles d'un replay.
+router.get('/streams/:id/comments', async (req, res: Response) => {
+  try {
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const { data, error } = await supabaseAdmin
+      .from('live_replay_comments')
+      .select('id, user_id, author_name, content, parent_id, is_vendor, created_at')
+      .eq('stream_id', streamId).eq('status', 'visible')
+      .order('created_at', { ascending: true }).limit(500);
+    if (error) return fail(res, 400, error.message);
+    const comments = (data || []).map((c: any) => ({
+      id: c.id, userId: c.user_id, authorName: c.author_name || null,
+      content: c.content, parentId: c.parent_id || null,
+      isVendor: c.is_vendor === true, createdAt: c.created_at,
+    }));
+    return ok(res, { comments });
+  } catch (e: any) {
+    logger.error(`[live/comments-get] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /streams/:id/comments (auth) — publie un commentaire (rate-limité 5/min).
+router.post('/streams/:id/comments', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const parentId = typeof req.body?.parent_id === 'string' && UUID_RE.test(req.body.parent_id) ? req.body.parent_id : null;
+    if (!content || content.length > 500) return fail(res, 400, 'Commentaire vide ou trop long');
+
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('id, vendor_user_id, status').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Replay introuvable');
+    const vendorUserId = (stream as any).vendor_user_id;
+
+    // Anti-spam : max 5 commentaires / 60 s / utilisateur.
+    const since = new Date(Date.now() - 60_000).toISOString();
+    const { count } = await supabaseAdmin
+      .from('live_replay_comments')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId).gt('created_at', since);
+    if ((count || 0) >= 5) return fail(res, 429, 'Trop de commentaires, réessayez dans un instant', 'RATE_LIMITED');
+
+    // Nom d'auteur dénormalisé (best-effort) + drapeau vendeur calculé serveur.
+    const { data: prof } = await supabaseAdmin
+      .from('profiles').select('first_name, last_name, full_name').eq('id', userId).maybeSingle();
+    const p = (prof || {}) as any;
+    const authorName = (p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '').trim() || null;
+    const isVendor = vendorUserId === userId;
+
+    const { data, error } = await supabaseAdmin
+      .from('live_replay_comments')
+      .insert({ stream_id: streamId, user_id: userId, author_name: authorName, content, parent_id: parentId, is_vendor: isVendor })
+      .select('id, user_id, author_name, content, parent_id, is_vendor, created_at').maybeSingle();
+    if (error) return fail(res, 400, error.message);
+
+    // Notifie le vendeur (in-app + email, JAMAIS SMS) — best-effort, non bloquant.
+    if (!isVendor && vendorUserId) {
+      await supabaseAdmin.from('notifications').insert({
+        user_id: vendorUserId,
+        title: 'Nouveau commentaire sur votre replay',
+        message: content.slice(0, 120),
+        type: 'replay_comment',
+        read: false,
+        metadata: { entity_type: 'live_replay', stream_id: streamId, comment_id: (data as any)?.id },
+      }).then(({ error: nErr }) => { if (nErr) logger.error(`[live/comments] notif: ${nErr.message}`); });
+    }
+
+    const c = data as any;
+    return ok(res, {
+      comment: { id: c.id, userId: c.user_id, authorName: c.author_name || null, content: c.content,
+        parentId: c.parent_id || null, isVendor: c.is_vendor === true, createdAt: c.created_at },
+    });
+  } catch (e: any) {
+    logger.error(`[live/comments-post] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// DELETE /comments/:id (auth) — auteur, vendeur du replay, ou PDG (soft delete).
+router.delete('/comments/:id', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const commentId = req.params.id;
+    if (!UUID_RE.test(commentId)) return fail(res, 400, 'id invalide');
+    const { data: comment } = await supabaseAdmin
+      .from('live_replay_comments').select('id, user_id, stream_id').eq('id', commentId).maybeSingle();
+    if (!comment) return fail(res, 404, 'Commentaire introuvable');
+    const cm = comment as any;
+
+    let allowed = cm.user_id === userId;
+    if (!allowed) {
+      const { data: stream } = await supabaseAdmin
+        .from('live_streams').select('vendor_user_id').eq('id', cm.stream_id).maybeSingle();
+      allowed = (stream as any)?.vendor_user_id === userId || await isAdminOrPdg(userId);
+    }
+    if (!allowed) return fail(res, 403, 'Non autorisé');
+
+    const { error } = await supabaseAdmin
+      .from('live_replay_comments').update({ status: 'removed' }).eq('id', commentId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { deleted: true });
+  } catch (e: any) {
+    logger.error(`[live/comments-delete] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

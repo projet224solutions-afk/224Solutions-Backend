@@ -822,4 +822,96 @@ router.post('/admin/change-currency', verifyJWT, async (req: AuthenticatedReques
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// SUIVRE UNE BOUTIQUE — /api/vendors/:id/follow, /me/following.
+// Le client gère SES suivis ; le fan-out des notifs est géré par des triggers DB.
+// ════════════════════════════════════════════════════════════════════════════
+const FOLLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** POST /api/vendors/:id/follow — suit/désuit la boutique (idempotent). */
+router.post('/:id/follow', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const { data, error } = await supabaseAdmin.rpc('toggle_follow_vendor', {
+      p_vendor_id: vendorId, p_actor_user_id: userId,
+    });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    const d = data as any;
+    res.json({ success: true, data: { following: d?.following === true, followersCount: d?.followers_count ?? 0 } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** GET /api/vendors/:id/follow-status — état de suivi du user courant + compteur. */
+router.get('/:id/follow-status', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const [{ data: follow }, { data: vendor }] = await Promise.all([
+      supabaseAdmin.from('vendor_followers').select('notify_products, notify_lives')
+        .eq('vendor_id', vendorId).eq('user_id', userId).maybeSingle(),
+      supabaseAdmin.from('vendors').select('followers_count').eq('id', vendorId).maybeSingle(),
+    ]);
+    res.json({ success: true, data: {
+      following: !!follow,
+      notifyProducts: (follow as any)?.notify_products ?? true,
+      notifyLives: (follow as any)?.notify_lives ?? true,
+      followersCount: (vendor as any)?.followers_count ?? 0,
+    } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow-status] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** PATCH /api/vendors/:id/follow-settings — règle notif produits/lives séparément. */
+router.patch('/:id/follow-settings', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const patch: Record<string, boolean> = {};
+    if (typeof req.body?.notify_products === 'boolean') patch.notify_products = req.body.notify_products;
+    if (typeof req.body?.notify_lives === 'boolean') patch.notify_lives = req.body.notify_lives;
+    if (Object.keys(patch).length === 0) { res.status(400).json({ success: false, error: 'Aucun réglage' }); return; }
+    const { error } = await supabaseAdmin.from('vendor_followers')
+      .update(patch).eq('vendor_id', vendorId).eq('user_id', userId);
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, data: { updated: true } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow-settings] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** GET /api/vendors/me/following — les boutiques suivies par le user courant. */
+router.get('/me/following', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { data, error } = await supabaseAdmin
+      .from('vendor_followers')
+      .select('vendor_id, notify_products, notify_lives, created_at, vendors(id, business_name, logo_url, shop_slug, followers_count)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    const shops = (data || []).map((r: any) => ({
+      vendorId: r.vendor_id,
+      name: r.vendors?.business_name || null,
+      logoUrl: r.vendors?.logo_url || null,
+      slug: r.vendors?.shop_slug || null,
+      followersCount: r.vendors?.followers_count ?? 0,
+      notifyProducts: r.notify_products, notifyLives: r.notify_lives,
+    }));
+    res.json({ success: true, data: { shops } });
+  } catch (e: any) {
+    logger.error(`[vendor-following] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
 export default router;

@@ -229,7 +229,7 @@ router.get('/streams/live', async (req, res: Response) => {
     const country = typeof req.query.country === 'string' ? req.query.country : null;
     let q = supabaseAdmin
       .from('live_streams')
-      .select('id, title, vendor_id, vendor_kind, country_code, channel, thumbnail_url, viewer_count, started_at, vendors(business_name)')
+      .select('id, title, vendor_id, vendor_kind, country_code, channel, thumbnail_url, viewer_count, total_likes, started_at, vendors(business_name)')
       .eq('status', 'live')
       .order('viewer_count', { ascending: false })
       .limit(50);
@@ -253,6 +253,7 @@ router.get('/streams/live', async (req, res: Response) => {
       vendorName: s.vendors?.business_name || null,
       vendorKind: s.vendor_kind, countryCode: s.country_code,
       thumbnailUrl: s.thumbnail_url, viewerCount: s.viewer_count,
+      totalLikes: s.total_likes ?? 0,
       startedAt: s.started_at, pinnedProductId: pinnedByStream[s.id] || null,
     }));
     return ok(res, { streams });
@@ -270,7 +271,7 @@ router.get('/streams/replays', async (req, res: Response) => {
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '12'), 10) || 12, 1), 30);
     let q = supabaseAdmin
       .from('live_streams')
-      .select('id, title, vendor_id, vendor_kind, country_code, thumbnail_url, replay_url, replay_expires_at, peak_viewer_count, started_at, ended_at, vendors(business_name)')
+      .select('id, title, vendor_id, vendor_kind, country_code, thumbnail_url, replay_url, replay_expires_at, peak_viewer_count, total_likes, started_at, ended_at, vendors(business_name)')
       .eq('status', 'ended')
       .not('replay_url', 'is', null)
       .gt('replay_expires_at', new Date().toISOString())
@@ -287,6 +288,7 @@ router.get('/streams/replays', async (req, res: Response) => {
       vendorKind: s.vendor_kind, countryCode: s.country_code,
       thumbnailUrl: s.thumbnail_url, replayUrl: s.replay_url,
       replayExpiresAt: s.replay_expires_at, peakViewerCount: s.peak_viewer_count,
+      totalLikes: s.total_likes ?? 0,
       durationSec: s.started_at && s.ended_at
         ? Math.max(0, Math.round((new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 1000))
         : null,
@@ -350,7 +352,16 @@ router.post('/streams/:id/events', verifyJWT, async (req: AuthenticatedRequest, 
       });
       viewerCount = (data as any)?.viewer_count;
     }
-    return ok(res, { recorded: true, viewerCount });
+
+    // Réaction coeur : le trigger DB a déjà incrémenté total_likes atomiquement,
+    // on relit le vrai total pour que le tap du spectateur reflète l'état serveur.
+    let totalLikes: number | undefined;
+    if (event_type === 'reaction') {
+      const { data } = await supabaseAdmin
+        .from('live_streams').select('total_likes').eq('id', streamId).maybeSingle();
+      totalLikes = (data as any)?.total_likes;
+    }
+    return ok(res, { recorded: true, viewerCount, totalLikes });
   } catch (e: any) {
     logger.error(`[live/events] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');

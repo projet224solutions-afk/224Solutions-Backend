@@ -223,6 +223,28 @@ router.post('/streams/:id/products', verifyJWT, async (req: AuthenticatedRequest
   }
 });
 
+// ── DELETE /streams/:id/products/:productId (host) — retire un produit du live ─
+router.delete('/streams/:id/products/:productId', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const productId = req.params.productId;
+    if (!UUID_RE.test(streamId) || !UUID_RE.test(productId)) return fail(res, 400, 'params invalides');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+    const { error } = await supabaseAdmin
+      .from('live_stream_products').delete()
+      .eq('live_stream_id', streamId).eq('product_id', productId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { removed: true });
+  } catch (e: any) {
+    logger.error(`[live/products-delete] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
 // ── GET /streams/live (public) — lives en cours ─────────────────────────────
 router.get('/streams/live', async (req, res: Response) => {
   try {
@@ -577,6 +599,43 @@ router.delete('/comments/:id', verifyJWT, async (req: AuthenticatedRequest, res:
     return ok(res, { deleted: true });
   } catch (e: any) {
     logger.error(`[live/comments-delete] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ── GET /streams/my-streams (vendeur) — SES lives/replays + agrégats (une requête) ─
+router.get('/my-streams', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 50);
+    const offset = Math.max(parseInt(String(req.query.offset || '0'), 10) || 0, 0);
+
+    const [{ data: rows, error: e1 }, { data: totalsRows, error: e2 }] = await Promise.all([
+      supabaseAdmin.rpc('get_vendor_live_streams', { p_vendor_user_id: userId, p_limit: limit, p_offset: offset }),
+      supabaseAdmin.rpc('get_vendor_live_totals', { p_vendor_user_id: userId }),
+    ]);
+    if (e1) return fail(res, 400, e1.message);
+    if (e2) return fail(res, 400, e2.message);
+
+    const streams = ((rows as any[]) || []).map((s) => ({
+      id: s.id, title: s.title, status: s.status,
+      thumbnailUrl: s.thumbnail_url, replayUrl: s.replay_url, replayExpiresAt: s.replay_expires_at,
+      totalLikes: s.total_likes ?? 0, replayViews: s.replay_views ?? 0,
+      viewerCount: s.viewer_count ?? 0, peakViewerCount: s.peak_viewer_count ?? 0,
+      commentsCount: Number(s.comments_count) || 0, purchasesCount: Number(s.purchases_count) || 0,
+      startedAt: s.started_at, endedAt: s.ended_at, createdAt: s.created_at,
+    }));
+    const t = ((totalsRows as any[]) || [])[0] || {};
+    const totals = {
+      streamsCount: Number(t.streams_count) || 0,
+      totalLikes: Number(t.total_likes) || 0,
+      totalReplayViews: Number(t.total_replay_views) || 0,
+      totalComments: Number(t.total_comments) || 0,
+      totalPurchases: Number(t.total_purchases) || 0,
+    };
+    return ok(res, { streams, totals });
+  } catch (e: any) {
+    logger.error(`[live/my-streams] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

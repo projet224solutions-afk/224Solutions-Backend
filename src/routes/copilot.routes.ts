@@ -93,22 +93,82 @@ async function dynamicAppKnowledge(): Promise<string> {
   } catch { return ''; }
 }
 
-// Capacité #8 — recherche INTERNET sans clé : DuckDuckGo Instant Answer puis Wikipedia FR.
-async function webSearch(query: string): Promise<string> {
-  const clip = (s: string) => String(s || '').slice(0, 800);
+// Capacité #8 — VRAIE recherche web renvoyant des RÉSULTATS STRUCTURÉS avec URLs.
+// Priorité : Brave/Tavily si WEB_SEARCH_API_KEY présent (résultats réels + liens) ; sinon
+// repli honnête DuckDuckGo (RelatedTopics ont FirstURL) + Wikipedia (avec URL de page).
+export interface WebResult { title: string; url: string; snippet: string; }
+
+async function webSearchStructured(query: string): Promise<WebResult[]> {
+  const q = String(query || '').trim().slice(0, 200);
+  if (q.length < 2) return [];
+  const key = process.env.WEB_SEARCH_API_KEY;
+  const provider = (process.env.WEB_SEARCH_PROVIDER || 'brave').toLowerCase();
+
+  if (key && provider === 'brave') {
+    try {
+      const r = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=5`, {
+        headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
+      });
+      if (r.ok) {
+        const d: any = await r.json();
+        const out = (d?.web?.results || []).slice(0, 5).map((it: any) => ({
+          title: String(it.title || '').slice(0, 160), url: String(it.url || ''),
+          snippet: String(it.description || '').replace(/<[^>]+>/g, '').slice(0, 300),
+        })).filter((x: WebResult) => x.url);
+        if (out.length) return out;
+      } else { logger.warn(`[copilot] brave ${r.status}`); }
+    } catch (e: any) { logger.warn(`[copilot] brave err ${e?.message}`); }
+  }
+  if (key && provider === 'tavily') {
+    try {
+      const r = await fetch('https://api.tavily.com/search', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: key, query: q, max_results: 5 }),
+      });
+      if (r.ok) {
+        const d: any = await r.json();
+        const out = (d.results || []).slice(0, 5).map((it: any) => ({
+          title: String(it.title || '').slice(0, 160), url: String(it.url || ''), snippet: String(it.content || '').slice(0, 300),
+        })).filter((x: WebResult) => x.url);
+        if (out.length) return out;
+      }
+    } catch (e: any) { logger.warn(`[copilot] tavily err ${e?.message}`); }
+  }
+
+  // Repli sans clé (info sommaire, mais avec de VRAIS liens quand disponibles).
+  const results: WebResult[] = [];
   try {
-    const r = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+    const r = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`);
     if (r.ok) {
       const d: any = await r.json();
-      const txt = d.AbstractText || d.Answer || d.Definition || (Array.isArray(d.RelatedTopics) ? d.RelatedTopics[0]?.Text : '');
-      if (txt) return clip(txt);
+      if (d.AbstractText && d.AbstractURL) results.push({ title: String(d.Heading || q).slice(0, 160), url: d.AbstractURL, snippet: String(d.AbstractText).slice(0, 300) });
+      for (const t of (Array.isArray(d.RelatedTopics) ? d.RelatedTopics : [])) {
+        if (results.length >= 5) break;
+        if (t?.FirstURL && t?.Text) results.push({ title: String(t.Text).slice(0, 120), url: t.FirstURL, snippet: String(t.Text).slice(0, 300) });
+      }
     }
   } catch { /* ignore */ }
-  try {
-    const w = await fetch(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query.replace(/^.*\b(quoi|qui|que)\b\s*(est|sont)?\s*/i, '').trim())}`);
-    if (w.ok) { const d: any = await w.json(); if (d.extract) return clip(d.extract); }
-  } catch { /* ignore */ }
-  return '';
+  if (results.length < 3) {
+    try {
+      const term = q.replace(/^.*\b(quoi|qui|que)\b\s*(est|sont)?\s*/i, '').trim() || q;
+      const w = await fetch(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(term)}`);
+      if (w.ok) {
+        const d: any = await w.json();
+        if (d.extract && d.content_urls?.desktop?.page) results.push({ title: String(d.title || term).slice(0, 160), url: d.content_urls.desktop.page, snippet: String(d.extract).slice(0, 300) });
+      }
+    } catch { /* ignore */ }
+  }
+  return results.slice(0, 5);
+}
+
+// Rate-limit recherche web par utilisateur : 10 recherches / 10 min (mémoire process).
+const _searchHits = new Map<string, number[]>();
+function allowWebSearch(userId: string): boolean {
+  const now = Date.now(), win = 10 * 60 * 1000, max = 10;
+  const arr = (_searchHits.get(userId) || []).filter((t) => now - t < win);
+  if (arr.length >= max) { _searchHits.set(userId, arr); return false; }
+  arr.push(now); _searchHits.set(userId, arr);
+  return true;
 }
 
 // PART 2 — mémoires STRUCTURÉES. Extraction heuristique (sans clé IA) : préférences/faits.
@@ -212,10 +272,18 @@ async function callOpenAILike(key: string, isLovable: boolean, sys: string, chat
 async function runProductSearch(q: string): Promise<any[]> {
   const query = String(q || '').trim();
   if (query.length < 2) return [];
-  const safe = query.replace(/[%_\\]/g, '\\$&'); // échappe les wildcards ILIKE (sinon '%' matche tout)
+  // Multi-mots-clés : on nettoie chaque mot (échappe les wildcards ILIKE) puis OR ilike →
+  // tolère l'ordre des mots (« sneakers nike rouge » matche « Nike sneakers rouges »).
+  const words = query.split(/\s+/).map((w) => w.replace(/[%_\\,().]/g, '')).filter((w) => w.length >= 2).slice(0, 4);
   try {
-    const { data } = await supabaseAdmin.from('products')
-      .select('id, name, price, images').eq('is_active', true).ilike('name', `%${safe}%`).limit(6);
+    let builder = supabaseAdmin.from('products').select('id, name, price, images').eq('is_active', true);
+    if (words.length > 1) {
+      builder = builder.or(words.map((w) => `name.ilike.%${w}%`).join(','));
+    } else {
+      const safe = (words[0] || query).replace(/[%_\\]/g, '\\$&');
+      builder = builder.ilike('name', `%${safe}%`);
+    }
+    const { data } = await builder.limit(6);
     return (data || []).map((p: any) => ({
       id: p.id, name: p.name, price: Number(p.price) || 0,
       image: Array.isArray(p.images) ? p.images[0] : null,
@@ -230,6 +298,11 @@ const COPILOT_TOOLS = [
     name: 'search_products',
     description: "Recherche des produits dans le marketplace 224Solutions par mot-clé. À utiliser dès que l'utilisateur veut trouver/acheter un produit, pour proposer des résultats réels.",
     input_schema: { type: 'object', properties: { query: { type: 'string', description: 'mots-clés du produit recherché' } }, required: ['query'] },
+  },
+  {
+    name: 'search_web',
+    description: "Recherche sur INTERNET (le web) et renvoie de vrais résultats avec des URLs sources. À utiliser pour toute question d'actualité, de prix de référence, de définition, d'information hors du marketplace 224Solutions. Cite TOUJOURS les sources (URLs) que tu utilises ; n'invente jamais d'URL.",
+    input_schema: { type: 'object', properties: { query: { type: 'string', description: 'la requête de recherche web' } }, required: ['query'] },
   },
   {
     name: 'propose_order',
@@ -294,22 +367,58 @@ function buildProposedAction(name: string, input: any): any | null {
   return null;
 }
 
-// Boucle d'outils Anthropic (max 4 tours). Exécute search_products côté serveur, collecte les
-// propose_* comme cartes de confirmation. Renvoie texte + produits trouvés + actions proposées.
-async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools: any[]): Promise<{ text: string | null; products: any[]; actions: any[] }> {
+// Extrait les sources (URL + titre) des citations d'un bloc de texte (outil natif web_search).
+function collectCitations(content: any[], sources: { title: string; url: string }[]) {
+  for (const block of content) {
+    if (block?.type !== 'text' || !Array.isArray(block.citations)) continue;
+    for (const c of block.citations) {
+      const url = c?.url; if (!url) continue;
+      if (!sources.some((s) => s.url === url)) sources.push({ title: String(c.title || url).slice(0, 160), url });
+    }
+  }
+}
+
+// Boucle d'outils Anthropic (max 5 tours). Exécute search_products + search_web côté serveur,
+// collecte les propose_* comme cartes de confirmation et les sources web. Renvoie texte +
+// produits + actions + sources. `useNativeWebSearch` ajoute l'outil natif Anthropic (flag env) ;
+// s'il est refusé (400), l'appelant réessaie sans lui (on garde search_web serveur en repli).
+async function callAnthropicAgentic(
+  key: string, sys: string, chat: any[], tools: any[], userId: string, useNativeWebSearch: boolean,
+): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; nativeRejected?: boolean }> {
   const messages: any[] = chat.map(toAnthropicMsg);
   const products: any[] = [];
   const actions: any[] = [];
+  const sources: { title: string; url: string }[] = [];
+  const effectiveTools = useNativeWebSearch
+    ? [...tools, { type: 'web_search_20250305', name: 'web_search', max_uses: 3 }]
+    : tools;
   try {
-    for (let turn = 0; turn < 4; turn++) {
+    for (let turn = 0; turn < 5; turn++) {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 800, system: sys, tools, messages }),
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 900, system: sys, tools: effectiveTools, messages }),
       });
-      if (!r.ok) { logger.warn(`[copilot] anthropic(tools) ${r.status}`); return { text: null, products, actions }; }
+      if (!r.ok) {
+        // Outil natif non supporté par le compte → signaler pour réessai sans lui.
+        if (useNativeWebSearch && turn === 0 && (r.status === 400 || r.status === 404)) {
+          logger.warn(`[copilot] web_search natif refusé (${r.status}) → repli search_web serveur`);
+          return { text: null, products, actions, sources, nativeRejected: true };
+        }
+        logger.warn(`[copilot] anthropic(tools) ${r.status}`);
+        return { text: null, products, actions, sources };
+      }
       const data: any = await r.json();
       const content: any[] = Array.isArray(data.content) ? data.content : [];
+      collectCitations(content, sources); // outil natif : citations sur les blocs texte
+
+      // Outil natif web_search : Anthropic exécute la recherche côté serveur et met pause_turn.
+      // On renvoie le contenu tel quel pour poursuivre (aucun tool_result à fabriquer).
+      if (data.stop_reason === 'pause_turn') {
+        messages.push({ role: 'assistant', content });
+        continue;
+      }
+
       if (data.stop_reason === 'tool_use') {
         messages.push({ role: 'assistant', content });
         const toolResults: any[] = [];
@@ -320,6 +429,15 @@ async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools
             for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
             toolResults.push({ type: 'tool_result', tool_use_id: block.id,
               content: found.length ? found.map((p) => `${p.name} — ${p.price} (id:${p.id})`).join('\n') : 'Aucun produit trouvé.' });
+          } else if (block.name === 'search_web') {
+            if (!allowWebSearch(userId)) {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Limite de recherches web atteinte (10 / 10 min). Réessaie plus tard.' });
+            } else {
+              const web = await webSearchStructured(block.input?.query || '');
+              for (const w of web) if (!sources.some((s) => s.url === w.url)) sources.push({ title: w.title, url: w.url });
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id,
+                content: web.length ? web.map((w, i) => `[${i + 1}] ${w.title}\n${w.url}\n${w.snippet}`).join('\n\n') : 'Aucun résultat web trouvé.' });
+            }
           } else if (block.name === 'propose_order' || block.name === 'propose_booking' || block.name === 'propose_fix') {
             const a = buildProposedAction(block.name, block.input);
             if (a) actions.push(a);
@@ -336,18 +454,18 @@ async function callAnthropicAgentic(key: string, sys: string, chat: any[], tools
               content: filtered.length
                 ? filtered.slice(0, 15).map((i: any) => `id:${i.id} | ${i.module}/${i.alert_key} | ${i.severity} | ${i.remediation_kind || '?'} | action:${i.final_action || '?'} | ${i.title}`).join('\n')
                 : 'Aucun incident ouvert' + (domain ? ` pour le domaine « ${domain} ».` : '.') });
-          } else {
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Outil inconnu.' });
           }
+          // Les blocs server_tool_use / web_search_tool_result (outil natif) sont gérés par
+          // Anthropic — on ne fabrique pas de tool_result pour eux.
         }
-        messages.push({ role: 'user', content: toolResults });
+        if (toolResults.length) messages.push({ role: 'user', content: toolResults });
         continue;
       }
       const txt = content.find((c: any) => c?.type === 'text')?.text?.trim() || null;
-      return { text: txt, products: products.slice(0, 6), actions };
+      return { text: txt, products: products.slice(0, 6), actions, sources: sources.slice(0, 6) };
     }
-    return { text: null, products: products.slice(0, 6), actions };
-  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions }; }
+    return { text: null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6) };
+  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, sources }; }
 }
 
 // Extraction de mémoire PAR CLAUDE (remplace l'heuristique quand la clé existe). Petit modèle
@@ -384,6 +502,32 @@ async function extractMemoriesLLM(userId: string, message: string, key: string) 
   } catch { /* best-effort */ }
 }
 
+// Garde-fou photo→marketplace : extrait 2-3 mots-clés PRODUIT de la description du modèle
+// (petit appel haiku, repli heuristique) pour une recherche produits forcée côté serveur.
+const _kwStop = new Set(['dans', 'avec', 'pour', 'cette', 'votre', 'marketplace', 'produit', 'produits', 'photo', 'image', 'trouve', 'marque', 'couleur', 'vois', 'semble', 'ressemble', 'peux', 'aider', 'aucun', 'aucune']);
+async function extractProductKeywords(text: string, anthropicKey?: string): Promise<string> {
+  if (anthropicKey) {
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 30,
+          system: "Extrait 2-3 mots-clés PRODUIT (type + marque/couleur si présents) de la description, séparés par des espaces, sans phrase ni ponctuation. Rien d'autre.",
+          messages: [{ role: 'user', content: text.slice(0, 500) }],
+        }),
+      });
+      if (r.ok) {
+        const d: any = await r.json();
+        const kw = (Array.isArray(d.content) ? d.content.find((c: any) => c.type === 'text')?.text : '')?.trim();
+        if (kw) return kw.replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+      }
+    } catch { /* repli heuristique */ }
+  }
+  const words = (text.match(/[A-Za-zÀ-ÿ]{4,}/g) || []).filter((w) => !_kwStop.has(w.toLowerCase()));
+  return words.slice(0, 3).join(' ');
+}
+
 router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const service = String(req.body?.service ?? '').toLowerCase();
@@ -407,7 +551,8 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     }
     const hasImage = !!imageBlock;
     const userId = req.user!.id;
-    if (!message) { fail(res, 400, 'message requis'); return; }
+    // Message texte OU photo requis (une photo seule doit lancer l'analyse + recherche produits).
+    if (!message && !hasImage) { fail(res, 400, 'message requis'); return; }
 
     // Contexte utilisateur temps réel (Phase 1, optionnel) — injecté dans le system prompt.
     const ctxLine = context ? [
@@ -421,7 +566,12 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     // #7 (auto-learn) + #8 (web sans clé) — calculés en amont pour servir aussi le repli.
     const wantsGuide = /(comment|o[uù]\b|aide|guide|naviguer|trouver|faire|utiliser|fonctionne)/i.test(message);
     const wantsWeb = /(qu'est|c'est quoi|c est quoi|explique|d[ée]finition|qui est|capitale|population|sur internet|cherche.*internet|actualit|m[ée]t[ée]o)/i.test(message);
-    const web = wantsWeb ? await webSearch(message) : '';
+    // Recherche web pour les providers SANS outils (Lovable/OpenAI) et le repli final.
+    // Anthropic, lui, appelle l'outil search_web tout seul → pas de double recherche.
+    const webResults = (wantsWeb && !process.env.ANTHROPIC_API_KEY) ? await webSearchStructured(message) : [];
+    const web = webResults.length
+      ? webResults.map((w, i) => `[${i + 1}] ${w.title} — ${w.url}\n${w.snippet}`).join('\n\n')
+      : '';
     const guide = wantsGuide ? (APP_GUIDE + await dynamicAppKnowledge()) : '';
     const memLine = await loadMemories(userId); // PART 2 — mémoires structurées de l'utilisateur
     // Extraction mémoire : par Claude si la clé existe (plus fine), sinon heuristique. Fire-and-forget.
@@ -457,12 +607,15 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
       + (guide ? `\n\n${guide}` : '')
       + (web ? `\n\nINFO TROUVÉE SUR INTERNET (à reformuler, cite que c'est une info web si pertinent) :\n${web}` : '')
       + pdgContext
-      + (hasImage ? "\n\n📷 L'utilisateur a joint une PHOTO à ce message : tu la VOIS. Identifie le produit/objet (nom, caractéristiques visibles), puis propose des correspondances sur le marketplace (utilise l'outil de recherche produits si disponible). INTERDIT de dire que tu ne peux pas voir les images." : '');
+      + (hasImage ? "\n\n📷 L'utilisateur a joint une PHOTO. Tu la VOIS (INTERDIT de dire le contraire). Procède en 3 ÉTAPES OBLIGATOIRES :\nÉtape 1 — identifie l'objet : type, marque si visible, couleur, caractéristiques.\nÉtape 2 — appelle OBLIGATOIREMENT l'outil search_products avec 2-3 mots-clés du produit identifié (réessaie avec des mots plus génériques si 0 résultat).\nÉtape 3 — présente les correspondances trouvées sur le marketplace ; s'il n'y en a AUCUNE, dis-le honnêtement et propose search_web pour des références de prix. Ne conclus jamais sans avoir appelé search_products." : '');
 
     // Messages de conversation (sans le rôle system — géré séparément pour Anthropic).
     // L'image ne concerne que le tour courant — jamais l'historique. Sans image, le dernier
     // message reste une string (format inchangé) ; avec image, il porte __image (mappé par provider).
-    const lastUserMsg: any = { role: 'user', content: message.slice(0, 2000) };
+    const lastUserMsg: any = {
+      role: 'user',
+      content: message.slice(0, 2000) || (hasImage ? 'Analyse cette photo et trouve des produits correspondants sur le marketplace.' : ''),
+    };
     if (hasImage) lastUserMsg.__image = imageBlock;
     const chat = [
       ...history.filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
@@ -475,15 +628,33 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     let provider = '';
     let products: any[] = [];
     let actions: any[] = [];
+    // Sources web (URLs citables) : seed = repli non-Anthropic ; sinon fournies par l'outil.
+    let sources: { title: string; url: string }[] = webResults.map((w) => ({ title: w.title, url: w.url }));
     const tools = pdgMode ? PDG_TOOLS : COPILOT_TOOLS;
 
     if (anthropicKey) {
-      const out = await callAnthropicAgentic(anthropicKey, sys, chat, tools);
+      // Outil natif web_search Anthropic derrière un flag (à activer après vérif d'accès réel
+      // du compte) ; sinon l'outil serveur search_web fait la recherche. Repli auto sur 400.
+      const useNative = process.env.COPILOT_NATIVE_WEB_SEARCH === '1';
+      let out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, useNative);
+      if (out.nativeRejected) out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, false);
       reply = out.text; products = out.products; actions = out.actions;
+      if (out.sources.length) sources = out.sources;
       if (reply) provider = 'anthropic';
     }
     if (!reply && lovableKey) { reply = await callOpenAILike(lovableKey, true, sys, chat); if (reply) provider = 'lovable'; }
     if (!reply && openaiKey) { reply = await callOpenAILike(openaiKey, false, sys, chat); if (reply) provider = 'openai'; }
+
+    // GARDE-FOU PHOTO→MARKETPLACE : une photo jointe mais AUCUN produit trouvé (le modèle n'a
+    // pas appelé search_products, ou provider sans outils) → on extrait les mots-clés de la
+    // réponse et on cherche NOUS-MÊMES, puis on fusionne. Plus de « je vois un X » sans cartes.
+    if (hasImage && reply && products.length === 0) {
+      const kws = await extractProductKeywords(reply, anthropicKey);
+      if (kws && kws.length >= 2) {
+        const found = await runProductSearch(kws);
+        for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
+      }
+    }
 
     const fallback = !reply;
     // Repli honnête : si une photo était jointe et qu'AUCUN provider n'a répondu, ne jamais
@@ -495,7 +666,7 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     // remember() ne reçoit QUE le texte du message — jamais le dataUrl (pas de base64 en DB).
     await remember(userId, service, message, finalReply);
     // Contrat API : enveloppe { success, data } (migration 2026-07-03, consommateurs frontend mis à jour ensemble).
-    ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, actions });
+    ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, actions, sources: sources.slice(0, 6) });
   } catch (e: any) {
     logger.error(`[copilot] ${e?.message}`);
     fail(res, 500, 'Erreur Copilot');

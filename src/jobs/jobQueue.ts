@@ -282,6 +282,51 @@ registerHandler('live-replays.purge', async () => {
   logger.info(`Live replays purge: ${purged}/${rows.length} purgés`);
 });
 
+// 📸 Stories vendeur : purge des stories expirées (> 24 h). purge_expired_stories()
+// SUPPRIME déjà les lignes DB et renvoie les (id, media_url) échus → il ne reste qu'à
+// libérer le média du stockage (best-effort ; la DB est déjà propre). Le média peut être
+// sur GCS public (bucket 224solutions) OU sur Supabase Storage (fallback dev).
+registerHandler('stories.purge', async () => {
+  const { data: expired, error } = await supabaseAdmin.rpc('purge_expired_stories');
+  if (error) { logger.error(`[stories.purge] ${error.message}`); return; }
+  const rows = (expired || []) as Array<{ id: string; media_url: string | null }>;
+  if (!rows.length) { logger.info('Stories purge: rien à purger'); return; }
+
+  const sa = loadServiceAccount();
+  let freed = 0;
+  for (const r of rows) {
+    const url = r.media_url;
+    if (!url) { freed++; continue; }
+    try {
+      const gcsMarker = `/${getBucketName()}/`;
+      const gcsIdx = url.indexOf(gcsMarker);
+      const supMarker = '/storage/v1/object/public/';
+      const supIdx = url.indexOf(supMarker);
+      if (gcsIdx >= 0 && sa) {
+        // GCS public : DELETE signé de l'objet.
+        const objectPath = decodeURIComponent(url.slice(gcsIdx + gcsMarker.length).split('?')[0]);
+        const signed = generateSignedUrl(sa, getBucketName(), objectPath, { method: 'DELETE', expiresInSeconds: 120 });
+        const resp = await fetch(signed, { method: 'DELETE' });
+        if (!(resp.ok || resp.status === 404)) logger.error(`[stories.purge] GCS ${r.id}: HTTP ${resp.status}`);
+      } else if (supIdx >= 0) {
+        // Supabase Storage : bucket = 1er segment après /object/public/, reste = chemin.
+        const rest = url.slice(supIdx + supMarker.length).split('?')[0];
+        const slash = rest.indexOf('/');
+        if (slash > 0) {
+          const bucket = rest.slice(0, slash);
+          const path = decodeURIComponent(rest.slice(slash + 1));
+          const { error: delErr } = await supabaseAdmin.storage.from(bucket).remove([path]);
+          if (delErr) logger.error(`[stories.purge] supabase ${r.id}: ${delErr.message}`);
+        }
+      }
+    } catch (e: any) {
+      logger.error(`[stories.purge] ${r.id}: ${e?.message}`);
+    }
+    freed++; // la ligne DB est déjà supprimée par la RPC ; le stockage est best-effort.
+  }
+  logger.info(`Stories purge: ${freed}/${rows.length} traitées`);
+});
+
 registerHandler('escrow.auto-release', async () => {
   const now = new Date().toISOString();
   const { data: escrows } = await supabaseAdmin
@@ -1041,6 +1086,7 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
       // Live shopping : purge quotidienne des replays expirés (> 30 j) — objet GCS + replay_url=null
       recurringTimers.push(setInterval(() => this.enqueue('live-replays.purge', {}).catch(() => {}), every24Hours));
+      recurringTimers.push(setInterval(() => this.enqueue('stories.purge', {}).catch(() => {}), every6Hours));
       // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
       recurringTimers.push(setInterval(() => this.enqueue('errors.auto-resolve-stale', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes

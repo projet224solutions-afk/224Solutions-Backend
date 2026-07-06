@@ -524,7 +524,7 @@ async function extractProductKeywords(text: string, anthropicKey?: string): Prom
       }
     } catch { /* repli heuristique */ }
   }
-  const words = (text.match(/[A-Za-zÀ-ÿ]{4,}/g) || []).filter((w) => !_kwStop.has(w.toLowerCase()));
+  const words = ((text.match(/[A-Za-zÀ-ÿ]{4,}/g) || []) as string[]).filter((w) => !_kwStop.has(w.toLowerCase()));
   return words.slice(0, 3).join(' ');
 }
 

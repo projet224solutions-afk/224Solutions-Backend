@@ -13,7 +13,9 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import * as autoHealing from '../services/autoHealing.service.js';
+import { PLATFORM_KB_SUMMARY, getPlatformHelp } from '../copilot/platformKnowledge.js';
 import { getSystemMap, getLiveObservation } from '../services/systemContext.service.js';
+import { createHash } from 'node:crypto';
 
 const router = Router();
 
@@ -269,40 +271,287 @@ async function callOpenAILike(key: string, isLovable: boolean, sys: string, chat
 
 // ── TOOL-CALLING (Claude) ────────────────────────────────────────────────
 // Recherche produits réutilisable (lecture seule) — partagée par l'outil et l'endpoint /search.
-async function runProductSearch(q: string): Promise<any[]> {
+/** Distance haversine en km entre deux points (même pattern que la proximité taxi). */
+function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
+  const R = 6371;
+  const dLat = ((bLat - aLat) * Math.PI) / 180;
+  const dLng = ((bLng - aLng) * Math.PI) / 180;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos((aLat * Math.PI) / 180) * Math.cos((bLat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+interface MarketSearchOpts { radiusKm?: number; lat?: number; lng?: number }
+
+/**
+ * search_marketplace — recherche produit ENRICHIE (données PUBLIQUES uniquement) : produit +
+ * boutique (pays/ville/quartier, certification, note, avis) + STOCK + deep link + distance si
+ * la position utilisateur est fournie (haversine, filtre rayon). Étend l'ancien search_products.
+ * Ne SELECTionne QUE des colonnes publiques (jamais de données privées de la boutique).
+ */
+async function runMarketplaceSearch(q: string, opts: MarketSearchOpts = {}): Promise<any[]> {
   const query = String(q || '').trim();
   if (query.length < 2) return [];
-  // Multi-mots-clés : on nettoie chaque mot (échappe les wildcards ILIKE) puis OR ilike →
-  // tolère l'ordre des mots (« sneakers nike rouge » matche « Nike sneakers rouges »).
   const words = query.split(/\s+/).map((w) => w.replace(/[%_\\,().]/g, '')).filter((w) => w.length >= 2).slice(0, 4);
+  const hasGeo = Number.isFinite(opts.lat) && Number.isFinite(opts.lng);
+  const radius = Number.isFinite(opts.radiusKm) && (opts.radiusKm as number) > 0 ? (opts.radiusKm as number) : null;
   try {
-    let builder = supabaseAdmin.from('products').select('id, name, price, images').eq('is_active', true);
-    if (words.length > 1) {
-      builder = builder.or(words.map((w) => `name.ilike.%${w}%`).join(','));
-    } else {
-      const safe = (words[0] || query).replace(/[%_\\]/g, '\\$&');
-      builder = builder.ilike('name', `%${safe}%`);
+    // Jointure produit→boutique. Colonnes PUBLIQUES seulement (nom/pays/ville/adresse/note/avis/geo).
+    let builder = supabaseAdmin
+      .from('products')
+      .select('id, name, price, currency, images, stock_quantity, vendor_id, vendors!inner(id, user_id, business_name, country, city, address, latitude, longitude, rating, total_reviews, is_active)')
+      .eq('is_active', true)
+      .eq('vendors.is_active', true);
+    if (words.length > 1) builder = builder.or(words.map((w) => `name.ilike.%${w}%`).join(','));
+    else builder = builder.ilike('name', `%${(words[0] || query).replace(/[%_\\]/g, '\\$&')}%`);
+    // On élargit le candidat set quand on filtre par distance (tri distance en mémoire ensuite).
+    const { data } = await builder.limit(hasGeo ? 60 : 8);
+    let rows = (data || []) as any[];
+    if (rows.length === 0) return [];
+
+    // Certification : MÊME source que le badge UI (vendor_certifications par vendor.user_id).
+    const userIds = [...new Set(rows.map((r) => r.vendors?.user_id).filter(Boolean))];
+    let certSet = new Set<string>();
+    if (userIds.length) {
+      const { data: certs } = await supabaseAdmin
+        .from('vendor_certifications').select('vendor_id').in('vendor_id', userIds).eq('status', 'CERTIFIE');
+      certSet = new Set((certs || []).map((c: any) => c.vendor_id));
     }
-    const { data } = await builder.limit(6);
-    return (data || []).map((p: any) => ({
-      id: p.id, name: p.name, price: Number(p.price) || 0,
-      image: Array.isArray(p.images) ? p.images[0] : null,
-    }));
+
+    let hits = rows.map((p) => {
+      const v = p.vendors || {};
+      const vLat = Number(v.latitude), vLng = Number(v.longitude);
+      const distance_km = hasGeo && Number.isFinite(vLat) && Number.isFinite(vLng)
+        ? Math.round(haversineKm(opts.lat as number, opts.lng as number, vLat, vLng) * 10) / 10
+        : null;
+      const stock = Number.isFinite(Number(p.stock_quantity)) ? Number(p.stock_quantity) : null;
+      return {
+        id: p.id, name: p.name, price: Number(p.price) || 0, currency: p.currency || 'GNF',
+        image: Array.isArray(p.images) ? p.images[0] : null,
+        stock, in_stock: stock === null ? null : stock > 0,
+        deep_link: `/marketplace/product/${p.id}`,
+        vendor: {
+          vendorId: v.id || p.vendor_id, business_name: v.business_name || null,
+          country: v.country || null, city: v.city || null, address: v.address || null,
+          certified: v.user_id ? certSet.has(v.user_id) : false,
+          rating: Number.isFinite(Number(v.rating)) ? Number(v.rating) : null,
+          total_reviews: Number.isFinite(Number(v.total_reviews)) ? Number(v.total_reviews) : 0,
+          shop_link: v.id ? `/shop/${v.id}` : null,
+          distance_km,
+        },
+      };
+    });
+
+    if (radius && hasGeo) hits = hits.filter((h) => h.vendor.distance_km !== null && h.vendor.distance_km <= radius);
+    // Tri : distance croissante (si géo) PUIS note décroissante.
+    hits.sort((a, b) => {
+      const da = a.vendor.distance_km, db = b.vendor.distance_km;
+      if (da !== null && db !== null && da !== db) return da - db;
+      return (b.vendor.rating || 0) - (a.vendor.rating || 0);
+    });
+    return hits.slice(0, 6);
   } catch { return []; }
+}
+
+/** Compat : l'ancien nom reste utilisé par le garde-fou image + les repli sans géo. */
+async function runProductSearch(q: string, opts: MarketSearchOpts = {}): Promise<any[]> {
+  return runMarketplaceSearch(q, opts);
+}
+
+// ── Outils « MES DONNÉES » — compte CONNECTÉ UNIQUEMENT (filtrés EN DUR par userId ; le
+//    modèle ne passe JAMAIS d'user_id en paramètre). Confidentialité : jamais les données d'autrui. ──
+const frMoney = (n: any, cur = 'GNF') => `${Math.round(Number(n) || 0).toLocaleString('fr-FR')} ${cur}`;
+const frDate = (d?: string | null) => (d ? new Date(d).toLocaleDateString('fr-FR') : '');
+const ORDER_STATUS_FR: Record<string, string> = { pending: 'en attente', paid: 'payée', processing: 'en préparation', in_transit: 'en cours de livraison', shipped: 'expédiée', delivered: 'livrée', completed: 'terminée', cancelled: 'annulée', refunded: 'remboursée' };
+const BOOKING_STATUS_FR: Record<string, string> = { pending: 'en attente', confirmed: 'confirmée', in_progress: 'en cours', completed: 'terminée', cancelled: 'annulée' };
+
+async function getMyOrders(userId: string, status?: string): Promise<string> {
+  try {
+    let q = supabaseAdmin.from('orders')
+      .select('order_number, status, total_amount, created_at, vendors(business_name)')
+      .eq('customer_id', userId)
+      .order('created_at', { ascending: false }).limit(5);
+    if (status && typeof status === 'string') q = q.eq('status', status);
+    const { data } = await q;
+    if (!data || data.length === 0) return 'Aucune commande trouvée pour ce compte.';
+    return data.map((o: any) => `Commande ${o.order_number || '?'} — ${ORDER_STATUS_FR[o.status] || o.status || '?'} — ${frMoney(o.total_amount)} — boutique ${o.vendors?.business_name || '?'} — ${frDate(o.created_at)}`).join('\n');
+  } catch { return 'Impossible de lire tes commandes pour le moment.'; }
+}
+
+async function getMyWallet(userId: string): Promise<string> {
+  try {
+    const { data: wallets } = await supabaseAdmin.from('wallets').select('id, balance, currency').eq('user_id', userId);
+    if (!wallets || wallets.length === 0) return "Aucun wallet trouvé pour ce compte.";
+    const lines = wallets.map((w: any) => `Solde : ${frMoney(w.balance, w.currency || 'GNF')}`);
+    const wid = (wallets[0] as any).id;
+    if (wid) {
+      const { data: txs } = await supabaseAdmin.from('wallet_transactions')
+        .select('transaction_type, amount, currency, created_at')
+        .or(`sender_wallet_id.eq.${wid},receiver_wallet_id.eq.${wid}`)
+        .order('created_at', { ascending: false }).limit(3);
+      if (txs && txs.length) {
+        lines.push('Dernières transactions :');
+        for (const tx of txs as any[]) lines.push(`- ${tx.transaction_type || 'opération'} : ${frMoney(tx.amount, tx.currency || 'GNF')} (${frDate(tx.created_at)})`);
+      }
+    }
+    return lines.join('\n');
+  } catch { return 'Impossible de lire ton wallet pour le moment.'; }
+}
+
+async function getMyBookings(userId: string): Promise<string> {
+  try {
+    const nowIso = new Date().toISOString();
+    const { data } = await supabaseAdmin.from('service_bookings')
+      .select('booking_type, scheduled_date, status, total_amount, professional_services(business_name)')
+      .eq('client_id', userId)
+      .gte('scheduled_date', nowIso)
+      .order('scheduled_date', { ascending: true }).limit(5);
+    if (!data || data.length === 0) return 'Aucune réservation à venir pour ce compte.';
+    return data.map((b: any) => `${b.booking_type || 'Réservation'}${b.professional_services?.business_name ? ' — ' + b.professional_services.business_name : ''} — ${frDate(b.scheduled_date)} — ${BOOKING_STATUS_FR[b.status] || b.status || '?'}`).join('\n');
+  } catch { return 'Impossible de lire tes réservations pour le moment.'; }
+}
+
+/** Nouveautés du marketplace (données PUBLIQUES) : produits + prestataires ajoutés récemment. */
+async function getNewArrivals(days = 7): Promise<string> {
+  try {
+    const d = Math.max(1, Math.min(Number(days) || 7, 30));
+    const since = new Date(Date.now() - d * 86400000).toISOString();
+    const [{ data: prods }, { data: svcs }] = await Promise.all([
+      supabaseAdmin.from('products')
+        .select('name, price, currency, created_at, vendors!inner(business_name, is_active)')
+        .eq('is_active', true).eq('vendors.is_active', true).gte('created_at', since)
+        .order('created_at', { ascending: false }).limit(6),
+      supabaseAdmin.from('professional_services')
+        .select('business_name, created_at, is_active').eq('is_active', true).gte('created_at', since)
+        .order('created_at', { ascending: false }).limit(4),
+    ]);
+    const lines: string[] = [];
+    for (const p of (prods || []) as any[]) lines.push(`🛍️ ${p.name} — ${frMoney(p.price, p.currency || 'GNF')} (boutique ${p.vendors?.business_name || '?'})`);
+    for (const s of (svcs || []) as any[]) if (s.business_name) lines.push(`🛠️ Nouveau prestataire : ${s.business_name}`);
+    return lines.length ? lines.join('\n') : `Aucune nouveauté ces ${d} derniers jours.`;
+  } catch { return 'Impossible de lister les nouveautés.'; }
+}
+
+// ── FIX 6 — Escalade humaine : crée un TICKET (table support_tickets existante) avec le
+//    RÉSUMÉ de la conversation (généré par le modèle). Le client ne répète rien. ──
+async function createSupportTicket(userId: string, summary: string, service?: string): Promise<string> {
+  try {
+    const desc = ((service ? `[${service}] ` : '') + (String(summary || '').trim() || 'Escalade depuis le copilote (résumé indisponible).')).slice(0, 4000);
+    const subject = ('[Copilote] ' + (String(summary || '').trim().split('\n')[0] || "Demande d'assistance")).slice(0, 120);
+    const { data, error } = await supabaseAdmin.from('support_tickets')
+      .insert({ requester_id: userId, subject, description: desc, category: 'autre', priority: 'medium', status: 'open' })
+      .select('ticket_number, id').single();
+    if (error) return "Je n'ai pas pu créer le ticket. Réessaie, ou contacte le support directement.";
+    const num = (data as any)?.ticket_number || String((data as any)?.id || '').slice(0, 8);
+    return `✅ Ticket ${num} créé. Un membre de l'équipe te recontactera — tu n'auras rien à répéter, ton résumé est joint.`;
+  } catch { return "Je n'ai pas pu créer le ticket pour le moment."; }
+}
+
+// ── FIX 8 — Cache FAQ : les questions GÉNÉRIQUES (sans contexte perso ni image) sont mises en
+//    cache (question_hash → réponse, TTL 6 h, par service+langue). Un hit = réponse instantanée
+//    SANS IA (compteur visible côté PDG). JAMAIS de cache sur une question personnelle (mon solde,
+//    ma commande…), avec image, ou si un outil « mes données »/action a servi à répondre. ──
+const FAQ_TTL_MS = 6 * 60 * 60 * 1000; // 6 h
+const FAQ_PERSONAL_TOOLS = new Set(['get_my_orders', 'get_my_wallet', 'get_my_bookings', 'create_support_ticket', 'propose_order', 'propose_booking', 'propose_fix', 'scan_incidents']);
+// Marqueurs d'une question PERSONNELLE (1re personne, données de compte, escalade) → jamais de cache.
+const FAQ_PERSONAL_RE = /\b(mon|ma|mes|mien|mienne|j'ai|jai|je veux|mon compte|mon solde|mon wallet|mon portefeuille|ma commande|mes commandes|ma reservation|mes reservations|ma livraison|humain|support|ticket|reclamation|rembours)\b/i;
+function faqNormalize(q: string): string {
+  return String(q || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+}
+function faqHash(q: string, service: string, lang: string): string {
+  return createHash('sha256').update(`${service || 'general'}|${lang || 'fr'}|${faqNormalize(q)}`).digest('hex');
+}
+function faqIsPersonal(q: string): boolean { return FAQ_PERSONAL_RE.test(faqNormalize(q)); }
+async function faqCacheGet(q: string, service: string, lang: string): Promise<string | null> {
+  try {
+    const h = faqHash(q, service, lang);
+    const { data } = await supabaseAdmin.from('copilot_faq_cache').select('reply, expires_at').eq('question_hash', h).maybeSingle();
+    if (!data || !(data as any).reply) return null;
+    // TTL applicatif (défense en profondeur si le nettoyage périodique n'a pas encore tourné).
+    if ((data as any).expires_at && new Date((data as any).expires_at).getTime() < Date.now()) return null;
+    void supabaseAdmin.rpc('bump_faq_cache_hit', { p_hash: h }).then(undefined, () => { /* best-effort */ });
+    return String((data as any).reply);
+  } catch { return null; }
+}
+async function faqCachePut(q: string, service: string, lang: string, reply: string): Promise<void> {
+  try {
+    if (!reply || reply.length < 8 || reply.length > 4000) return;
+    const h = faqHash(q, service, lang);
+    await supabaseAdmin.from('copilot_faq_cache').upsert({
+      question_hash: h, service: service || 'general', lang: lang || 'fr',
+      question: String(q).slice(0, 300), reply: reply.slice(0, 4000),
+      expires_at: new Date(Date.now() + FAQ_TTL_MS).toISOString(), updated_at: new Date().toISOString(),
+    }, { onConflict: 'question_hash' });
+  } catch { /* best-effort — le cache ne doit JAMAIS casser une réponse */ }
+}
+
+// ── FIX 9 — Langue de réponse. Le copilote répond dans la langue de l'utilisateur UNIQUEMENT pour
+//    les langues où le modèle est FIABLE (grandes langues mondiales). Les langues locales ouest-
+//    africaines (Pulaar/Peul 'ff', Wolof 'wo', Soussou 'su/sus') ne sont PAS générées
+//    dynamiquement : on répond en FRANÇAIS (langue officielle en Guinée, comprise) plutôt que de
+//    produire une traduction bancale — même logique d'honnêteté que le registre UI (pas de faux
+//    soussou). 'su' est explicitement exclu. Le cache FAQ (FIX 8) est déjà clé par langue. ──
+const COPILOT_LANG_NAMES: Record<string, string> = {
+  en: 'English', es: 'español', pt: 'português', ar: 'العربية (Arabic)', zh: '中文 (Chinese)',
+  ru: 'русский (Russian)', de: 'Deutsch', it: 'italiano', ja: '日本語 (Japanese)', ko: '한국어 (Korean)',
+  hi: 'हिन्दी (Hindi)', tr: 'Türkçe', nl: 'Nederlands', pl: 'polski', th: 'ไทย (Thai)',
+  vi: 'Tiếng Việt', id: 'Bahasa Indonesia', sw: 'Kiswahili', uk: 'українська (Ukrainian)',
+  he: 'עברית (Hebrew)', fa: 'فارسی (Persian)', bn: 'বাংলা (Bengali)',
+};
+function replyLangDirective(lang: string): string {
+  const code = String(lang || '').slice(0, 5).toLowerCase();
+  if (!code || code === 'fr') return ''; // défaut = français (aucune directive)
+  const name = COPILOT_LANG_NAMES[code];
+  if (!name) return ''; // langue non fiable (ff/wo/su/inconnue) → réponse en français, honnêtement
+  return ` LANGUE DE RÉPONSE : réponds INTÉGRALEMENT en ${name}. Garde tels quels les noms propres, les montants et devises (ex. 50000 GNF), les codes/identifiants et les emojis.`;
 }
 
 // Outils proposés à Claude. search_products = exécuté serveur (lecture). propose_* = JAMAIS
 // exécuté serveur : renvoie une carte de CONFIRMATION au front (zéro débit silencieux).
 const COPILOT_TOOLS = [
   {
-    name: 'search_products',
-    description: "Recherche des produits dans le marketplace 224Solutions par mot-clé. À utiliser dès que l'utilisateur veut trouver/acheter un produit, pour proposer des résultats réels.",
-    input_schema: { type: 'object', properties: { query: { type: 'string', description: 'mots-clés du produit recherché' } }, required: ['query'] },
+    name: 'search_marketplace',
+    description: "Recherche ENRICHIE de produits dans le marketplace 224Solutions : renvoie, PAR PRODUIT, le prix, le STOCK, le lien du produit, et sa BOUTIQUE (nom, pays/ville/quartier, si elle est CERTIFIÉE, sa note et son nombre d'avis, et la DISTANCE si la position de l'utilisateur est connue). À utiliser dès que l'utilisateur veut trouver/acheter un produit OU cherche une boutique proche. Utilise radius_km quand l'utilisateur mentionne une distance (« à 5 km », « près de moi »).",
+    input_schema: { type: 'object', properties: {
+      query: { type: 'string', description: 'mots-clés du produit recherché' },
+      radius_km: { type: 'number', description: 'rayon max en km autour de la position de l\'utilisateur (ex. 5, 10, 20) — à utiliser si l\'utilisateur veut des boutiques proches' },
+    }, required: ['query'] },
   },
   {
     name: 'search_web',
     description: "Recherche sur INTERNET (le web) et renvoie de vrais résultats avec des URLs sources. À utiliser pour toute question d'actualité, de prix de référence, de définition, d'information hors du marketplace 224Solutions. Cite TOUJOURS les sources (URLs) que tu utilises ; n'invente jamais d'URL.",
     input_schema: { type: 'object', properties: { query: { type: 'string', description: 'la requête de recherche web' } }, required: ['query'] },
+  },
+  {
+    name: 'get_my_orders',
+    description: "Les 5 dernières commandes de l'UTILISATEUR CONNECTÉ (numéro, statut, montant, boutique). À utiliser pour « où est ma commande ? », « mes commandes ». Ne renvoie QUE les données du compte connecté — jamais celles d'un autre.",
+    input_schema: { type: 'object', properties: { status: { type: 'string', description: 'filtre de statut optionnel (ex. delivered, pending)' } } },
+  },
+  {
+    name: 'get_my_wallet',
+    description: "Le solde du wallet de l'UTILISATEUR CONNECTÉ + ses 3 dernières transactions. À utiliser pour « mon solde », « mes transactions ». Ne renvoie QUE les données du compte connecté.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_my_bookings',
+    description: "Les réservations À VENIR de l'UTILISATEUR CONNECTÉ (services, rendez-vous, taxi programmé). Ne renvoie QUE les données du compte connecté.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_platform_help',
+    description: "Renvoie l'explication DÉTAILLÉE d'un concept 224Solutions. topic parmi : escrow, wallet, taxi, delivery, live, certification, caution, reviews, become_vendor, services, payment_links. À utiliser quand l'utilisateur demande « comment marche X », « c'est quoi le séquestre », « comment devenir vendeur ».",
+    input_schema: { type: 'object', properties: { topic: { type: 'string', description: 'le sujet (ex. escrow, wallet, taxi, live, certification)' } }, required: ['topic'] },
+  },
+  {
+    name: 'get_new_arrivals',
+    description: "Les produits et prestataires AJOUTÉS RÉCEMMENT au marketplace (données publiques). À utiliser pour « quoi de neuf ? », « les nouveautés ». days optionnel (défaut 7).",
+    input_schema: { type: 'object', properties: { days: { type: 'number', description: 'fenêtre en jours (défaut 7, max 30)' } } },
+  },
+  {
+    name: 'create_support_ticket',
+    description: "Crée un TICKET d'assistance HUMAINE pour l'utilisateur connecté, avec un RÉSUMÉ de la conversation. À utiliser UNIQUEMENT quand tu n'arrives PAS à résoudre le problème, OU quand l'utilisateur demande explicitement à « parler à un humain / au support ». Le client ne répétera rien : le résumé est joint. summary = résumé clair du problème, du contexte et de ce qui a déjà été tenté.",
+    input_schema: { type: 'object', properties: {
+      summary: { type: 'string', description: 'résumé factuel du problème et de ce qui a été tenté (sera lu par le support humain)' },
+    }, required: ['summary'] },
   },
   {
     name: 'propose_order',
@@ -382,13 +631,78 @@ function collectCitations(content: any[], sources: { title: string; url: string 
 // collecte les propose_* comme cartes de confirmation et les sources web. Renvoie texte +
 // produits + actions + sources. `useNativeWebSearch` ajoute l'outil natif Anthropic (flag env) ;
 // s'il est refusé (400), l'appelant réessaie sans lui (on garde search_web serveur en repli).
+// Contexte mutable partagé par les handlers d'outils (products/actions/sources/usedTools).
+interface ToolCtx {
+  userId: string;
+  geo: { lat?: number; lng?: number };
+  products: any[];
+  actions: any[];
+  sources: { title: string; url: string }[];
+  usedTools: Set<string>;
+}
+
+// Exécute UN bloc tool_use et renvoie le texte du tool_result (ou null si non géré : bloc natif).
+// SOURCE UNIQUE du dispatch d'outils — utilisée par la version NON-streamée (callAnthropicAgentic)
+// ET la version STREAMÉE (callAnthropicAgenticStream). Aucune duplication : toute nouvelle capacité
+// s'ajoute ICI et bénéficie aux deux chemins.
+async function dispatchToolBlock(block: any, ctx: ToolCtx): Promise<string | null> {
+  if (block?.type !== 'tool_use') return null;
+  ctx.usedTools.add(String(block.name || ''));
+  const { userId, geo, products, actions, sources } = ctx;
+  if (block.name === 'search_marketplace' || block.name === 'search_products') {
+    const found = await runMarketplaceSearch(block.input?.query || '', { radiusKm: block.input?.radius_km, lat: geo.lat, lng: geo.lng });
+    for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
+    return found.length ? found.map((p) => {
+      const v = p.vendor || {};
+      const parts = [`${p.name} — ${p.price} ${p.currency}`,
+        `stock: ${p.in_stock === null ? 'n/c' : p.in_stock ? 'en stock (' + p.stock + ')' : 'RUPTURE'}`,
+        `boutique: ${v.business_name || '?'}${v.certified ? ' ✓CERTIFIÉE' : ''}`];
+      if (v.city || v.country) parts.push(`lieu: ${[v.city, v.country].filter(Boolean).join(', ')}`);
+      if (v.distance_km != null) parts.push(`distance: ${v.distance_km} km`);
+      if (v.rating != null) parts.push(`note: ${v.rating}/5 (${v.total_reviews} avis)`);
+      parts.push(`lien: ${p.deep_link}`);
+      return parts.join(' | ') + ` (id:${p.id})`;
+    }).join('\n') : 'Aucun produit trouvé' + (block.input?.radius_km ? ` dans un rayon de ${block.input.radius_km} km — propose d'élargir le rayon.` : '.');
+  }
+  if (block.name === 'search_web') {
+    if (!allowWebSearch(userId)) return 'Limite de recherches web atteinte (10 / 10 min). Réessaie plus tard.';
+    const web = await webSearchStructured(block.input?.query || '');
+    for (const w of web) if (!sources.some((s) => s.url === w.url)) sources.push({ title: w.title, url: w.url });
+    return web.length ? web.map((w, i) => `[${i + 1}] ${w.title}\n${w.url}\n${w.snippet}`).join('\n\n') : 'Aucun résultat web trouvé.';
+  }
+  if (block.name === 'get_my_orders') return await getMyOrders(userId, block.input?.status);       // filtré EN DUR par userId
+  if (block.name === 'get_my_wallet') return await getMyWallet(userId);
+  if (block.name === 'get_my_bookings') return await getMyBookings(userId);
+  if (block.name === 'get_platform_help') return getPlatformHelp(String(block.input?.topic || ''));
+  if (block.name === 'get_new_arrivals') return await getNewArrivals(block.input?.days);
+  if (block.name === 'create_support_ticket') return await createSupportTicket(userId, String(block.input?.summary || ''));
+  if (block.name === 'propose_order' || block.name === 'propose_booking' || block.name === 'propose_fix') {
+    const a = buildProposedAction(block.name, block.input);
+    if (a) actions.push(a);
+    return a ? 'Bouton de confirmation affiché au PDG. Rien n\'est exécuté tant qu\'il ne clique pas.' : 'Paramètres insuffisants.';
+  }
+  if (block.name === 'scan_incidents') {
+    try { await autoHealing.scanAndDiagnose(); } catch { /* best-effort */ }
+    const all = await autoHealing.listIncidents();
+    const open = all.filter((i: any) => !['resolved', 'applied', 'failed'].includes(i.status));
+    const domain = String(block.input?.domain || '').toLowerCase();
+    const filtered = domain ? open.filter((i: any) => String(i.module || '').toLowerCase().includes(domain)) : open;
+    return filtered.length
+      ? filtered.slice(0, 15).map((i: any) => `id:${i.id} | ${i.module}/${i.alert_key} | ${i.severity} | ${i.remediation_kind || '?'} | action:${i.final_action || '?'} | ${i.title}`).join('\n')
+      : 'Aucun incident ouvert' + (domain ? ` pour le domaine « ${domain} ».` : '.');
+  }
+  return null; // server_tool_use / web_search_tool_result (outil natif) → géré par Anthropic
+}
+
 async function callAnthropicAgentic(
   key: string, sys: string, chat: any[], tools: any[], userId: string, useNativeWebSearch: boolean,
-): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; nativeRejected?: boolean }> {
+  geo: { lat?: number; lng?: number } = {},
+): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[]; nativeRejected?: boolean }> {
   const messages: any[] = chat.map(toAnthropicMsg);
   const products: any[] = [];
   const actions: any[] = [];
   const sources: { title: string; url: string }[] = [];
+  const usedTools = new Set<string>(); // FIX 8 — trace des outils appelés (cacheabilité FAQ)
   const effectiveTools = useNativeWebSearch
     ? [...tools, { type: 'web_search_20250305', name: 'web_search', max_uses: 3 }]
     : tools;
@@ -403,10 +717,10 @@ async function callAnthropicAgentic(
         // Outil natif non supporté par le compte → signaler pour réessai sans lui.
         if (useNativeWebSearch && turn === 0 && (r.status === 400 || r.status === 404)) {
           logger.warn(`[copilot] web_search natif refusé (${r.status}) → repli search_web serveur`);
-          return { text: null, products, actions, sources, nativeRejected: true };
+          return { text: null, products, actions, sources, usedTools: [...usedTools], nativeRejected: true };
         }
         logger.warn(`[copilot] anthropic(tools) ${r.status}`);
-        return { text: null, products, actions, sources };
+        return { text: null, products, actions, sources, usedTools: [...usedTools] };
       }
       const data: any = await r.json();
       const content: any[] = Array.isArray(data.content) ? data.content : [];
@@ -422,50 +736,120 @@ async function callAnthropicAgentic(
       if (data.stop_reason === 'tool_use') {
         messages.push({ role: 'assistant', content });
         const toolResults: any[] = [];
+        const ctx: ToolCtx = { userId, geo, products, actions, sources, usedTools };
         for (const block of content) {
           if (block?.type !== 'tool_use') continue;
-          if (block.name === 'search_products') {
-            const found = await runProductSearch(block.input?.query || '');
-            for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: found.length ? found.map((p) => `${p.name} — ${p.price} (id:${p.id})`).join('\n') : 'Aucun produit trouvé.' });
-          } else if (block.name === 'search_web') {
-            if (!allowWebSearch(userId)) {
-              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Limite de recherches web atteinte (10 / 10 min). Réessaie plus tard.' });
-            } else {
-              const web = await webSearchStructured(block.input?.query || '');
-              for (const w of web) if (!sources.some((s) => s.url === w.url)) sources.push({ title: w.title, url: w.url });
-              toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-                content: web.length ? web.map((w, i) => `[${i + 1}] ${w.title}\n${w.url}\n${w.snippet}`).join('\n\n') : 'Aucun résultat web trouvé.' });
-            }
-          } else if (block.name === 'propose_order' || block.name === 'propose_booking' || block.name === 'propose_fix') {
-            const a = buildProposedAction(block.name, block.input);
-            if (a) actions.push(a);
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: a ? 'Bouton de confirmation affiché au PDG. Rien n\'est exécuté tant qu\'il ne clique pas.' : 'Paramètres insuffisants.' });
-          } else if (block.name === 'scan_incidents') {
-            // PDG uniquement : ingest + diagnostic dual-IA, puis liste des incidents ouverts.
-            try { await autoHealing.scanAndDiagnose(); } catch { /* best-effort */ }
-            const all = await autoHealing.listIncidents();
-            const open = all.filter((i: any) => !['resolved', 'applied', 'failed'].includes(i.status));
-            const domain = String(block.input?.domain || '').toLowerCase();
-            const filtered = domain ? open.filter((i: any) => String(i.module || '').toLowerCase().includes(domain)) : open;
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id,
-              content: filtered.length
-                ? filtered.slice(0, 15).map((i: any) => `id:${i.id} | ${i.module}/${i.alert_key} | ${i.severity} | ${i.remediation_kind || '?'} | action:${i.final_action || '?'} | ${i.title}`).join('\n')
-                : 'Aucun incident ouvert' + (domain ? ` pour le domaine « ${domain} ».` : '.') });
-          }
-          // Les blocs server_tool_use / web_search_tool_result (outil natif) sont gérés par
-          // Anthropic — on ne fabrique pas de tool_result pour eux.
+          const c = await dispatchToolBlock(block, ctx);
+          if (c != null) toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: c });
         }
         if (toolResults.length) messages.push({ role: 'user', content: toolResults });
         continue;
       }
       const txt = content.find((c: any) => c?.type === 'text')?.text?.trim() || null;
-      return { text: txt, products: products.slice(0, 6), actions, sources: sources.slice(0, 6) };
+      return { text: txt, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
     }
-    return { text: null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6) };
-  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, sources }; }
+    return { text: null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
+  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, sources, usedTools: [...usedTools] }; }
+}
+
+// FIX 4 — Variante STREAMÉE (Anthropic stream:true). Même boucle d'outils (dispatchToolBlock
+// partagé), mais les deltas de texte sont poussés au fur et à mesure via onDelta. Renvoie le
+// texte complet + products/actions/sources à la fin (pour la voix, le remember et le cache).
+// `startedRef.started` passe à true dès le PREMIER delta : la route sait alors qu'un repli
+// non-streamé transparent n'est plus possible (on a déjà commencé à écrire au client).
+async function callAnthropicAgenticStream(
+  key: string, sys: string, chat: any[], tools: any[], userId: string,
+  geo: { lat?: number; lng?: number },
+  onDelta: (t: string) => void,
+  startedRef: { started: boolean },
+): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[] }> {
+  const messages: any[] = chat.map(toAnthropicMsg);
+  const products: any[] = [];
+  const actions: any[] = [];
+  const sources: { title: string; url: string }[] = [];
+  const usedTools = new Set<string>();
+  let fullText = '';
+  const ret = () => ({ text: fullText.trim() || null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] });
+  try {
+    for (let turn = 0; turn < 5; turn++) {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 900, system: sys, tools, stream: true, messages }),
+      });
+      if (!r.ok || !r.body) { logger.warn(`[copilot/stream] anthropic ${r.status}`); return ret(); }
+
+      // Reconstruction des blocs de contenu à partir du flux SSE (indexés par position).
+      const blocks: any[] = [];
+      const partialJson: Record<number, string> = {};
+      let stopReason = '';
+      const reader = (r.body as any).getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let done = false;
+      while (!done) {
+        const { value, done: rd } = await reader.read();
+        if (rd) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).replace(/\r$/, '');
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue; // on ignore les lignes `event:` (le JSON porte `type`)
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') continue;
+          let ev: any;
+          try { ev = JSON.parse(dataStr); } catch { continue; }
+          switch (ev.type) {
+            case 'content_block_start':
+              blocks[ev.index] = { ...(ev.content_block || {}) };
+              if (blocks[ev.index].type === 'tool_use') partialJson[ev.index] = '';
+              break;
+            case 'content_block_delta':
+              if (ev.delta?.type === 'text_delta') {
+                const t = ev.delta.text || '';
+                if (t) { fullText += t; startedRef.started = true; onDelta(t); }
+                if (blocks[ev.index]) blocks[ev.index].text = (blocks[ev.index].text || '') + t;
+              } else if (ev.delta?.type === 'input_json_delta') {
+                partialJson[ev.index] = (partialJson[ev.index] || '') + (ev.delta.partial_json || '');
+              }
+              break;
+            case 'content_block_stop':
+              if (blocks[ev.index]?.type === 'tool_use') {
+                try { blocks[ev.index].input = JSON.parse(partialJson[ev.index] || '{}'); } catch { blocks[ev.index].input = {}; }
+              }
+              break;
+            case 'message_delta':
+              if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
+              break;
+            case 'message_stop':
+              done = true;
+              break;
+            case 'error':
+              logger.warn(`[copilot/stream] event error ${JSON.stringify(ev.error || {}).slice(0, 200)}`);
+              done = true;
+              break;
+          }
+        }
+      }
+
+      const content = blocks.filter(Boolean);
+      if (stopReason === 'tool_use') {
+        messages.push({ role: 'assistant', content });
+        const toolResults: any[] = [];
+        const ctx: ToolCtx = { userId, geo, products, actions, sources, usedTools };
+        for (const block of content) {
+          if (block?.type !== 'tool_use') continue;
+          const c = await dispatchToolBlock(block, ctx);
+          if (c != null) toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: c });
+        }
+        if (toolResults.length) messages.push({ role: 'user', content: toolResults });
+        continue; // tour suivant : la vraie réponse (streamée)
+      }
+      return ret(); // end_turn (ou fin de flux) → réponse finale complète
+    }
+    return ret();
+  } catch (e: any) { logger.warn(`[copilot/stream] err ${e?.message}`); return ret(); }
 }
 
 // Extraction de mémoire PAR CLAUDE (remplace l'heuristique quand la clé existe). Petit modèle
@@ -528,117 +912,170 @@ async function extractProductKeywords(text: string, anthropicKey?: string): Prom
   return words.slice(0, 3).join(' ');
 }
 
+// Préambule PARTAGÉ par POST '/' (non-streamé) et POST '/stream' (SSE) : parse le body, construit
+// géo/langue/contexte, lit le cache FAQ, vérifie le rôle PDG, assemble le system prompt + le chat.
+// N'ÉCRIT JAMAIS dans `res` (le caller décide comment répondre — JSON ou SSE). SOURCE UNIQUE :
+// toute évolution du contexte du copilote se fait ici et profite aux deux endpoints.
+interface PreparedTurn {
+  service: string; message: string; userId: string; hasImage: boolean; imageBlock: any;
+  userGeo: { lat?: number; lng?: number }; lang: string; faqEligible: boolean;
+  pdgMode: boolean; sys: string; chat: any[]; web: string; webSources: { title: string; url: string }[];
+  userName: string; cacheHit: string | null;
+  keys: { anthropic?: string; lovable?: string; openai?: string };
+}
+async function prepareCopilotTurn(req: AuthenticatedRequest): Promise<{ error?: { status: number; msg: string }; turn?: PreparedTurn }> {
+  const service = String(req.body?.service ?? '').toLowerCase();
+  const message = String(req.body?.message ?? '').trim();
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
+  const context = (req.body?.context && typeof req.body.context === 'object') ? req.body.context : null;
+  // 📷 VISION : photo compressée côté client (dataURL JPEG ≤1024px). Validée strictement,
+  // ignorée (avec log) si invalide — on répond alors en texte, on ne bloque jamais.
+  const rawImage = typeof req.body?.image === 'string' ? req.body.image : '';
+  const imageMatch = rawImage.match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+  const MAX_IMAGE_B64 = 2_800_000; // ~2 Mo décodés — large pour du 1024px JPEG q0.8
+  let imageBlock: { mediaType: string; base64: string; dataUrl: string } | null = null;
+  if (rawImage && imageMatch && imageMatch[2].length <= MAX_IMAGE_B64) {
+    imageBlock = {
+      mediaType: `image/${imageMatch[1] === 'jpg' ? 'jpeg' : imageMatch[1]}`,
+      base64: imageMatch[2],
+      dataUrl: rawImage,
+    };
+  } else if (rawImage) {
+    logger.warn(`[copilot] image rejetée (format ou taille) len=${rawImage.length}`);
+  }
+  const hasImage = !!imageBlock;
+  const userId = req.user!.id;
+  // Message texte OU photo requis (une photo seule doit lancer l'analyse + recherche produits).
+  if (!message && !hasImage) return { error: { status: 400, msg: 'message requis' } };
+
+  // Contexte utilisateur temps réel (Phase 1, optionnel) — injecté dans le system prompt.
+  // Position de l'utilisateur (géoloc navigateur accordée OU ville profil) — pour la recherche
+  // marketplace par distance. Uniquement lat/lng numériques ; jamais bloquant si absent.
+  const userGeo: { lat?: number; lng?: number } = {};
+  if (context && Number.isFinite(Number(context.lat)) && Number.isFinite(Number(context.lng))) {
+    userGeo.lat = Number(context.lat); userGeo.lng = Number(context.lng);
+  }
+  const ctxLine = context ? [
+    'CONTEXTE UTILISATEUR (utilise-le si pertinent, ne le récite pas) :',
+    context.name ? `- Prénom : ${String(context.name).slice(0, 40)}` : '',
+    context.role ? `- Rôle : ${String(context.role).slice(0, 30)}` : '',
+    (typeof context.balance === 'number') ? `- Solde wallet : ${context.balance} ${String(context.currency || 'GNF').slice(0, 5)}` : '',
+    context.service ? `- Service courant : ${String(context.service).slice(0, 30)}` : '',
+    (userGeo.lat != null) ? "- Position connue : tu peux utiliser search_marketplace avec radius_km pour trouver des boutiques proches." : '',
+  ].filter(Boolean).join('\n') : '';
+
+  // FIX 8 — Cache FAQ (lecture) : une question GÉNÉRIQUE (ni personnelle, ni image, hors PDG)
+  // peut être servie INSTANTANÉMENT depuis le cache, sans IA. Compteur incrémenté côté DB.
+  const lang = String((context && context.lang) || 'fr').slice(0, 5).toLowerCase();
+  const faqEligible = !hasImage && service !== 'pdg' && message.length >= 8 && !faqIsPersonal(message);
+  let cacheHit: string | null = null;
+  if (faqEligible) {
+    const cached = await faqCacheGet(message, service, lang);
+    if (cached) cacheHit = cached;
+  }
+
+  // #7 (auto-learn) + #8 (web sans clé) — calculés en amont pour servir aussi le repli.
+  const wantsGuide = /(comment|o[uù]\b|aide|guide|naviguer|trouver|faire|utiliser|fonctionne)/i.test(message);
+  const wantsWeb = /(qu'est|c'est quoi|c est quoi|explique|d[ée]finition|qui est|capitale|population|sur internet|cherche.*internet|actualit|m[ée]t[ée]o)/i.test(message);
+  // Recherche web pour les providers SANS outils (Lovable/OpenAI) et le repli final.
+  // Anthropic, lui, appelle l'outil search_web tout seul → pas de double recherche.
+  const webResults = (wantsWeb && !process.env.ANTHROPIC_API_KEY) ? await webSearchStructured(message) : [];
+  const web = webResults.length
+    ? webResults.map((w, i) => `[${i + 1}] ${w.title} — ${w.url}\n${w.snippet}`).join('\n\n')
+    : '';
+  const guide = wantsGuide ? (APP_GUIDE + await dynamicAppKnowledge()) : '';
+  const memLine = await loadMemories(userId); // PART 2 — mémoires structurées de l'utilisateur
+  // Extraction mémoire : par Claude si la clé existe (plus fine), sinon heuristique. Fire-and-forget.
+  if (process.env.ANTHROPIC_API_KEY) void extractMemoriesLLM(userId, message, process.env.ANTHROPIC_API_KEY);
+  else void extractMemories(userId, message);
+
+  // Mode PDG : rôle VÉRIFIÉ en DB (jamais sur la seule foi du paramètre service). Le Copilot PDG
+  // garde en mémoire la CARTE de toute l'app + OBSERVE l'état live → diagnostic/correction précis.
+  let pdgMode = false;
+  if (service === 'pdg') {
+    try {
+      const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
+      pdgMode = ['pdg', 'ceo', 'admin'].includes(String(prof?.role || '').toLowerCase());
+    } catch { pdgMode = false; }
+  }
+  let pdgContext = '';
+  if (pdgMode) {
+    try {
+      const [mapTxt, obsTxt] = await Promise.all([getSystemMap(), getLiveObservation()]);
+      pdgContext = `\n\n=== MÉMOIRE SYSTÈME (ce que l'app sait faire) ===\n${mapTxt}\n\n=== OBSERVATION TEMPS RÉEL (ce qui se passe maintenant) ===\n${obsTxt}\n\nUtilise scan_incidents pour rafraîchir/diagnostiquer, et propose_fix pour offrir une correction sûre en 1 clic.`;
+    } catch { /* best-effort */ }
+  }
+
+  const sys = (SERVICE_PROMPTS[service] || DEFAULT_PROMPT)
+    + " Ne donne jamais de conseil dangereux ; pour un acte technique risqué, recommande un professionnel."
+    + " CONFIDENTIALITÉ ABSOLUE : tu ne révèles JAMAIS les données d'un AUTRE compte (vendeur ou client) — ni ses ventes, commandes, wallet, solde, clients ou messages privés. Si on te demande les données d'autrui (ex. « combien a vendu la boutique X ? », « quel est le solde de Y ? »), refuse poliment : ce sont des informations privées. Tu ne parles que (a) des données PUBLIQUES (produits actifs, infos publiques de boutique) et (b) des données du COMPTE CONNECTÉ, via les outils get_my_orders / get_my_wallet / get_my_bookings."
+    + " ESCALADE : si tu ne parviens PAS à résoudre le problème après avoir vraiment essayé, ou si l'utilisateur demande à parler à un humain / au support, propose de créer un ticket puis appelle create_support_ticket avec un RÉSUMÉ fidèle (problème + ce qui a été tenté). Ne promets jamais une intervention humaine sans avoir créé le ticket."
+    + replyLangDirective(lang)
+    + `\n\n${PLATFORM_KB_SUMMARY}`
+    + (ctxLine ? `\n\n${ctxLine}` : '')
+    + (memLine ? `\n\n${memLine}` : '')
+    + (guide ? `\n\n${guide}` : '')
+    + (web ? `\n\nINFO TROUVÉE SUR INTERNET (à reformuler, cite que c'est une info web si pertinent) :\n${web}` : '')
+    + pdgContext
+    + (hasImage ? "\n\n📷 L'utilisateur a joint une PHOTO. Tu la VOIS (INTERDIT de dire le contraire). Procède en 3 ÉTAPES OBLIGATOIRES :\nÉtape 1 — identifie l'objet : type, marque si visible, couleur, caractéristiques.\nÉtape 2 — appelle OBLIGATOIREMENT l'outil search_marketplace avec 2-3 mots-clés du produit identifié (réessaie avec des mots plus génériques si 0 résultat).\nÉtape 3 — présente les correspondances trouvées sur le marketplace ; s'il n'y en a AUCUNE, dis-le honnêtement et propose search_web pour des références de prix. Ne conclus jamais sans avoir appelé search_marketplace." : '');
+
+  // Messages de conversation (sans le rôle system — géré séparément pour Anthropic).
+  // L'image ne concerne que le tour courant — jamais l'historique. Sans image, le dernier
+  // message reste une string (format inchangé) ; avec image, il porte __image (mappé par provider).
+  const lastUserMsg: any = {
+    role: 'user',
+    content: message.slice(0, 2000) || (hasImage ? 'Analyse cette photo et trouve des produits correspondants sur le marketplace.' : ''),
+  };
+  if (hasImage) lastUserMsg.__image = imageBlock;
+  const chat = [
+    ...history.filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .map((m: any) => ({ role: m.role, content: String(m.content).slice(0, 2000) })),
+    lastUserMsg,
+  ];
+
+  return { turn: {
+    service, message, userId, hasImage, imageBlock, userGeo, lang, faqEligible, pdgMode, sys, chat, web,
+    webSources: webResults.map((w) => ({ title: w.title, url: w.url })),
+    userName: String((context && context.name) || ''), cacheHit,
+    keys: { anthropic: process.env.ANTHROPIC_API_KEY, lovable: process.env.LOVABLE_API_KEY, openai: process.env.OPENAI_API_KEY },
+  } };
+}
+
 router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const service = String(req.body?.service ?? '').toLowerCase();
-    const message = String(req.body?.message ?? '').trim();
-    const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
-    const context = (req.body?.context && typeof req.body.context === 'object') ? req.body.context : null;
-    // 📷 VISION : photo compressée côté client (dataURL JPEG ≤1024px). Validée strictement,
-    // ignorée (avec log) si invalide — on répond alors en texte, on ne bloque jamais.
-    const rawImage = typeof req.body?.image === 'string' ? req.body.image : '';
-    const imageMatch = rawImage.match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
-    const MAX_IMAGE_B64 = 2_800_000; // ~2 Mo décodés — large pour du 1024px JPEG q0.8
-    let imageBlock: { mediaType: string; base64: string; dataUrl: string } | null = null;
-    if (rawImage && imageMatch && imageMatch[2].length <= MAX_IMAGE_B64) {
-      imageBlock = {
-        mediaType: `image/${imageMatch[1] === 'jpg' ? 'jpeg' : imageMatch[1]}`,
-        base64: imageMatch[2],
-        dataUrl: rawImage,
-      };
-    } else if (rawImage) {
-      logger.warn(`[copilot] image rejetée (format ou taille) len=${rawImage.length}`);
+    const prep = await prepareCopilotTurn(req);
+    if (prep.error) { fail(res, prep.error.status, prep.error.msg); return; }
+    const { service, message, userId, hasImage, imageBlock, userGeo, lang, faqEligible, pdgMode, sys, chat, web, webSources, userName, cacheHit } = prep.turn!;
+    const anthropicKey = prep.turn!.keys.anthropic;
+    const lovableKey = prep.turn!.keys.lovable;
+    const openaiKey = prep.turn!.keys.openai;
+    void imageBlock; // (déjà intégré au chat via __image)
+
+    // FIX 8 — cache FAQ : réponse instantanée sans IA.
+    if (cacheHit) {
+      await remember(userId, service, message, cacheHit);
+      ok(res, { reply: cacheHit, fallback: false, source: 'cache', products: [], actions: [], sources: [] });
+      return;
     }
-    const hasImage = !!imageBlock;
-    const userId = req.user!.id;
-    // Message texte OU photo requis (une photo seule doit lancer l'analyse + recherche produits).
-    if (!message && !hasImage) { fail(res, 400, 'message requis'); return; }
-
-    // Contexte utilisateur temps réel (Phase 1, optionnel) — injecté dans le system prompt.
-    const ctxLine = context ? [
-      'CONTEXTE UTILISATEUR (utilise-le si pertinent, ne le récite pas) :',
-      context.name ? `- Prénom : ${String(context.name).slice(0, 40)}` : '',
-      context.role ? `- Rôle : ${String(context.role).slice(0, 30)}` : '',
-      (typeof context.balance === 'number') ? `- Solde wallet : ${context.balance} ${String(context.currency || 'GNF').slice(0, 5)}` : '',
-      context.service ? `- Service courant : ${String(context.service).slice(0, 30)}` : '',
-    ].filter(Boolean).join('\n') : '';
-
-    // #7 (auto-learn) + #8 (web sans clé) — calculés en amont pour servir aussi le repli.
-    const wantsGuide = /(comment|o[uù]\b|aide|guide|naviguer|trouver|faire|utiliser|fonctionne)/i.test(message);
-    const wantsWeb = /(qu'est|c'est quoi|c est quoi|explique|d[ée]finition|qui est|capitale|population|sur internet|cherche.*internet|actualit|m[ée]t[ée]o)/i.test(message);
-    // Recherche web pour les providers SANS outils (Lovable/OpenAI) et le repli final.
-    // Anthropic, lui, appelle l'outil search_web tout seul → pas de double recherche.
-    const webResults = (wantsWeb && !process.env.ANTHROPIC_API_KEY) ? await webSearchStructured(message) : [];
-    const web = webResults.length
-      ? webResults.map((w, i) => `[${i + 1}] ${w.title} — ${w.url}\n${w.snippet}`).join('\n\n')
-      : '';
-    const guide = wantsGuide ? (APP_GUIDE + await dynamicAppKnowledge()) : '';
-    const memLine = await loadMemories(userId); // PART 2 — mémoires structurées de l'utilisateur
-    // Extraction mémoire : par Claude si la clé existe (plus fine), sinon heuristique. Fire-and-forget.
-    if (process.env.ANTHROPIC_API_KEY) void extractMemoriesLLM(userId, message, process.env.ANTHROPIC_API_KEY);
-    else void extractMemories(userId, message);
-
-    // Clés IA disponibles (les deux travaillent EN REDONDANCE : Claude primaire, OpenAI secours).
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    const lovableKey = process.env.LOVABLE_API_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
-
-    // Mode PDG : rôle VÉRIFIÉ en DB (jamais sur la seule foi du paramètre service). Le Copilot PDG
-    // garde en mémoire la CARTE de toute l'app + OBSERVE l'état live → diagnostic/correction précis.
-    let pdgMode = false;
-    if (service === 'pdg') {
-      try {
-        const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
-        pdgMode = ['pdg', 'ceo', 'admin'].includes(String(prof?.role || '').toLowerCase());
-      } catch { pdgMode = false; }
-    }
-    let pdgContext = '';
-    if (pdgMode) {
-      try {
-        const [mapTxt, obsTxt] = await Promise.all([getSystemMap(), getLiveObservation()]);
-        pdgContext = `\n\n=== MÉMOIRE SYSTÈME (ce que l'app sait faire) ===\n${mapTxt}\n\n=== OBSERVATION TEMPS RÉEL (ce qui se passe maintenant) ===\n${obsTxt}\n\nUtilise scan_incidents pour rafraîchir/diagnostiquer, et propose_fix pour offrir une correction sûre en 1 clic.`;
-      } catch { /* best-effort */ }
-    }
-
-    const sys = (SERVICE_PROMPTS[service] || DEFAULT_PROMPT)
-      + " Ne donne jamais de conseil dangereux ; pour un acte technique risqué, recommande un professionnel."
-      + (ctxLine ? `\n\n${ctxLine}` : '')
-      + (memLine ? `\n\n${memLine}` : '')
-      + (guide ? `\n\n${guide}` : '')
-      + (web ? `\n\nINFO TROUVÉE SUR INTERNET (à reformuler, cite que c'est une info web si pertinent) :\n${web}` : '')
-      + pdgContext
-      + (hasImage ? "\n\n📷 L'utilisateur a joint une PHOTO. Tu la VOIS (INTERDIT de dire le contraire). Procède en 3 ÉTAPES OBLIGATOIRES :\nÉtape 1 — identifie l'objet : type, marque si visible, couleur, caractéristiques.\nÉtape 2 — appelle OBLIGATOIREMENT l'outil search_products avec 2-3 mots-clés du produit identifié (réessaie avec des mots plus génériques si 0 résultat).\nÉtape 3 — présente les correspondances trouvées sur le marketplace ; s'il n'y en a AUCUNE, dis-le honnêtement et propose search_web pour des références de prix. Ne conclus jamais sans avoir appelé search_products." : '');
-
-    // Messages de conversation (sans le rôle system — géré séparément pour Anthropic).
-    // L'image ne concerne que le tour courant — jamais l'historique. Sans image, le dernier
-    // message reste une string (format inchangé) ; avec image, il porte __image (mappé par provider).
-    const lastUserMsg: any = {
-      role: 'user',
-      content: message.slice(0, 2000) || (hasImage ? 'Analyse cette photo et trouve des produits correspondants sur le marketplace.' : ''),
-    };
-    if (hasImage) lastUserMsg.__image = imageBlock;
-    const chat = [
-      ...history.filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-        .map((m: any) => ({ role: m.role, content: String(m.content).slice(0, 2000) })),
-      lastUserMsg,
-    ];
 
     // CHAÎNE RÉSILIENTE : Anthropic (avec OUTILS) → Lovable(Gemini) → OpenAI → repli (web/contextuel).
     let reply: string | null = null;
     let provider = '';
     let products: any[] = [];
     let actions: any[] = [];
+    let usedTools: string[] = []; // FIX 8 — outils réellement appelés (décide de la cacheabilité)
     // Sources web (URLs citables) : seed = repli non-Anthropic ; sinon fournies par l'outil.
-    let sources: { title: string; url: string }[] = webResults.map((w) => ({ title: w.title, url: w.url }));
+    let sources: { title: string; url: string }[] = [...webSources];
     const tools = pdgMode ? PDG_TOOLS : COPILOT_TOOLS;
 
     if (anthropicKey) {
       // Outil natif web_search Anthropic derrière un flag (à activer après vérif d'accès réel
       // du compte) ; sinon l'outil serveur search_web fait la recherche. Repli auto sur 400.
       const useNative = process.env.COPILOT_NATIVE_WEB_SEARCH === '1';
-      let out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, useNative);
-      if (out.nativeRejected) out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, false);
+      let out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, useNative, userGeo);
+      if (out.nativeRejected) out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, false, userGeo);
       reply = out.text; products = out.products; actions = out.actions;
+      usedTools = out.usedTools || [];
       if (out.sources.length) sources = out.sources;
       if (reply) provider = 'anthropic';
     }
@@ -651,7 +1088,7 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     if (hasImage && reply && products.length === 0) {
       const kws = await extractProductKeywords(reply, anthropicKey);
       if (kws && kws.length >= 2) {
-        const found = await runProductSearch(kws);
+        const found = await runProductSearch(kws, userGeo);
         for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
       }
     }
@@ -665,11 +1102,86 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
         : (web || fallbackReply(service, message)));
     // remember() ne reçoit QUE le texte du message — jamais le dataUrl (pas de base64 en DB).
     await remember(userId, service, message, finalReply);
+    // FIX 8 — Cache FAQ (écriture) : on ne met en cache QUE si la réponse est GÉNÉRIQUE — réponse
+    // réelle (pas un repli), aucun outil « mes données »/action utilisé, et le texte ne contient
+    // pas le prénom de l'utilisateur (anti-fuite via cache partagé entre comptes).
+    if (faqEligible && !fallback && reply) {
+      const nameTok = userName.trim().toLowerCase();
+      const replyHasName = nameTok.length >= 3 && finalReply.toLowerCase().includes(nameTok);
+      if (!usedTools.some((t) => FAQ_PERSONAL_TOOLS.has(t)) && !replyHasName) {
+        void faqCachePut(message, service, lang, finalReply);
+      }
+    }
     // Contrat API : enveloppe { success, data } (migration 2026-07-03, consommateurs frontend mis à jour ensemble).
     ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, actions, sources: sources.slice(0, 6) });
   } catch (e: any) {
     logger.error(`[copilot] ${e?.message}`);
     fail(res, 500, 'Erreur Copilot');
+  }
+});
+
+// FIX 4 — STREAMING SSE. Même préambule (prepareCopilotTurn) que la route non-streamée : la
+// réponse arrive au fil de l'eau (events `delta`), puis un event `done` porte
+// products/actions/sources. Si le streaming n'est pas possible (pas de clé Anthropic, image,
+// flux vide, erreur AVANT le 1er delta) → event `fallback` : le FRONT rappelle alors la route
+// non-streamée POST '/' de façon TRANSPARENTE. La voix (TTS) est jouée côté front à la fin.
+router.post('/stream', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  const prep = await prepareCopilotTurn(req);
+  if (prep.error) { fail(res, prep.error.status, prep.error.msg); return; }
+  const t = prep.turn!;
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // pas de buffering proxy/nginx → deltas immédiats
+  (res as any).flushHeaders?.();
+  const send = (event: string, data: any) => {
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client déconnecté */ }
+  };
+
+  // Cache FAQ : réponse instantanée (un seul delta) puis done.
+  if (t.cacheHit) {
+    await remember(t.userId, t.service, t.message, t.cacheHit);
+    send('delta', { text: t.cacheHit });
+    send('done', { fallback: false, source: 'cache', products: [], actions: [], sources: [] });
+    res.end();
+    return;
+  }
+  // Streaming impossible (pas de clé Anthropic OU image) → repli transparent vers POST '/'.
+  if (!t.keys.anthropic || t.hasImage) {
+    send('fallback', { reason: !t.keys.anthropic ? 'no_anthropic' : 'image' });
+    res.end();
+    return;
+  }
+
+  const tools = t.pdgMode ? PDG_TOOLS : COPILOT_TOOLS;
+  const startedRef = { started: false };
+  try {
+    const out = await callAnthropicAgenticStream(
+      t.keys.anthropic, t.sys, t.chat, tools, t.userId, t.userGeo,
+      (delta) => send('delta', { text: delta }),
+      startedRef,
+    );
+    // Rien n'a été streamé (flux vide / erreur silencieuse) → repli transparent.
+    if (!out.text && !startedRef.started) { send('fallback', { reason: 'empty' }); res.end(); return; }
+    const finalText = out.text || '';
+    await remember(t.userId, t.service, t.message, finalText);
+    // FIX 8 — écriture cache : mêmes garde-fous que la route non-streamée (générique only).
+    if (t.faqEligible && out.text) {
+      const nameTok = t.userName.trim().toLowerCase();
+      const replyHasName = nameTok.length >= 3 && finalText.toLowerCase().includes(nameTok);
+      if (!out.usedTools.some((x) => FAQ_PERSONAL_TOOLS.has(x)) && !replyHasName) {
+        void faqCachePut(t.message, t.service, t.lang, finalText);
+      }
+    }
+    send('done', { fallback: false, source: 'anthropic', products: out.products, actions: out.actions, sources: out.sources.slice(0, 6) });
+    res.end();
+  } catch (e: any) {
+    logger.warn(`[copilot/stream] route err ${e?.message}`);
+    // Erreur AVANT le 1er delta → repli transparent ; sinon on clôt proprement ce qui a été envoyé.
+    if (!startedRef.started) send('fallback', { reason: 'error' });
+    else send('done', { fallback: false, products: [], actions: [], sources: [] });
+    res.end();
   }
 });
 
@@ -705,6 +1217,64 @@ router.get('/history', verifyJWT, async (req: AuthenticatedRequest, res: Respons
     // Contrat API : un échec remonte (plus d'historique vide en success:true).
     logger.warn(`[copilot/history] ${e?.message}`);
     fail(res, 500, 'Historique Copilot indisponible');
+  }
+});
+
+// ── FIX 5 — Feedback 👍👎 (utilisateur connecté). Vote MODIFIABLE par message. ──
+router.post('/feedback', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const rating = req.body?.rating === 'up' ? 'up' : req.body?.rating === 'down' ? 'down' : null;
+    if (!rating) { fail(res, 400, 'rating up/down requis'); return; }
+    const service = String(req.body?.service ?? '').slice(0, 40) || null;
+    const message_ref = req.body?.message_ref ? String(req.body.message_ref).slice(0, 80) : null;
+    const question = req.body?.question ? String(req.body.question).slice(0, 300) : null;
+    const reply = req.body?.reply ? String(req.body.reply).slice(0, 1000) : null;
+    const comment = req.body?.comment ? String(req.body.comment).slice(0, 300) : null;
+    // Vote modifiable : on remplace le vote précédent de CE message (même user).
+    if (message_ref) await supabaseAdmin.from('copilot_feedback').delete().eq('user_id', userId).eq('message_ref', message_ref);
+    const { error } = await supabaseAdmin.from('copilot_feedback')
+      .insert({ user_id: userId, service, message_ref, question, reply, rating, comment });
+    if (error) { fail(res, 400, error.message); return; }
+    ok(res, { saved: true });
+  } catch (e: any) {
+    logger.warn(`[copilot/feedback] ${e?.message}`);
+    fail(res, 500, 'Feedback indisponible');
+  }
+});
+
+// ── FIX 5 — Qualité Copilote (PDG/admin uniquement) : taux 👍, volume par service, 👎 récents. ──
+router.get('/feedback/stats', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const role = String(req.user!.role || '').toLowerCase();
+    if (!['admin', 'pdg', 'ceo'].includes(role)) { fail(res, 403, 'Réservé au PDG'); return; }
+    const { data } = await supabaseAdmin.from('copilot_feedback')
+      .select('service, rating, question, reply, comment, created_at')
+      .order('created_at', { ascending: false }).limit(500);
+    const rows = (data || []) as any[];
+    const up = rows.filter((r) => r.rating === 'up').length;
+    const down = rows.filter((r) => r.rating === 'down').length;
+    const total = up + down;
+    const satisfaction = total ? Math.round((up / total) * 100) : null;
+    const byService: Record<string, { up: number; down: number }> = {};
+    for (const r of rows) {
+      const s = r.service || 'autre';
+      if (!byService[s]) byService[s] = { up: 0, down: 0 };
+      byService[s][r.rating === 'up' ? 'up' : 'down']++;
+    }
+    const recentDown = rows.filter((r) => r.rating === 'down').slice(0, 20)
+      .map((r) => ({ service: r.service, question: r.question, reply: r.reply, comment: r.comment, created_at: r.created_at }));
+    // FIX 8 — compteur cache FAQ : nombre d'entrées + total de hits (réponses servies sans IA).
+    let faqCache = { entries: 0, hits: 0 };
+    try {
+      const { data: fq } = await supabaseAdmin.from('copilot_faq_cache').select('hits').limit(2000);
+      const fr = (fq || []) as any[];
+      faqCache = { entries: fr.length, hits: fr.reduce((a, r) => a + (Number(r.hits) || 0), 0) };
+    } catch { /* best-effort */ }
+    ok(res, { total, up, down, satisfaction, byService, recentDown, faqCache });
+  } catch (e: any) {
+    logger.warn(`[copilot/feedback-stats] ${e?.message}`);
+    fail(res, 500, 'Stats Copilote indisponibles');
   }
 });
 

@@ -33,6 +33,13 @@ function isAllowedThumbnailUrl(raw: string): boolean {
   const bucket = getBucketName();
   if (u.hostname === `${bucket}.storage.googleapis.com`) return true;
   if (u.hostname === 'storage.googleapis.com' && u.pathname.startsWith(`/${bucket}/`)) return true;
+  // Fallback LÉGITIME de useStorageUpload : quand GCS n'est pas dispo (dev, session, objet
+  // non affichable), l'upload retombe sur NOTRE Supabase Storage (objets publics). Sans ceci
+  // la vignette était rejetée (400) → thumbnail_url restait NULL → dégradé orange permanent.
+  try {
+    const sb = process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL) : null;
+    if (sb && u.hostname === sb.hostname && u.pathname.startsWith('/storage/v1/object/public/')) return true;
+  } catch { /* URL SUPABASE_URL invalide → on ignore */ }
   return false;
 }
 
@@ -698,6 +705,86 @@ router.post('/cohosts/:cohostId/respond', verifyJWT, async (req: AuthenticatedRe
     return ok(res, data);
   } catch (e: any) {
     logger.error(`[live/cohost-respond] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /streams/:id/join-request (spectateur VENDEUR) — DEMANDE à rejoindre le live.
+router.post('/streams/:id/join-request', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    // La RPC vérifie : vendeur avec boutique, live en cours, pas le host, cooldown anti-spam.
+    const { data, error } = await supabaseAdmin.rpc('request_join_live', {
+      p_stream_id: streamId, p_actor_user_id: userId,
+    });
+    if (error) return fail(res, 400, error.message);
+
+    // Notification durable au host (en plus du realtime « join-request » côté client).
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    const hostId = (stream as any)?.vendor_user_id;
+    if (hostId) {
+      await supabaseAdmin.from('notifications').insert({
+        user_id: hostId,
+        title: 'Demande pour rejoindre votre live',
+        message: 'Un vendeur demande à co-animer votre direct.',
+        type: 'live_cohost',
+        read: false,
+        metadata: { entity_type: 'live_join_request', cohost_id: (data as any)?.cohost_id, stream_id: streamId },
+      });
+    }
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[live/join-request] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// POST /cohosts/:cohostId/respond-request (HOST) — accepte/refuse une demande 'requested'.
+router.post('/cohosts/:cohostId/respond-request', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const cohostId = req.params.cohostId;
+    if (!UUID_RE.test(cohostId)) return fail(res, 400, 'id invalide');
+    const accept = req.body?.accept === true;
+    const { data, error } = await supabaseAdmin.rpc('respond_join_request', {
+      p_cohost_id: cohostId, p_accept: accept, p_actor_user_id: req.user!.id,
+    });
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[live/respond-join-request] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// GET /streams/:id/join-requests (HOST) — demandes 'requested' en attente de SON live.
+router.get('/streams/:id/join-requests', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'id invalide');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const { data, error } = await supabaseAdmin
+      .from('live_cohosts')
+      .select('id, cohost_vendor_id, requested_at:invited_at, vendors(business_name)')
+      .eq('live_stream_id', streamId)
+      .eq('status', 'requested')
+      .eq('initiated_by', 'guest')
+      .order('invited_at', { ascending: true });
+    if (error) return fail(res, 400, error.message);
+    const requests = (data || []).map((r: any) => ({
+      cohostId: r.id, vendorId: r.cohost_vendor_id,
+      vendorName: r.vendors?.business_name ?? null, requestedAt: r.requested_at,
+    }));
+    return ok(res, { requests });
+  } catch (e: any) {
+    logger.error(`[live/join-requests] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

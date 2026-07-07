@@ -888,10 +888,13 @@ router.get('/streams/:id/cohosts', async (req, res: Response) => {
 
     const { data, error } = await supabaseAdmin
       .from('live_cohosts')
-      .select('cohost_user_id, cohost_vendor_id, status, vendors:cohost_vendor_id(business_name)')
+      .select('id, cohost_user_id, cohost_vendor_id, status, vendors:cohost_vendor_id(business_name)')
       .eq('live_stream_id', streamId).eq('status', 'live');
     if (error) return fail(res, 400, error.message);
+    // `cohostId` exposé pour permettre au HOST de révoquer (FIX 4). end_live_cohost gate par
+    // acteur (owner→revoked / cohost→left / autre→refus) : exposer l'id reste sûr.
     const cohosts = (data || []).map((c: any) => ({
+      cohostId: c.id,
       uid: String(uuidToNumericUid(c.cohost_user_id)),
       vendorId: c.cohost_vendor_id,
       vendorName: c.vendors?.business_name || null,

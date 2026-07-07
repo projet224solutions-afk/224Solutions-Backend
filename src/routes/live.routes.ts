@@ -173,6 +173,37 @@ router.post('/streams/:id/end', verifyJWT, async (req: AuthenticatedRequest, res
   }
 });
 
+// ── POST /streams/:id/replay-ready (host) — replay_url arrivé APRÈS la clôture ──
+// FIX 7 : l'upload du replay se fait en arrière-plan (résumable). L'URL peut donc arriver
+// APRÈS /end (le live est déjà 'ended'). On met à jour replay_url + expiration sans re-clôturer.
+// isAllowedThumbnailUrl = « une de NOS URLs de stockage » (GCS bucket OU Supabase) → réutilisée.
+router.post('/streams/:id/replay-ready', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const { replay_url } = req.body || {};
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'Identifiant de live invalide', 'INVALID_STREAM_ID');
+    if (typeof replay_url !== 'string' || replay_url.length > 2048 || !isAllowedThumbnailUrl(replay_url)) {
+      return fail(res, 400, 'URL de replay invalide', 'INVALID_REPLAY_URL');
+    }
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+    const { error } = await supabaseAdmin
+      .from('live_streams')
+      .update({ replay_url, replay_expires_at: expires })
+      .eq('id', streamId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { streamId, replayUrl: replay_url });
+  } catch (e: any) {
+    logger.error(`[live/replay-ready] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
 // ── POST /streams/:id/thumbnail (host) — vignette du replay (best-effort) ───
 // Capturée côté client PENDANT le direct puis uploadée (GCS). Aucune action vendeur.
 // Host revérifié : seul le vendeur hôte peut écrire la vignette de SON stream.

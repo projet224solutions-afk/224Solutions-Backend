@@ -11,6 +11,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
+import { idempotencyGuard } from '../middlewares/idempotency.middleware.js';
 import { issueLiveToken, currentLiveProvider } from '../services/liveToken.service.js';
 import { uuidToNumericUid } from '../services/agoraToken.js';
 import { getBucketName, loadServiceAccount, generateSignedUrl } from '../services/gcs.service.js';
@@ -523,6 +524,131 @@ router.post('/streams/:id/events', verifyJWT, async (req: AuthenticatedRequest, 
     return ok(res, { recorded: true, viewerCount, totalLikes });
   } catch (e: any) {
     logger.error(`[live/events] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 9 — CADEAUX VIRTUELS (monétisation) : catalogue config PDG + envoi atomique wallet.
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /streams/gift-catalog (public) — la grille de cadeaux ACTIFS (montants config PDG).
+router.get('/streams/gift-catalog', async (_req, res: Response) => {
+  try {
+    const { data } = await supabaseAdmin
+      .from('live_gift_catalog')
+      .select('code, emoji, label, amount, currency')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
+    return ok(res, { gifts: (data as any[]) || [] });
+  } catch (e: any) {
+    logger.warn(`[live/gift-catalog] ${e?.message}`);
+    return fail(res, 500, 'Catalogue cadeaux indisponible');
+  }
+});
+
+// Taux de commission plateforme sur les cadeaux — CONFIG PDG (pdg_settings), défaut 10%.
+async function getGiftCommissionPct(): Promise<number> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings').select('setting_value').eq('setting_key', 'live_gift_commission_percentage').maybeSingle();
+    const raw = (data as any)?.setting_value;
+    const v = typeof raw === 'object' && raw !== null ? Number(raw.value) : Number(raw);
+    if (Number.isFinite(v) && v >= 0 && v <= 100) return v;
+  } catch { /* défaut ci-dessous */ }
+  return 10;
+}
+
+const GIFT_ERR_MAP: Record<string, { status: number; msg: string; code: string }> = {
+  INSUFFICIENT_FUNDS: { status: 400, msg: 'Solde insuffisant pour ce cadeau.', code: 'INSUFFICIENT_FUNDS' },
+  DONOR_WALLET_NOT_FOUND: { status: 400, msg: 'Aucun portefeuille dans cette devise.', code: 'NO_WALLET' },
+  WALLET_BLOCKED: { status: 403, msg: 'Votre portefeuille est bloqué.', code: 'WALLET_BLOCKED' },
+  SELF_GIFT: { status: 400, msg: 'Vous ne pouvez pas vous offrir un cadeau.', code: 'SELF_GIFT' },
+};
+
+// POST /streams/:id/gift — envoie un cadeau (débit atomique wallet + commission coffre PDG).
+// idempotencyGuard (après verifyJWT) dédoublonne les rejeux (double-clic / réseau).
+router.post('/streams/:id([0-9a-fA-F-]{36})/gift', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const giftCode = String(req.body?.gift_code || '').trim().toLowerCase();
+    if (!giftCode) return fail(res, 400, 'gift_code requis', 'GIFT_CODE_REQUIRED');
+
+    // Montant AUTORITATIF = catalogue serveur (jamais un montant du body).
+    const { data: gift } = await supabaseAdmin
+      .from('live_gift_catalog').select('code, amount, currency, is_active').eq('code', giftCode).maybeSingle();
+    if (!gift || !(gift as any).is_active) return fail(res, 400, 'Cadeau inconnu', 'GIFT_UNKNOWN');
+
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id, status').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    const hostId = (stream as any).vendor_user_id as string;
+    if (hostId === userId) return fail(res, 400, 'Vous ne pouvez pas vous offrir un cadeau.', 'SELF_GIFT');
+
+    const amount = Number((gift as any).amount);
+    const currency = (gift as any).currency || 'GNF';
+    const pct = await getGiftCommissionPct();
+    const commission = Math.round(amount * (pct / 100));
+
+    const { data, error } = await supabaseAdmin.rpc('process_live_gift', {
+      p_donor_id: userId, p_host_id: hostId, p_gift_code: giftCode,
+      p_amount: amount, p_commission: commission, p_live_id: streamId, p_currency: currency,
+    });
+    if (error) {
+      const key = String(error.message || '').match(/[A-Z_]{4,}/)?.[0] || '';
+      const mapped = GIFT_ERR_MAP[key];
+      if (mapped) return fail(res, mapped.status, mapped.msg, mapped.code);
+      logger.error(`[live/gift] ${error.message}`);
+      return fail(res, 400, "Le cadeau n'a pas pu être envoyé.", 'GIFT_FAILED');
+    }
+
+    // Trace d'audit best-effort (pas bloquante) — l'argent est déjà journalisé par la RPC.
+    void supabaseAdmin.from('live_stream_events').insert({
+      live_stream_id: streamId, user_id: userId, event_type: 'purchase',
+      metadata: { kind: 'gift', gift_code: giftCode, amount, commission },
+    }).then(undefined, () => { /* best-effort */ });
+
+    return ok(res, { transaction_id: (data as any)?.transaction_id, gift_code: giftCode, amount, currency });
+  } catch (e: any) {
+    logger.error(`[live/gift] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 10 — STICKERS TEXTE DU HOST : le host écrit ses stickers (max 2), persistés pour
+// les spectateurs qui rejoignent en cours de live. La diffusion temps réel passe par le
+// canal realtime côté client ; ICI on ne fait que persister l'état courant (host-only).
+// ════════════════════════════════════════════════════════════════════════════
+
+const STICKER_STYLES = ['teal', 'orange', 'mono', 'gradient'];
+
+// PUT /streams/:id/stickers — remplace l'ensemble des stickers actifs (host uniquement).
+router.put('/streams/:id([0-9a-fA-F-]{36})/stickers', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const raw = Array.isArray(req.body?.stickers) ? req.body.stickers : [];
+    // Validation + normalisation : max 2, texte ≤ 20 car., style whitelisté, x/y ∈ [0,100].
+    const stickers = raw.slice(0, 2).map((s: any) => ({
+      id: String(s?.id || '').slice(0, 40) || `stk-${Math.abs(Math.round(Number(s?.x) || 0))}-${Math.abs(Math.round(Number(s?.y) || 0))}`,
+      text: Array.from(String(s?.text || '')).filter((c) => c >= ' ').join('').trim().slice(0, 20),
+      style: STICKER_STYLES.includes(String(s?.style)) ? String(s.style) : 'teal',
+      x: Math.min(100, Math.max(0, Number(s?.x) || 0)),
+      y: Math.min(100, Math.max(0, Number(s?.y) || 0)),
+    })).filter((s: any) => s.text.length > 0);
+
+    const { error } = await supabaseAdmin.from('live_streams').update({ active_stickers: stickers }).eq('id', streamId);
+    if (error) return fail(res, 400, error.message);
+    return ok(res, { stickers });
+  } catch (e: any) {
+    logger.error(`[live/stickers] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

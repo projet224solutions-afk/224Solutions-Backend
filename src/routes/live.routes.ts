@@ -591,9 +591,13 @@ router.post('/streams/:id([0-9a-fA-F-]{36})/gift', verifyJWT, idempotencyGuard, 
     const pct = await getGiftCommissionPct();
     const commission = Math.round(amount * (pct / 100));
 
+    // Clé d'idempotence HTTP (validée uuid v4 par idempotencyGuard) → idempotence RÉELLE en base
+    // (transaction_id dérivé). Repli uuid interne si le middleware a fail-open (rare).
+    const idemKey = String(req.headers['idempotency-key'] || '');
     const { data, error } = await supabaseAdmin.rpc('process_live_gift', {
       p_donor_id: userId, p_host_id: hostId, p_gift_code: giftCode,
       p_amount: amount, p_commission: commission, p_live_id: streamId, p_currency: currency,
+      p_idempotency_key: /^[0-9a-f-]{36}$/i.test(idemKey) ? idemKey : null,
     });
     if (error) {
       const key = String(error.message || '').match(/[A-Z_]{4,}/)?.[0] || '';

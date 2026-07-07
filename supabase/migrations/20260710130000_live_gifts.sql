@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS public.live_gift_catalog (
   emoji      text NOT NULL,
   label      text NOT NULL,
   amount     numeric(12,2) NOT NULL CHECK (amount > 0),
-  currency   text NOT NULL DEFAULT 'GNF',
+  -- V1 : cadeaux en GNF uniquement. Le coffre PDG est GNF et crédite le revenu « à la source »
+  -- sans conversion FX → verrouiller la devise ici évite un crédit coffre erroné en devise ≠ GNF.
+  currency   text NOT NULL DEFAULT 'GNF' CHECK (currency = 'GNF'),
   is_active  boolean NOT NULL DEFAULT true,
   sort_order int NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -43,13 +45,14 @@ ON CONFLICT (code) DO NOTHING;
 
 -- ── RPC atomique du cadeau ───────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.process_live_gift(
-  p_donor_id   uuid,
-  p_host_id    uuid,
-  p_gift_code  text,
-  p_amount     numeric,
-  p_commission numeric,
-  p_live_id    uuid,
-  p_currency   text DEFAULT 'GNF'
+  p_donor_id        uuid,
+  p_host_id         uuid,
+  p_gift_code       text,
+  p_amount          numeric,
+  p_commission      numeric,
+  p_live_id         uuid,
+  p_currency        text DEFAULT 'GNF',
+  p_idempotency_key uuid DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -59,7 +62,10 @@ DECLARE
   v_cur          text := upper(coalesce(nullif(trim(p_currency), ''), 'GNF'));
   v_donor_wallet public.wallets%ROWTYPE;
   v_total        numeric;
-  v_gift_id      uuid := gen_random_uuid();
+  -- Idempotence RÉELLE en base : la clé (fournie par la route = Idempotency-Key HTTP) dérive
+  -- le transaction_id. Un rejeu avec la même clé → même v_tx_id → early return (aucun double-débit),
+  -- ET record_pdg_revenue dédoublonne sur (source_type, transaction_id=v_gift_id).
+  v_gift_id      uuid := COALESCE(p_idempotency_key, gen_random_uuid());
   v_tx_id        text := 'LGIFT-' || replace(v_gift_id::text, '-', '');
   v_credit       jsonb;
   v_pct          numeric;
@@ -70,6 +76,11 @@ BEGIN
   IF p_donor_id = p_host_id THEN RAISE EXCEPTION 'SELF_GIFT'; END IF;
   v_total := p_amount + p_commission;
 
+  -- IDEMPOTENT : cadeau déjà traité (même clé) → on renvoie sans rien refaire.
+  IF EXISTS (SELECT 1 FROM public.wallet_transactions WHERE transaction_id = v_tx_id) THEN
+    RETURN jsonb_build_object('success', true, 'already_processed', true, 'transaction_id', v_tx_id);
+  END IF;
+
   -- 1) DÉBIT donateur du montant TOTAL (cadeau + commission). Verrou + gardes solde/blocage.
   SELECT * INTO v_donor_wallet FROM public.wallets
     WHERE user_id = p_donor_id AND currency = v_cur ORDER BY id LIMIT 1 FOR UPDATE;
@@ -79,11 +90,13 @@ BEGIN
 
   UPDATE public.wallets SET balance = balance - v_total, updated_at = now() WHERE id = v_donor_wallet.id;
 
+  -- Ledger : amount = total débité ; fee = commission ; net_amount = ce que reçoit le host.
+  -- (Respecte la contrainte valid_net_amount : net_amount = amount - fee.)
   INSERT INTO public.wallet_transactions (
-    transaction_id, sender_user_id, receiver_user_id, amount, net_amount,
+    transaction_id, sender_user_id, receiver_user_id, amount, fee, net_amount,
     transaction_type, status, currency, description, metadata)
   VALUES (
-    v_tx_id, p_donor_id, p_host_id, v_total, p_amount,
+    v_tx_id, p_donor_id, p_host_id, v_total, p_commission, p_amount,
     'payment', 'completed', v_cur, 'Cadeau live',
     jsonb_build_object('source', 'live_gift', 'live_id', p_live_id, 'gift_code', p_gift_code,
                        'gift_amount', p_amount, 'commission', p_commission));
@@ -106,7 +119,7 @@ END;
 $$;
 
 -- SECURITY DEFINER sensible (mouvement d'argent) → backend service_role uniquement.
-REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text) FROM anon;
-REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text) FROM authenticated;
-GRANT EXECUTE ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text) TO service_role;
+REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text, uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text, uuid) FROM anon;
+REVOKE ALL ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text, uuid) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.process_live_gift(uuid, uuid, text, numeric, numeric, uuid, text, uuid) TO service_role;

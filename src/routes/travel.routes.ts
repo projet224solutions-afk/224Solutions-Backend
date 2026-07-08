@@ -330,6 +330,29 @@ router.get('/bookings/mine', verifyJWT, async (req: AuthenticatedRequest, res: R
   }
 });
 
+// ── PHASE 3 — POST /affiliate-clicks : trace un clic d'affiliation sortant (vols/hôtels/digital).
+//    BEST-EFFORT : la redirection côté client n'attend pas cette réponse ; si la table n'existe
+//    pas encore (migration non jouée), on répond tracked:false sans casser. ──
+router.post('/affiliate-clicks', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const offerType = String(req.body?.offer_type || '').toLowerCase();
+    if (!['flight', 'hotel', 'digital'].includes(offerType)) return fail(res, 400, 'offer_type invalide', 'BAD_PARAMS');
+    const targetUrl = String(req.body?.target_url || '').slice(0, 800);
+    if (!/^https?:\/\//i.test(targetUrl)) return fail(res, 400, 'target_url invalide', 'BAD_PARAMS');
+    const rawOfferId = String(req.body?.offer_id || '');
+    const offerId = /^[0-9a-f-]{36}$/i.test(rawOfferId) ? rawOfferId : null;
+    const partner = req.body?.partner_name ? String(req.body.partner_name).slice(0, 120) : null;
+    const { error } = await supabaseAdmin.from('travel_affiliate_clicks' as any).insert({
+      user_id: req.user!.id, offer_type: offerType, offer_id: offerId, partner_name: partner, target_url: targetUrl,
+    });
+    if (error) { logger.warn(`[travel/aff-clicks] ${error.message}`); return ok(res, { tracked: false }); }
+    return ok(res, { tracked: true });
+  } catch (e: any) {
+    logger.warn(`[travel/aff-clicks] ${e?.message}`);
+    return ok(res, { tracked: false }); // best-effort assumé : jamais bloquant pour le client
+  }
+});
+
 // ── 8. GET /bookings/agency?service_id= — les réservations reçues par une agence ──
 router.get('/bookings/agency', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {

@@ -15,9 +15,18 @@ import { ok, fail } from '../utils/apiResponse.js';
 import * as autoHealing from '../services/autoHealing.service.js';
 import { PLATFORM_KB_SUMMARY, getPlatformHelp } from '../copilot/platformKnowledge.js';
 import { getSystemMap, getLiveObservation } from '../services/systemContext.service.js';
+import { COUNTRY_CODE_TO_NAME } from './marketplace.routes.js';
 import { createHash } from 'node:crypto';
 
 const router = Router();
+
+// URL publique de l'app — MÊME base que les aperçus OG (og-meta/short-link : https://224solution.net).
+// Sert à donner au modèle ET aux cartes front des URLs ABSOLUES partageables (WhatsApp → aperçu OG).
+const APP_PUBLIC_URL = (process.env.APP_URL || 'https://224solution.net').replace(/\/+$/, '');
+const absUrl = (path: string) => `${APP_PUBLIC_URL}${path}`;
+
+// Normalisation accent/casse-insensible (matching catégorie de service, pays…).
+const foldText = (s: unknown) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 
 // Phase 2 — mémoire : persiste le tour (best-effort, ne fait jamais échouer la réponse).
 async function remember(userId: string, service: string, userMsg: string, reply: string) {
@@ -55,7 +64,7 @@ const SERVICE_PROMPTS: Record<string, string> = {
   soudure: "Tu es un expert soudeur/métallier. Tu expliques MIG/TIG/arc, conseilles métaux et finitions, estimes portails/garde-corps. Concis.",
   agent: "Tu es l'assistant de l'AGENT 224Solutions (il enrôle/active des utilisateurs et vendeurs, gère KYC, commissions, sous-agents, liens d'affiliation). Tu l'aides à créer un utilisateur, comprendre ses commissions, suivre ses filleuls, résoudre un blocage KYC. Concret, en GNF.",
   pdg: "Tu es le Copilote du PDG de 224Solutions : tu supervises TOUTE la plateforme (finance, abonnements, escrow, wallet, commandes, sécurité). Quand le PDG signale une panne ou demande l'état du système, utilise l'outil scan_incidents pour détecter et diagnostiquer les incidents, puis propose_fix pour offrir une correction en 1 clic UNIQUEMENT quand la remédiation est sûre. Sois factuel, orienté décision. Ne proposes jamais d'exécuter une action touchant l'argent sans validation humaine explicite.",
-  client: "Tu es l'assistant PERSONNEL du CLIENT 224Solutions. Tu maîtrises tous les parcours client et tu aides à agir vite et en confiance : SUIVRE SES COMMANDES (outil get_my_orders : statut, livraison, historique), CONSULTER SON WALLET et ses dernières transactions en GNF (get_my_wallet), comprendre le PAIEMENT SÉCURISÉ (escrow : l'argent reste bloqué jusqu'à confirmation de réception, protection acheteur), TROUVER un produit ou une BOUTIQUE proche via search_marketplace (avec un rayon en km si sa position est connue), lire les AVIS VÉRIFIÉS, SUIVRE une boutique, et regarder/rejoindre les LIVES. Tu proposes des produits/boutiques réels du marketplace (jamais inventés) et tu orientes vers l'action concrète (bouton, page). Si tu ne peux pas résoudre, propose de créer un ticket (create_support_ticket). Concis, chaleureux, en GNF.",
+  client: "Tu es l'assistant PERSONNEL du CLIENT 224Solutions. Tu maîtrises tous les parcours client et tu aides à agir vite et en confiance : SUIVRE SES COMMANDES (outil get_my_orders : statut, livraison, historique), CONSULTER SON WALLET et ses dernières transactions en GNF (get_my_wallet), comprendre le PAIEMENT SÉCURISÉ (escrow : l'argent reste bloqué jusqu'à confirmation de réception, protection acheteur), TROUVER un produit (search_marketplace), un RESTAURANT/une PHARMACIE/un SALON ou tout service de proximité (search_local_services), ou une BOUTIQUE par son nom — même physique (search_shops), lire les AVIS VÉRIFIÉS, SUIVRE une boutique, et regarder/rejoindre les LIVES. Tu proposes des produits/boutiques réels du marketplace (jamais inventés) et tu orientes vers l'action concrète (bouton, page). Si tu ne peux pas résoudre, propose de créer un ticket (create_support_ticket). Concis, chaleureux, en GNF.",
   actionnaire: "Tu es l'assistant SOBRE de l'espace ACTIONNAIRE de 224Solutions. Tu expliques à l'actionnaire connecté comment comprendre SES parts, SES dividendes, et le fonctionnement de l'espace actionnaire (répartition, versements vers le wallet, historique). RÈGLES ABSOLUES : (1) tu ne révèles JAMAIS les données financières d'un AUTRE actionnaire ni d'un tiers ; (2) tu ne donnes JAMAIS de conseil d'investissement — ni recommandation d'achat/vente de parts, ni prévision de rendement, ni valorisation de l'entreprise. Tu restes factuel, neutre et pédagogique ; pour toute décision d'investissement, invite à se rapprocher de la direction. Concis, en GNF.",
 };
 const DEFAULT_PROMPT = "Tu es Copilot 224, l'assistant de la super-app 224Solutions en Guinée. Tu réponds de façon concise, concrète et utile, montants en GNF.";
@@ -282,7 +291,7 @@ function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): nu
   return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
 
-interface MarketSearchOpts { radiusKm?: number; lat?: number; lng?: number }
+interface MarketSearchOpts { radiusKm?: number; lat?: number; lng?: number; country?: string | null }
 
 /**
  * search_marketplace — recherche produit ENRICHIE (données PUBLIQUES uniquement) : produit +
@@ -300,11 +309,13 @@ async function runMarketplaceSearch(q: string, opts: MarketSearchOpts = {}): Pro
     // Jointure produit→boutique. Colonnes PUBLIQUES seulement (nom/pays/ville/adresse/note/avis/geo).
     let builder = supabaseAdmin
       .from('products')
-      .select('id, name, price, currency, images, stock_quantity, vendor_id, vendors!inner(id, user_id, business_name, country, city, address, latitude, longitude, rating, total_reviews, is_active)')
+      .select('id, name, price, currency, images, stock_quantity, vendor_id, vendors!inner(id, user_id, business_name, business_type, shop_slug, country, city, address, latitude, longitude, rating, total_reviews, is_active)')
       .eq('is_active', true)
       .eq('vendors.is_active', true);
     if (words.length > 1) builder = builder.or(words.map((w) => `name.ilike.%${w}%`).join(','));
     else builder = builder.ilike('name', `%${(words[0] || query).replace(/[%_\\]/g, '\\$&')}%`);
+    // Palier « pays » de l'escalade : restreint aux boutiques du pays (ilike = casse-insensible).
+    if (opts.country) builder = builder.ilike('vendors.country', opts.country);
     // On élargit le candidat set quand on filtre par distance (tri distance en mémoire ensuite).
     const { data } = await builder.limit(hasGeo ? 60 : 8);
     let rows = (data || []) as any[];
@@ -331,13 +342,17 @@ async function runMarketplaceSearch(q: string, opts: MarketSearchOpts = {}): Pro
         image: Array.isArray(p.images) ? p.images[0] : null,
         stock, in_stock: stock === null ? null : stock > 0,
         deep_link: `/marketplace/product/${p.id}`,
+        // URL ABSOLUE partageable — même chemin canonique que l'aperçu OG (og-meta : /product/:id).
+        url: absUrl(`/product/${p.id}`),
         vendor: {
           vendorId: v.id || p.vendor_id, business_name: v.business_name || null,
+          business_type: v.business_type || null,
           country: v.country || null, city: v.city || null, address: v.address || null,
           certified: v.user_id ? certSet.has(v.user_id) : false,
           rating: Number.isFinite(Number(v.rating)) ? Number(v.rating) : null,
           total_reviews: Number.isFinite(Number(v.total_reviews)) ? Number(v.total_reviews) : 0,
           shop_link: v.id ? `/shop/${v.id}` : null,
+          shop_url: v.id ? absUrl(v.shop_slug ? `/boutique/${v.shop_slug}` : `/shop/${v.id}`) : null,
           distance_km,
         },
       };
@@ -357,6 +372,192 @@ async function runMarketplaceSearch(q: string, opts: MarketSearchOpts = {}): Pro
 /** Compat : l'ancien nom reste utilisé par le garde-fou image + les repli sans géo. */
 async function runProductSearch(q: string, opts: MarketSearchOpts = {}): Promise<any[]> {
   return runMarketplaceSearch(q, opts);
+}
+
+/** Pays de l'utilisateur (nom FR tel que stocké dans vendors.country) — palier « pays » de l'escalade. */
+async function getUserCountryName(userId: string): Promise<string | null> {
+  try {
+    const { data } = await supabaseAdmin.from('profiles').select('country_code').eq('id', userId).maybeSingle();
+    const code = String((data as any)?.country_code || '').toUpperCase().slice(0, 2);
+    return (code && COUNTRY_CODE_TO_NAME[code]) || null;
+  } catch { return null; }
+}
+
+/**
+ * ESCALADE PAR PALIERS (côté backend — le réflexe du bon vendeur) : rayon demandé → 50 km →
+ * pays de l'utilisateur → monde. S'arrête au PREMIER palier qui donne des résultats et renvoie
+ * l'échelle atteinte — le modèle reçoit tout en UN appel (pas besoin de rappeler l'outil).
+ * Sans rayon demandé (ou sans position) : recherche directement à l'échelle monde.
+ */
+async function searchWithEscalation<T>(
+  run: (o: { radiusKm?: number; country?: string | null }) => Promise<T[]>,
+  o: { radiusKm?: number; hasGeo: boolean; userCountry: string | null },
+): Promise<{ hits: T[]; scope: string; escalated: boolean; tried: string[] }> {
+  const startKm = o.hasGeo && Number.isFinite(o.radiusKm) && (o.radiusKm as number) > 0 ? (o.radiusKm as number) : null;
+  const tiers: { label: string; opts: { radiusKm?: number; country?: string | null } }[] = [];
+  if (startKm) {
+    tiers.push({ label: `${startKm} km`, opts: { radiusKm: startKm } });
+    if (startKm < 50) tiers.push({ label: '50 km', opts: { radiusKm: 50 } });
+    if (o.userCountry) tiers.push({ label: `pays (${o.userCountry})`, opts: { country: o.userCountry } });
+  }
+  tiers.push({ label: 'monde entier', opts: {} });
+  const tried: string[] = [];
+  for (let i = 0; i < tiers.length; i++) {
+    const hits = await run(tiers[i].opts);
+    tried.push(tiers[i].label);
+    if (hits.length) return { hits, scope: tiers[i].label, escalated: i > 0, tried };
+  }
+  return { hits: [], scope: 'monde entier', escalated: tiers.length > 1, tried };
+}
+
+// Synonymes naturels → jetons de catégorie (matchés contre service_types.code/name/category de la
+// DB — la liste des services elle-même n'est PAS dupliquée ici, la DB/serviceTypesConfig fait foi).
+const SERVICE_CATEGORY_SYNONYMS: Record<string, string[]> = {
+  resto: ['restaurant'], restos: ['restaurant'], restaurants: ['restaurant'], manger: ['restaurant'],
+  pharma: ['pharmacie'], pharmacies: ['pharmacie'],
+  salon: ['beaute', 'coiffure', 'salon'], coiffeur: ['beaute', 'coiffure'], coiffure: ['beaute', 'coiffure'],
+  garage: ['reparation', 'mecanique', 'auto'], mecanicien: ['reparation', 'mecanique'], garagiste: ['reparation', 'mecanique'],
+  clinique: ['sante', 'clinique'], cliniques: ['sante', 'clinique'], hopital: ['sante', 'clinique'], medecin: ['sante'], docteur: ['sante'],
+  magasin: ['boutique'], magasins: ['boutique'], boutiques: ['boutique'],
+  hotel: ['hotel', 'hebergement'], hotels: ['hotel', 'hebergement'],
+};
+
+/**
+ * search_local_services — les prestataires de PROXIMITÉ (restaurants, pharmacies, salons, garages,
+ * cliniques… les 18 services). MÊME SOURCE que la page Proximité de l'app : RPC get_proximity_listings
+ * (services pro actifs+abonnés UNION boutiques online/hybrid), catégorie = service_types.code/name.
+ * Colonnes PUBLIQUES uniquement (JAMAIS phone/email/user_id). Deep links réels de l'app :
+ * service → /services-proximite/:id ; boutique → /shop/:id.
+ */
+async function runLocalServicesSearch(q: string, category: string, opts: MarketSearchOpts = {}): Promise<any[]> {
+  const query = foldText(q);
+  const hasGeo = Number.isFinite(opts.lat) && Number.isFinite(opts.lng);
+  const radius = Number.isFinite(opts.radiusKm) && (opts.radiusKm as number) > 0 ? (opts.radiusKm as number) : null;
+  // Jetons de catégorie : mots naturels de l'utilisateur → synonymes (accents/casse ignorés).
+  const catTokens = [...new Set(foldText(category).split(/\s+/).filter((w) => w.length >= 3)
+    .flatMap((w) => [w, ...(SERVICE_CATEGORY_SYNONYMS[w] || [])]))];
+  try {
+    // 1) MÊMES règles de visibilité que la page Proximité : services pro dont l'abonnement est actif.
+    let activeIds: string[] = [];
+    try {
+      const { data: subs } = await supabaseAdmin.rpc('get_active_service_subscription_limits');
+      activeIds = ((subs as any[]) || []).map((r) => r?.professional_service_id).filter(Boolean);
+    } catch { /* RPC absente → la RPC listings applique son propre repli */ }
+    // 2) Source canonique unifiée (services pro + boutiques en ligne/hybrides).
+    const { data, error } = await supabaseAdmin.rpc('get_proximity_listings', { p_service_ids: activeIds });
+    if (error) { logger.warn(`[copilot/services] get_proximity_listings: ${error.message}`); return []; }
+    const rows = ((data as any[]) || []);
+
+    let hits = rows.map((r) => {
+      const rLat = Number(r.latitude), rLng = Number(r.longitude);
+      const distance_km = hasGeo && Number.isFinite(rLat) && Number.isFinite(rLng)
+        ? Math.round(haversineKm(opts.lat as number, opts.lng as number, rLat, rLng) * 10) / 10
+        : null;
+      const isVendor = String(r.source || '') === 'vendor';
+      const deep_link = isVendor ? `/shop/${r.id}` : `/services-proximite/${r.id}`;
+      return {
+        id: r.id, source: isVendor ? 'vendor' : 'service',
+        name: r.business_name || null,
+        category: r.service_type_name || r.service_type_code || null,
+        category_code: r.service_type_code || null,
+        description: r.description ? String(r.description).slice(0, 160) : null,
+        image: r.cover_image_url || r.logo_url || null,
+        city: r.effective_city || null, neighborhood: r.neighborhood || null,
+        country: r.effective_country || null,
+        rating: Number.isFinite(Number(r.rating)) ? Number(r.rating) : null,
+        total_reviews: Number.isFinite(Number(r.total_reviews)) ? Number(r.total_reviews) : 0,
+        distance_km, deep_link, url: absUrl(deep_link),
+      };
+    });
+
+    // Filtres en mémoire (même logique que la page : match catégorie sur code/name/category, texte libre).
+    if (catTokens.length) {
+      hits = hits.filter((h) => {
+        const hay = foldText(`${h.category_code || ''} ${h.category || ''} ${h.name || ''}`);
+        return catTokens.some((tk) => hay.includes(tk));
+      });
+    }
+    if (query.length >= 2) {
+      const qTokens = query.split(/\s+/).filter((w) => w.length >= 2);
+      hits = hits.filter((h) => {
+        const hay = foldText(`${h.name || ''} ${h.description || ''} ${h.category || ''} ${h.city || ''} ${h.neighborhood || ''}`);
+        return qTokens.some((tk) => hay.includes(tk));
+      });
+    }
+    if (opts.country) {
+      const c = foldText(opts.country);
+      hits = hits.filter((h) => foldText(h.country) === c);
+    }
+    if (radius && hasGeo) hits = hits.filter((h) => h.distance_km !== null && h.distance_km <= radius);
+    // Tri : distance croissante (si géo) PUIS note décroissante — comme la page Proximité.
+    hits.sort((a, b) => {
+      if (a.distance_km !== null && b.distance_km !== null && a.distance_km !== b.distance_km) return a.distance_km - b.distance_km;
+      if (a.distance_km !== null && b.distance_km === null) return -1;
+      if (a.distance_km === null && b.distance_km !== null) return 1;
+      return (b.rating || 0) - (a.rating || 0);
+    });
+    return hits.slice(0, 6);
+  } catch (e: any) { logger.warn(`[copilot/services] ${e?.message}`); return []; }
+}
+
+/**
+ * search_shops — les BOUTIQUES elles-mêmes (par nom/catégorie), Y COMPRIS les boutiques PHYSIQUES
+ * sans produits en ligne (vitrine mondiale assumée : jamais masquées). Colonnes PUBLIQUES uniquement.
+ */
+async function runShopsSearch(q: string, opts: MarketSearchOpts = {}): Promise<any[]> {
+  const query = String(q || '').trim();
+  if (query.length < 2) return [];
+  const hasGeo = Number.isFinite(opts.lat) && Number.isFinite(opts.lng);
+  const words = query.split(/\s+/).map((w) => w.replace(/[%_\\,().]/g, '')).filter((w) => w.length >= 2).slice(0, 4);
+  try {
+    let builder = supabaseAdmin
+      .from('vendors')
+      .select('id, user_id, business_name, business_type, service_type, shop_slug, description, logo_url, cover_image_url, city, neighborhood, country, latitude, longitude, rating, total_reviews, followers_count')
+      .eq('is_active', true);
+    if (words.length > 1) builder = builder.or(words.map((w) => `business_name.ilike.%${w}%`).join(','));
+    else builder = builder.ilike('business_name', `%${(words[0] || query).replace(/[%_\\]/g, '\\$&')}%`);
+    if (opts.country) builder = builder.ilike('country', opts.country);
+    const { data } = await builder.limit(hasGeo ? 30 : 8);
+    const rows = ((data as any[]) || []);
+    if (rows.length === 0) return [];
+
+    // Certification : MÊME source que le badge UI (vendor_certifications par vendor.user_id).
+    const userIds = [...new Set(rows.map((r) => r.user_id).filter(Boolean))];
+    let certSet = new Set<string>();
+    if (userIds.length) {
+      const { data: certs } = await supabaseAdmin
+        .from('vendor_certifications').select('vendor_id').in('vendor_id', userIds).eq('status', 'CERTIFIE');
+      certSet = new Set((certs || []).map((c: any) => c.vendor_id));
+    }
+
+    let hits = rows.map((v) => {
+      const vLat = Number(v.latitude), vLng = Number(v.longitude);
+      const distance_km = hasGeo && Number.isFinite(vLat) && Number.isFinite(vLng)
+        ? Math.round(haversineKm(opts.lat as number, opts.lng as number, vLat, vLng) * 10) / 10
+        : null;
+      const shop_link = `/shop/${v.id}`;
+      return {
+        id: v.id, business_name: v.business_name || null,
+        business_type: v.business_type || null, service_type: v.service_type || null,
+        description: v.description ? String(v.description).slice(0, 160) : null,
+        image: v.logo_url || v.cover_image_url || null,
+        city: v.city || null, neighborhood: v.neighborhood || null, country: v.country || null,
+        certified: v.user_id ? certSet.has(v.user_id) : false,
+        rating: Number.isFinite(Number(v.rating)) ? Number(v.rating) : null,
+        total_reviews: Number.isFinite(Number(v.total_reviews)) ? Number(v.total_reviews) : 0,
+        followers: Number.isFinite(Number(v.followers_count)) ? Number(v.followers_count) : null,
+        distance_km, shop_link,
+        // URL ABSOLUE canonique (même chemin que l'aperçu OG shop : /boutique/:slug, repli /shop/:id).
+        url: absUrl(v.shop_slug ? `/boutique/${v.shop_slug}` : shop_link),
+      };
+    });
+    if (opts.radiusKm && hasGeo) hits = hits.filter((h) => h.distance_km !== null && h.distance_km <= (opts.radiusKm as number));
+    hits.sort((a, b) => {
+      if (a.distance_km !== null && b.distance_km !== null && a.distance_km !== b.distance_km) return a.distance_km - b.distance_km;
+      return (b.rating || 0) - (a.rating || 0);
+    });
+    return hits.slice(0, 5);
+  } catch (e: any) { logger.warn(`[copilot/shops] ${e?.message}`); return []; }
 }
 
 // ── Outils « MES DONNÉES » — compte CONNECTÉ UNIQUEMENT (filtrés EN DUR par userId ; le
@@ -453,7 +654,10 @@ async function createSupportTicket(userId: string, summary: string, service?: st
 //    SANS IA (compteur visible côté PDG). JAMAIS de cache sur une question personnelle (mon solde,
 //    ma commande…), avec image, ou si un outil « mes données »/action a servi à répondre. ──
 const FAQ_TTL_MS = 6 * 60 * 60 * 1000; // 6 h
-const FAQ_PERSONAL_TOOLS = new Set(['get_my_orders', 'get_my_wallet', 'get_my_bookings', 'create_support_ticket', 'propose_order', 'propose_booking', 'propose_fix', 'scan_incidents']);
+// Outils dont la réponse ne doit JAMAIS être servie depuis le cache partagé : données du compte,
+// actions, ET recherches géo/stock (résultats dépendants de la position et du stock du moment —
+// servir le « restaurant près de moi » d'un AUTRE utilisateur serait faux).
+const FAQ_PERSONAL_TOOLS = new Set(['get_my_orders', 'get_my_wallet', 'get_my_bookings', 'create_support_ticket', 'propose_order', 'propose_booking', 'propose_fix', 'scan_incidents', 'search_marketplace', 'search_products', 'search_local_services', 'search_shops']);
 // Marqueurs d'une question PERSONNELLE (1re personne, données de compte, escalade) → jamais de cache.
 const FAQ_PERSONAL_RE = /\b(mon|ma|mes|mien|mienne|j'ai|jai|je veux|mon compte|mon solde|mon wallet|mon portefeuille|ma commande|mes commandes|ma reservation|mes reservations|ma livraison|humain|support|ticket|reclamation|rembours)\b/i;
 function faqNormalize(q: string): string {
@@ -512,10 +716,26 @@ function replyLangDirective(lang: string): string {
 const COPILOT_TOOLS = [
   {
     name: 'search_marketplace',
-    description: "Recherche ENRICHIE de produits dans le marketplace 224Solutions : renvoie, PAR PRODUIT, le prix, le STOCK, le lien du produit, et sa BOUTIQUE (nom, pays/ville/quartier, si elle est CERTIFIÉE, sa note et son nombre d'avis, et la DISTANCE si la position de l'utilisateur est connue). À utiliser dès que l'utilisateur veut trouver/acheter un produit OU cherche une boutique proche. Utilise radius_km quand l'utilisateur mentionne une distance (« à 5 km », « près de moi »).",
+    description: "Recherche ENRICHIE de PRODUITS dans le marketplace 224Solutions : renvoie, PAR PRODUIT, le prix, le STOCK, le lien du produit (URL absolue partageable), et sa BOUTIQUE (nom, pays/ville/quartier, si elle est CERTIFIÉE, sa note et son nombre d'avis, et la DISTANCE si la position de l'utilisateur est connue). L'ESCALADE est AUTOMATIQUE : si un rayon est demandé et ne donne rien, la recherche relance elle-même 50 km → pays → monde et t'indique l'échelle du résultat. À utiliser dès que l'utilisateur veut trouver/acheter un PRODUIT. Utilise radius_km quand l'utilisateur mentionne une distance (« à 5 km » ; « près de moi » sans précision = 10). Ne mets PAS de radius_km si l'utilisateur veut chercher partout (« n'importe où », « dans le monde », « même à l'étranger »).",
     input_schema: { type: 'object', properties: {
       query: { type: 'string', description: 'mots-clés du produit recherché' },
-      radius_km: { type: 'number', description: 'rayon max en km autour de la position de l\'utilisateur (ex. 5, 10, 20) — à utiliser si l\'utilisateur veut des boutiques proches' },
+      radius_km: { type: 'number', description: 'rayon de DÉPART en km autour de la position de l\'utilisateur (ex. 5, 10, 20) — l\'escalade vers 50 km/pays/monde est automatique si 0 résultat' },
+    }, required: ['query'] },
+  },
+  {
+    name: 'search_local_services',
+    description: "Recherche les SERVICES et COMMERCES de PROXIMITÉ réels de la plateforme : restaurants, pharmacies, salons de coiffure/beauté, garages, cliniques, hôtels et tout prestataire local. À utiliser quand l'utilisateur cherche un SERVICE/COMMERCE (« un restaurant près de moi », « une pharmacie ouverte », « un garagiste ») — PAS un produit (produit = search_marketplace ; en cas de doute, utilise les DEUX). Renvoie par prestataire : nom, catégorie, ville/quartier, note+avis, distance, et le lien réel de sa page (URL absolue partageable). L'escalade rayon → 50 km → pays → monde est automatique si 0 résultat.",
+    input_schema: { type: 'object', properties: {
+      query: { type: 'string', description: 'texte libre optionnel (nom du prestataire, plat, quartier…)' },
+      category: { type: 'string', description: "catégorie naturelle : restaurant, pharmacie, salon, coiffure, garage, clinique, hôtel, boutique…" },
+      radius_km: { type: 'number', description: "rayon de DÉPART en km (« près de moi » sans précision = 10) — escalade automatique si 0 résultat" },
+    } },
+  },
+  {
+    name: 'search_shops',
+    description: "Recherche les BOUTIQUES elles-mêmes PAR NOM (ou catégorie), Y COMPRIS les boutiques PHYSIQUES sans produits en ligne (vitrine : elles se visitent sur place). À utiliser pour « tu connais la boutique X ? », « où se trouve la boutique Y ? ». Renvoie : nom, type (physique/en ligne/hybride), pays/ville/quartier, certifiée, note+avis, followers, et le lien de sa page (URL absolue partageable). Une boutique physique se présente TOUJOURS (« visite sur place »), jamais masquée.",
+    input_schema: { type: 'object', properties: {
+      query: { type: 'string', description: 'nom (même partiel) ou catégorie de la boutique' },
     }, required: ['query'] },
   },
   {
@@ -638,9 +858,30 @@ interface ToolCtx {
   userId: string;
   geo: { lat?: number; lng?: number };
   products: any[];
+  services: any[];   // cartes prestataires de proximité (search_local_services)
+  shops: any[];      // cartes boutiques (search_shops)
   actions: any[];
   sources: { title: string; url: string }[];
   usedTools: Set<string>;
+  // Pays de l'utilisateur, résolu UNE fois par tour (palier « pays » de l'escalade).
+  userCountry?: string | null;
+  userCountryResolved?: boolean;
+}
+
+/** Résout (et mémoïse dans le ctx) le pays de l'utilisateur pour le palier « pays ». */
+async function resolveUserCountry(ctx: ToolCtx): Promise<string | null> {
+  if (!ctx.userCountryResolved) {
+    ctx.userCountryResolved = true;
+    ctx.userCountry = await getUserCountryName(ctx.userId);
+  }
+  return ctx.userCountry ?? null;
+}
+
+/** Préambule du tool_result quand l'escalade a joué : le modèle sait OÙ le résultat a été trouvé. */
+function escalationHeader(escalated: boolean, scope: string, tried: string[]): string {
+  if (!escalated) return '';
+  const before = tried.slice(0, -1).join(' puis ');
+  return `AUCUN résultat à ${before} — trouvé à l'échelle : ${scope}. Présente-le comme une PROPOSITION positive (dis OÙ, mentionne pays/ville si hors du pays de l'utilisateur, et propose d'envoyer le lien).\n`;
 }
 
 // Exécute UN bloc tool_use et renvoie le texte du tool_result (ou null si non géré : bloc natif).
@@ -650,21 +891,62 @@ interface ToolCtx {
 async function dispatchToolBlock(block: any, ctx: ToolCtx): Promise<string | null> {
   if (block?.type !== 'tool_use') return null;
   ctx.usedTools.add(String(block.name || ''));
-  const { userId, geo, products, actions, sources } = ctx;
+  const { userId, geo, products, services, shops, actions, sources } = ctx;
+  const hasGeo = Number.isFinite(geo.lat) && Number.isFinite(geo.lng);
   if (block.name === 'search_marketplace' || block.name === 'search_products') {
-    const found = await runMarketplaceSearch(block.input?.query || '', { radiusKm: block.input?.radius_km, lat: geo.lat, lng: geo.lng });
+    const userCountry = await resolveUserCountry(ctx);
+    // ESCALADE CÔTÉ BACKEND : rayon demandé → 50 km → pays → monde, en UN appel d'outil.
+    const { hits: found, scope, escalated, tried } = await searchWithEscalation(
+      (o) => runMarketplaceSearch(block.input?.query || '', { radiusKm: o.radiusKm, country: o.country, lat: geo.lat, lng: geo.lng }),
+      { radiusKm: Number(block.input?.radius_km) || undefined, hasGeo, userCountry },
+    );
     for (const f of found) if (!products.some((p) => p.id === f.id)) products.push(f);
-    return found.length ? found.map((p) => {
+    return found.length ? escalationHeader(escalated, scope, tried) + found.map((p) => {
       const v = p.vendor || {};
       const parts = [`${p.name} — ${p.price} ${p.currency}`,
         `stock: ${p.in_stock === null ? 'n/c' : p.in_stock ? 'en stock (' + p.stock + ')' : 'RUPTURE'}`,
-        `boutique: ${v.business_name || '?'}${v.certified ? ' ✓CERTIFIÉE' : ''}`];
+        `boutique: ${v.business_name || '?'}${v.certified ? ' ✓CERTIFIÉE' : ''}${v.business_type === 'physical' ? ' (PHYSIQUE — visite sur place)' : ''}`];
       if (v.city || v.country) parts.push(`lieu: ${[v.city, v.country].filter(Boolean).join(', ')}`);
       if (v.distance_km != null) parts.push(`distance: ${v.distance_km} km`);
       if (v.rating != null) parts.push(`note: ${v.rating}/5 (${v.total_reviews} avis)`);
-      parts.push(`lien: ${p.deep_link}`);
+      parts.push(`lien: ${p.url || p.deep_link}`);
       return parts.join(' | ') + ` (id:${p.id})`;
-    }).join('\n') : 'Aucun produit trouvé' + (block.input?.radius_km ? ` dans un rayon de ${block.input.radius_km} km — propose d'élargir le rayon.` : '.');
+    }).join('\n')
+      : `Aucun produit trouvé, même à l'échelle mondiale (paliers essayés : ${tried.join(' → ')}). Dis-le simplement (pas de tableau), propose d'autres mots-clés, le lien /marketplace, ou une recherche web de références.`;
+  }
+  if (block.name === 'search_local_services') {
+    const userCountry = await resolveUserCountry(ctx);
+    const { hits: found, scope, escalated, tried } = await searchWithEscalation(
+      (o) => runLocalServicesSearch(block.input?.query || '', block.input?.category || '', { radiusKm: o.radiusKm, country: o.country, lat: geo.lat, lng: geo.lng }),
+      { radiusKm: Number(block.input?.radius_km) || undefined, hasGeo, userCountry },
+    );
+    for (const f of found) if (!services.some((s) => s.id === f.id)) services.push(f);
+    return found.length ? escalationHeader(escalated, scope, tried) + found.map((s) => {
+      const parts = [`${s.name || '?'}${s.source === 'vendor' ? ' (boutique)' : ''}`,
+        `catégorie: ${s.category || '?'}`];
+      if (s.city || s.neighborhood || s.country) parts.push(`lieu: ${[s.neighborhood, s.city, s.country].filter(Boolean).join(', ')}`);
+      if (s.distance_km != null) parts.push(`distance: ${s.distance_km} km`);
+      if (s.rating != null && s.rating > 0) parts.push(`note: ${s.rating}/5 (${s.total_reviews} avis)`);
+      parts.push(`lien: ${s.url || s.deep_link}`);
+      return parts.join(' | ') + ` (id:${s.id})`;
+    }).join('\n')
+      : `Aucun prestataire trouvé, même à l'échelle mondiale (paliers essayés : ${tried.join(' → ')}). Dis-le simplement et honnêtement (pas de tableau), et propose la page /proximite de l'app pour parcourir les services.`;
+  }
+  if (block.name === 'search_shops') {
+    const found = await runShopsSearch(block.input?.query || '', { lat: geo.lat, lng: geo.lng });
+    for (const f of found) if (!shops.some((s) => s.id === f.id)) shops.push(f);
+    const typeLabel = (bt: string | null) => bt === 'physical' ? 'PHYSIQUE (visite sur place, pas de commande en ligne)' : bt === 'hybrid' ? 'hybride (en ligne + sur place)' : bt ? 'en ligne' : '?';
+    return found.length ? found.map((v) => {
+      const parts = [`${v.business_name || '?'}`, `type: ${typeLabel(v.business_type)}`];
+      if (v.city || v.neighborhood || v.country) parts.push(`lieu: ${[v.neighborhood, v.city, v.country].filter(Boolean).join(', ')}`);
+      if (v.certified) parts.push('✓CERTIFIÉE');
+      if (v.rating != null && v.rating > 0) parts.push(`note: ${v.rating}/5 (${v.total_reviews} avis)`);
+      if (v.followers != null && v.followers > 0) parts.push(`${v.followers} abonnés`);
+      if (v.distance_km != null) parts.push(`distance: ${v.distance_km} km`);
+      parts.push(`lien: ${v.url || v.shop_link}`);
+      return parts.join(' | ') + ` (id:${v.id})`;
+    }).join('\n')
+      : "Aucune boutique de ce nom trouvée sur la plateforme. Dis-le simplement et propose de chercher le produit (search_marketplace) ou de vérifier l'orthographe.";
   }
   if (block.name === 'search_web') {
     if (!allowWebSearch(userId)) return 'Limite de recherches web atteinte (10 / 10 min). Réessaie plus tard.';
@@ -699,9 +981,11 @@ async function dispatchToolBlock(block: any, ctx: ToolCtx): Promise<string | nul
 async function callAnthropicAgentic(
   key: string, sys: string, chat: any[], tools: any[], userId: string, useNativeWebSearch: boolean,
   geo: { lat?: number; lng?: number } = {},
-): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[]; nativeRejected?: boolean }> {
+): Promise<{ text: string | null; products: any[]; services: any[]; shops: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[]; nativeRejected?: boolean }> {
   const messages: any[] = chat.map(toAnthropicMsg);
   const products: any[] = [];
+  const services: any[] = [];
+  const shops: any[] = [];
   const actions: any[] = [];
   const sources: { title: string; url: string }[] = [];
   const usedTools = new Set<string>(); // FIX 8 — trace des outils appelés (cacheabilité FAQ)
@@ -719,10 +1003,10 @@ async function callAnthropicAgentic(
         // Outil natif non supporté par le compte → signaler pour réessai sans lui.
         if (useNativeWebSearch && turn === 0 && (r.status === 400 || r.status === 404)) {
           logger.warn(`[copilot] web_search natif refusé (${r.status}) → repli search_web serveur`);
-          return { text: null, products, actions, sources, usedTools: [...usedTools], nativeRejected: true };
+          return { text: null, products, services, shops, actions, sources, usedTools: [...usedTools], nativeRejected: true };
         }
         logger.warn(`[copilot] anthropic(tools) ${r.status}`);
-        return { text: null, products, actions, sources, usedTools: [...usedTools] };
+        return { text: null, products, services, shops, actions, sources, usedTools: [...usedTools] };
       }
       const data: any = await r.json();
       const content: any[] = Array.isArray(data.content) ? data.content : [];
@@ -738,7 +1022,7 @@ async function callAnthropicAgentic(
       if (data.stop_reason === 'tool_use') {
         messages.push({ role: 'assistant', content });
         const toolResults: any[] = [];
-        const ctx: ToolCtx = { userId, geo, products, actions, sources, usedTools };
+        const ctx: ToolCtx = { userId, geo, products, services, shops, actions, sources, usedTools };
         for (const block of content) {
           if (block?.type !== 'tool_use') continue;
           const c = await dispatchToolBlock(block, ctx);
@@ -748,10 +1032,10 @@ async function callAnthropicAgentic(
         continue;
       }
       const txt = content.find((c: any) => c?.type === 'text')?.text?.trim() || null;
-      return { text: txt, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
+      return { text: txt, products: products.slice(0, 6), services: services.slice(0, 6), shops: shops.slice(0, 5), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
     }
-    return { text: null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
-  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), actions, sources, usedTools: [...usedTools] }; }
+    return { text: null, products: products.slice(0, 6), services: services.slice(0, 6), shops: shops.slice(0, 5), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] };
+  } catch (e: any) { logger.warn(`[copilot] anthropic(tools) err ${e?.message}`); return { text: null, products: products.slice(0, 6), services: services.slice(0, 6), shops: shops.slice(0, 5), actions, sources, usedTools: [...usedTools] }; }
 }
 
 // FIX 4 — Variante STREAMÉE (Anthropic stream:true). Même boucle d'outils (dispatchToolBlock
@@ -764,14 +1048,16 @@ async function callAnthropicAgenticStream(
   geo: { lat?: number; lng?: number },
   onDelta: (t: string) => void,
   startedRef: { started: boolean },
-): Promise<{ text: string | null; products: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[] }> {
+): Promise<{ text: string | null; products: any[]; services: any[]; shops: any[]; actions: any[]; sources: { title: string; url: string }[]; usedTools: string[] }> {
   const messages: any[] = chat.map(toAnthropicMsg);
   const products: any[] = [];
+  const services: any[] = [];
+  const shops: any[] = [];
   const actions: any[] = [];
   const sources: { title: string; url: string }[] = [];
   const usedTools = new Set<string>();
   let fullText = '';
-  const ret = () => ({ text: fullText.trim() || null, products: products.slice(0, 6), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] });
+  const ret = () => ({ text: fullText.trim() || null, products: products.slice(0, 6), services: services.slice(0, 6), shops: shops.slice(0, 5), actions, sources: sources.slice(0, 6), usedTools: [...usedTools] });
   try {
     for (let turn = 0; turn < 5; turn++) {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -839,7 +1125,7 @@ async function callAnthropicAgenticStream(
       if (stopReason === 'tool_use') {
         messages.push({ role: 'assistant', content });
         const toolResults: any[] = [];
-        const ctx: ToolCtx = { userId, geo, products, actions, sources, usedTools };
+        const ctx: ToolCtx = { userId, geo, products, services, shops, actions, sources, usedTools };
         for (const block of content) {
           if (block?.type !== 'tool_use') continue;
           const c = await dispatchToolBlock(block, ctx);
@@ -1010,6 +1296,9 @@ async function prepareCopilotTurn(req: AuthenticatedRequest): Promise<{ error?: 
 
   const sys = (SERVICE_PROMPTS[service] || DEFAULT_PROMPT)
     + " Ne donne jamais de conseil dangereux ; pour un acte technique risqué, recommande un professionnel."
+    + " FORMATAGE : texte simple et lisible dans une bulle de chat mobile. JAMAIS de titres markdown (##) ni de tableaux markdown (lignes avec |). Listes courtes à tirets et gras avec parcimonie. Réponses compactes."
+    + " CHOIX D'OUTIL DE RECHERCHE : un SERVICE/COMMERCE de proximité (restaurant, pharmacie, salon, garage, clinique…) → search_local_services ; un PRODUIT (« un cric voiture ») → search_marketplace ; une BOUTIQUE par son NOM → search_shops ; en cas de doute → les deux. « près de moi » sans précision = radius_km 10. « n'importe où / dans le monde / même à l'étranger / en France » = PAS de radius_km (le pays cité s'ajoute au texte de recherche)."
+    + " PORTÉE MONDIALE & ESCALADE : la plateforme est une vitrine MONDIALE. La recherche escalade elle-même (rayon demandé → 50 km → pays → monde) et t'indique l'échelle du résultat — ne conclus JAMAIS « indisponible/aucun » sans que la recherche (avec son escalade mondiale) ait été tentée. Dis toujours OÙ le résultat a été trouvé ; hors du pays de l'utilisateur, affiche pays/ville (ex. « Grenoble, France 🇫🇷 »), devise = celle du vendeur. Formule en PROPOSITION positive de vendeur : « Aucune boutique ne l'a à 20 km. Par contre, [Boutique] à Coyah (47 km) l'a en stock à 50 000 GNF — certifiée ✓ ⭐4,6. Je t'envoie le lien ? » — jamais un « aucun résultat » sec. Une boutique PHYSIQUE sans vente en ligne se présente quand même en vitrine (« boutique physique à Madina, Conakry — visite sur place ») avec le lien de sa page — JAMAIS masquée. Quand l'utilisateur demande le lien, cite l'URL absolue fournie par l'outil (elle est cliquable et partageable)."
     + " CONFIDENTIALITÉ ABSOLUE : tu ne révèles JAMAIS les données d'un AUTRE compte (vendeur ou client) — ni ses ventes, commandes, wallet, solde, clients ou messages privés. Si on te demande les données d'autrui (ex. « combien a vendu la boutique X ? », « quel est le solde de Y ? »), refuse poliment : ce sont des informations privées. Tu ne parles que (a) des données PUBLIQUES (produits actifs, infos publiques de boutique) et (b) des données du COMPTE CONNECTÉ, via les outils get_my_orders / get_my_wallet / get_my_bookings."
     + " ESCALADE : si tu ne parviens PAS à résoudre le problème après avoir vraiment essayé, ou si l'utilisateur demande à parler à un humain / au support, propose de créer un ticket puis appelle create_support_ticket avec un RÉSUMÉ fidèle (problème + ce qui a été tenté). Ne promets jamais une intervention humaine sans avoir créé le ticket."
     + " VISION : tu AS la vision — tu analyses les images/photos. Ne dis JAMAIS que tu es un assistant « 100% textuel » ni que tu ne peux pas voir les photos (c'est FAUX). Si l'utilisateur fait référence à une photo déjà envoyée mais absente du message courant, appuie-toi sur TA description précédente dans l'historique de la conversation et poursuis (lance search_web ou search_marketplace selon sa demande — références de prix, produits similaires…)."
@@ -1057,7 +1346,7 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     // FIX 8 — cache FAQ : réponse instantanée sans IA.
     if (cacheHit) {
       await remember(userId, service, message, cacheHit);
-      ok(res, { reply: cacheHit, fallback: false, source: 'cache', products: [], actions: [], sources: [] });
+      ok(res, { reply: cacheHit, fallback: false, source: 'cache', products: [], services: [], shops: [], actions: [], sources: [] });
       return;
     }
 
@@ -1065,6 +1354,8 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
     let reply: string | null = null;
     let provider = '';
     let products: any[] = [];
+    let services: any[] = [];
+    let shops: any[] = [];
     let actions: any[] = [];
     let usedTools: string[] = []; // FIX 8 — outils réellement appelés (décide de la cacheabilité)
     // Sources web (URLs citables) : seed = repli non-Anthropic ; sinon fournies par l'outil.
@@ -1077,7 +1368,7 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
       const useNative = process.env.COPILOT_NATIVE_WEB_SEARCH === '1';
       let out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, useNative, userGeo);
       if (out.nativeRejected) out = await callAnthropicAgentic(anthropicKey, sys, chat, tools, userId, false, userGeo);
-      reply = out.text; products = out.products; actions = out.actions;
+      reply = out.text; products = out.products; services = out.services; shops = out.shops; actions = out.actions;
       usedTools = out.usedTools || [];
       if (out.sources.length) sources = out.sources;
       if (reply) provider = 'anthropic';
@@ -1116,7 +1407,7 @@ router.post('/', verifyJWT, async (req: AuthenticatedRequest, res: Response) => 
       }
     }
     // Contrat API : enveloppe { success, data } (migration 2026-07-03, consommateurs frontend mis à jour ensemble).
-    ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, actions, sources: sources.slice(0, 6) });
+    ok(res, { reply: finalReply, fallback, source: fallback ? (!hasImage && web ? 'web' : 'local') : provider, products, services, shops, actions, sources: sources.slice(0, 6) });
   } catch (e: any) {
     logger.error(`[copilot] ${e?.message}`);
     fail(res, 500, 'Erreur Copilot');
@@ -1146,7 +1437,7 @@ router.post('/stream', verifyJWT, async (req: AuthenticatedRequest, res: Respons
   if (t.cacheHit) {
     await remember(t.userId, t.service, t.message, t.cacheHit);
     send('delta', { text: t.cacheHit });
-    send('done', { fallback: false, source: 'cache', products: [], actions: [], sources: [] });
+    send('done', { fallback: false, source: 'cache', products: [], services: [], shops: [], actions: [], sources: [] });
     res.end();
     return;
   }
@@ -1177,13 +1468,13 @@ router.post('/stream', verifyJWT, async (req: AuthenticatedRequest, res: Respons
         void faqCachePut(t.message, t.service, t.lang, finalText);
       }
     }
-    send('done', { fallback: false, source: 'anthropic', products: out.products, actions: out.actions, sources: out.sources.slice(0, 6) });
+    send('done', { fallback: false, source: 'anthropic', products: out.products, services: out.services, shops: out.shops, actions: out.actions, sources: out.sources.slice(0, 6) });
     res.end();
   } catch (e: any) {
     logger.warn(`[copilot/stream] route err ${e?.message}`);
     // Erreur AVANT le 1er delta → repli transparent ; sinon on clôt proprement ce qui a été envoyé.
     if (!startedRef.started) send('fallback', { reason: 'error' });
-    else send('done', { fallback: false, products: [], actions: [], sources: [] });
+    else send('done', { fallback: false, products: [], services: [], shops: [], actions: [], sources: [] });
     res.end();
   }
 });

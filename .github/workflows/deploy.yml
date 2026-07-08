@@ -25,6 +25,10 @@ jobs:
           ABLY_API_KEY: ${{ secrets.ABLY_API_KEY }}
           AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
           AGORA_APP_CERTIFICATE: ${{ secrets.AGORA_APP_CERTIFICATE }}
+          AGORA_CUSTOMER_ID: ${{ secrets.AGORA_CUSTOMER_ID }}
+          AGORA_CUSTOMER_SECRET: ${{ secrets.AGORA_CUSTOMER_SECRET }}
+          GCS_HMAC_ACCESS_KEY: ${{ secrets.GCS_HMAC_ACCESS_KEY }}
+          GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
@@ -51,10 +55,20 @@ jobs:
           # Meme ecriture robuste que Ably (supprime puis reecrit ; ne fait rien si secret vide).
           if [ -n "${AGORA_APP_ID}" ]; then sed -i '/^AGORA_APP_ID=/d' .env; echo "AGORA_APP_ID=${AGORA_APP_ID}" >> .env; fi
           if [ -n "${AGORA_APP_CERTIFICATE}" ]; then sed -i '/^AGORA_APP_CERTIFICATE=/d' .env; echo "AGORA_APP_CERTIFICATE=${AGORA_APP_CERTIFICATE}" >> .env; fi
+          # Agora Cloud Recording (replay serveur) + cle HMAC GCS (ecriture S3-compatible par Agora).
+          # Meme ecriture robuste (supprime puis reecrit = rotation OK ; rien si secret vide —
+          # l'enregistrement serveur reste alors desactive, repli client). JAMAIS de valeur loguee.
+          if [ -n "${AGORA_CUSTOMER_ID}" ]; then sed -i '/^AGORA_CUSTOMER_ID=/d' .env; echo "AGORA_CUSTOMER_ID=${AGORA_CUSTOMER_ID}" >> .env; fi
+          if [ -n "${AGORA_CUSTOMER_SECRET}" ]; then sed -i '/^AGORA_CUSTOMER_SECRET=/d' .env; echo "AGORA_CUSTOMER_SECRET=${AGORA_CUSTOMER_SECRET}" >> .env; fi
+          if [ -n "${GCS_HMAC_ACCESS_KEY}" ]; then sed -i '/^GCS_HMAC_ACCESS_KEY=/d' .env; echo "GCS_HMAC_ACCESS_KEY=${GCS_HMAC_ACCESS_KEY}" >> .env; fi
+          if [ -n "${GCS_HMAC_SECRET}" ]; then sed -i '/^GCS_HMAC_SECRET=/d' .env; echo "GCS_HMAC_SECRET=${GCS_HMAC_SECRET}" >> .env; fi
           git fetch origin main
           git reset --hard origin/main
           npm install --no-audit --no-fund
+          # Redemarrage : relit le .env via dotenv au boot. Mono-instance = l'API porte AUSSI les
+          # jobs (RUN_BACKGROUND_JOBS) ; si un process worker PM2 dedie existe, il est relance aussi.
           pm2 restart 224-backend --update-env
+          pm2 describe 224-worker >/dev/null 2>&1 && pm2 restart 224-worker --update-env || true
           pm2 save
           echo DEPLOY_OK
           REMOTE

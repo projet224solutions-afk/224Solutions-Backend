@@ -24,6 +24,7 @@ import { createNotification } from '../services/notification.service.js';
 import { loadServiceAccount, getPrivateBucketName, getBucketName, generateSignedUrl } from '../services/gcs.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
 import { autoReconcileMonitorCases } from '../services/escrowMonitor.service.js';
+import { finalizeRecordingIfReady, isCloudRecordingConfigured } from '../services/agoraRecording.service.js';
 
 const REDIS_JOBS_ENABLED = (process.env.REDIS_ENABLED ?? (env.isProduction ? 'true' : 'false')) === 'true';
 
@@ -512,6 +513,34 @@ registerHandler('live.reap-orphans', async () => {
     .select('id');
   if (error) { logger.warn(`[live] reap-orphans: ${error.message}`); return; }
   if (data && data.length) logger.info(`[live] ${data.length} live(s) orphelin(s) clôturé(s) (> ${maxHours}h sans fin)`);
+});
+
+// CHANTIER 2 — FILET REPLAY SERVEUR + STOP D'OFFICE (anti-facturation). Pour tout live TERMINÉ
+// dont l'enregistrement Agora n'est pas encore publié (recording_status recording/processing,
+// pas de replay_url), on tente le stop (idempotent → arrête la facturation) et on publie le MP4
+// dès qu'il est prêt en GCS. Aucun live avec un fichier existant ne reste orphelin.
+registerHandler('live.recording-safety-net', async () => {
+  if (!isCloudRecordingConfigured()) return; // enregistrement serveur désactivé → repli client
+  const { data, error } = await supabaseAdmin
+    .from('live_streams')
+    .select('id, channel, recording_resource_id, recording_sid, recording_uid, ended_at')
+    .eq('status', 'ended')
+    .is('replay_url', null)
+    .in('recording_status', ['recording', 'processing'])
+    .not('recording_sid', 'is', null)
+    .limit(50);
+  if (error) { logger.warn(`[live/recording] safety-net: ${error.message}`); return; }
+  for (const s of (data || []) as any[]) {
+    // Abandon après 6 h sans fichier → 'failed' (la reprise vendeur / le repli client prend le relais).
+    if (s.ended_at && Date.now() - new Date(s.ended_at).getTime() > 6 * 3600 * 1000) {
+      await supabaseAdmin.from('live_streams').update({ recording_status: 'failed' }).eq('id', s.id).is('replay_url', null);
+      continue;
+    }
+    try {
+      const url = await finalizeRecordingIfReady(s);
+      if (url) logger.info(`[live/recording] replay serveur publié (filet) ${s.id}`);
+    } catch (e: any) { logger.warn(`[live/recording] finalize ${s.id}: ${e?.message}`); }
+  }
 });
 
 // 🤖 Surveillance : réconciliation automatique — un cas signalé dont la CORRECTION est
@@ -1072,6 +1101,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('calls.expire-ringing', {}).catch(() => {}), 60 * 1000));
       // Live : reaper des fantômes (hôte crashé) toutes les heures
       recurringTimers.push(setInterval(() => this.enqueue('live.reap-orphans', {}).catch(() => {}), everyHour));
+      // Live : filet replay serveur + stop d'office (anti-facturation) toutes les 5 min
+      recurringTimers.push(setInterval(() => this.enqueue('live.recording-safety-net', {}).catch(() => {}), 5 * 60 * 1000));
       // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
       recurringTimers.push(setInterval(() => this.enqueue('monitor.auto-reconcile', {}).catch(() => {}), 5 * 60 * 1000));
 
@@ -1119,6 +1150,8 @@ export const jobQueue = {
       await queue.add('calls.expire-ringing', {}, { repeat: { every: 60 * 1000 } });
       // Live : reaper des fantômes (hôte crashé) toutes les heures
       await queue.add('live.reap-orphans', {}, { repeat: { every: 3600000 } });
+      // Live : filet replay serveur + stop d'office (anti-facturation) toutes les 5 min
+      await queue.add('live.recording-safety-net', {}, { repeat: { every: 5 * 60 * 1000 } });
       // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
       await queue.add('monitor.auto-reconcile', {}, { repeat: { every: 5 * 60 * 1000 } });
 

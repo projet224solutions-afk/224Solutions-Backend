@@ -80,6 +80,16 @@ export const env = {
   AGORA_APP_ID: optionalEnv('AGORA_APP_ID', ''),
   AGORA_APP_CERTIFICATE: optionalEnv('AGORA_APP_CERTIFICATE', ''),
 
+  // Agora Cloud Recording (replay serveur GARANTI) — REST acquire/start/stop en Basic auth avec
+  // les clés RESTful de la console Agora (DISTINCTES de l'App Certificate). Le fichier est écrit
+  // DIRECTEMENT dans notre bucket GCS via l'API S3-compatible → il faut une clé HMAC GCS (≠ service
+  // account RSA). TOUS optionnels : absents → l'enregistrement serveur est désactivé (best-effort,
+  // le repli client prend le relais). JAMAIS en base — process.env uniquement.
+  AGORA_CUSTOMER_ID: optionalEnv('AGORA_CUSTOMER_ID', ''),
+  AGORA_CUSTOMER_SECRET: optionalEnv('AGORA_CUSTOMER_SECRET', ''),
+  GCS_HMAC_ACCESS_KEY: optionalEnv('GCS_HMAC_ACCESS_KEY', ''),
+  GCS_HMAC_SECRET: optionalEnv('GCS_HMAC_SECRET', ''),
+
   // OAuth (Google)
   OAUTH_CLIENT_ID: optionalEnv('OAUTH_CLIENT_ID', ''),
   OAUTH_CLIENT_SECRET: optionalEnv('OAUTH_CLIENT_SECRET', ''),

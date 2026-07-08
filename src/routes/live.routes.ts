@@ -13,6 +13,7 @@ import { ok, fail } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { idempotencyGuard } from '../middlewares/idempotency.middleware.js';
 import { issueLiveToken, currentLiveProvider } from '../services/liveToken.service.js';
+import { startLiveRecording, stopLiveRecording } from '../services/agoraRecording.service.js';
 import { uuidToNumericUid } from '../services/agoraToken.js';
 import { getBucketName, loadServiceAccount, generateSignedUrl } from '../services/gcs.service.js';
 
@@ -126,6 +127,12 @@ router.post('/streams/:id/start', verifyJWT, async (req: AuthenticatedRequest, r
 
     const provider = currentLiveProvider();
     const issued = await issueLiveToken(provider, (stream as any).channel, 'host', undefined, bearer(req));
+    // CHANTIER 2 — ENREGISTREMENT SERVEUR (best-effort, fire-and-forget) : ne bloque JAMAIS le
+    // démarrage du live. Si les secrets Cloud Recording manquent → no-op (repli client).
+    if (provider === 'agora') {
+      void startLiveRecording({ streamId, channel: issued.channel })
+        .catch((e) => logger.warn(`[live/recording] start ${streamId}: ${e?.message}`));
+    }
     return ok(res, { token: issued.token, channel: issued.channel, provider, uid: issued.uid, appId: issued.appId });
   } catch (e: any) {
     logger.error(`[live/start] ${e?.message}`);
@@ -158,7 +165,9 @@ router.post('/streams/:id/end', verifyJWT, async (req: AuthenticatedRequest, res
     const streamId = req.params.id;
     const { replay_url } = req.body || {};
     const { data: stream } = await supabaseAdmin
-      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+      .from('live_streams')
+      .select('vendor_user_id, channel, recording_resource_id, recording_sid, recording_uid')
+      .eq('id', streamId).maybeSingle();
     if (!stream) return fail(res, 404, 'Live introuvable');
     if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
 
@@ -167,6 +176,16 @@ router.post('/streams/:id/end', verifyJWT, async (req: AuthenticatedRequest, res
       p_replay_url: typeof replay_url === 'string' && replay_url ? replay_url : null,
     });
     if (error) return fail(res, 400, error.message);
+
+    // CHANTIER 2 — STOP de l'enregistrement serveur (best-effort). Le fichier finalisé arrive en
+    // GCS ; l'URL du replay est publiée par le stop (si prête) ou par le worker filet (sinon).
+    const s = stream as any;
+    if (s.recording_resource_id && s.recording_sid) {
+      void stopLiveRecording({
+        streamId, channel: s.channel, resourceId: s.recording_resource_id,
+        sid: s.recording_sid, recordingUid: s.recording_uid,
+      }).catch((e) => logger.warn(`[live/recording] stop ${streamId}: ${e?.message}`));
+    }
     return ok(res, data);
   } catch (e: any) {
     logger.error(`[live/end] ${e?.message}`);
@@ -792,6 +811,7 @@ router.get('/my-streams', verifyJWT, async (req: AuthenticatedRequest, res: Resp
       totalLikes: s.total_likes ?? 0, replayViews: s.replay_views ?? 0,
       viewerCount: s.viewer_count ?? 0, peakViewerCount: s.peak_viewer_count ?? 0,
       commentsCount: Number(s.comments_count) || 0, purchasesCount: Number(s.purchases_count) || 0,
+      recordingStatus: s.recording_status || 'none',
       startedAt: s.started_at, endedAt: s.ended_at, createdAt: s.created_at,
     }));
     const t = ((totalsRows as any[]) || [])[0] || {};

@@ -213,11 +213,21 @@ router.post('/streams/:id/replay-ready', verifyJWT, async (req: AuthenticatedReq
     if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
 
     const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
-    const { error } = await supabaseAdmin
+    // 🔒 PREMIER ÉCRIVAIN GAGNE : ne JAMAIS écraser un replay déjà publié (le recording serveur
+    // agoraRecording.service pose déjà `.is('replay_url', null)`). Sans ça, le repli client
+    // (« Reprendre l'envoi ») pouvait CLOBBER le MP4 serveur — course + doublon de replay.
+    const { data: updated, error } = await supabaseAdmin
       .from('live_streams')
       .update({ replay_url, replay_expires_at: expires })
-      .eq('id', streamId);
+      .eq('id', streamId)
+      .is('replay_url', null)
+      .select('id');
     if (error) return fail(res, 400, error.message);
+    // 0 ligne = un replay existait déjà (recording serveur ou envoi précédent) → succès idempotent,
+    // pas d'écrasement. Le blob local peut être supprimé côté client.
+    if (!updated || updated.length === 0) {
+      return ok(res, { streamId, replayUrl: replay_url, already_published: true });
+    }
     return ok(res, { streamId, replayUrl: replay_url });
   } catch (e: any) {
     logger.error(`[live/replay-ready] ${e?.message}`);

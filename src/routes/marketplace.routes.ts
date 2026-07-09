@@ -14,7 +14,9 @@ import { cache } from '../config/redis.js';
 
 const router = Router();
 
-// Seuil minimal de produits pour basculer AUTOMATIQUEMENT un utilisateur sur son pays.
+// Seuil de produits (STRICT) pour basculer AUTOMATIQUEMENT un utilisateur sur son pays.
+// Règle PDG : AU PLUS 30 (≤ 30) → Mondial ; DÉPASSE 30 (≥ 31) → Produits (son pays).
+// La comparaison est donc « productCount > HOME_COUNTRY_MIN_PRODUCTS » (strict, pas >=).
 const HOME_COUNTRY_MIN_PRODUCTS = 30;
 
 // Règle marketplace : seuls les vendeurs « en ligne » / « hybride » exposent des produits.
@@ -34,10 +36,30 @@ const COUNTRY_CODE_TO_NAME: Record<string, string> = {
 
 const norm = (s?: string | null) => (s || '').trim().replace(/\s+/g, ' ').toLowerCase();
 
+// Inverse de COUNTRY_CODE_TO_NAME : nom FR (normalisé) → code ISO-2. Construit une seule fois.
+const COUNTRY_NAME_TO_CODE: Record<string, string> = Object.entries(COUNTRY_CODE_TO_NAME)
+  .reduce((acc, [code, name]) => { acc[norm(name)] = code; return acc; }, {} as Record<string, string>);
+
+// Variantes d'un pays pour le comptage : le pays peut être stocké en NOM ('France') OU en
+// CODE ISO ('FR') dans vendors.country → on matche toutes ses variantes connues (comme la RPC v2).
+function countryVariants(country: string): string[] {
+  const out = new Set<string>();
+  const raw = country.trim();
+  if (!raw) return [];
+  out.add(raw);
+  if (raw.length === 2 && COUNTRY_CODE_TO_NAME[raw.toUpperCase()]) {
+    out.add(COUNTRY_CODE_TO_NAME[raw.toUpperCase()]); // code → nom
+  } else {
+    const code = COUNTRY_NAME_TO_CODE[norm(raw)];
+    if (code) out.add(code); // nom → code
+  }
+  return [...out];
+}
+
 interface HomeCountryDecision {
   success: boolean;
   homeCountry: string | null;   // nom du pays résolu (présent dans les vendeurs), ou null
-  qualifies: boolean;           // productCount >= threshold
+  qualifies: boolean;           // productCount > threshold (seuil strict)
   productCount: number;
   threshold: number;
   countries: string[];          // pays disponibles (chips) — vendeurs visibles
@@ -50,31 +72,20 @@ const SAFE_FALLBACK: HomeCountryDecision = {
 
 /**
  * Repli JS (utilisé si la RPC atomique n'est pas encore appliquée en base) :
- * réplique la décision via 2 requêtes (comptage produits + liste pays).
+ * (1) liste des pays + résolution du pays détecté, PUIS (2) comptage EXACT côté serveur
+ * du SEUL pays résolu (count head → aucun plafond 1000), multi-variantes nom/code ISO.
  */
 async function computeHomeCountryFallback(detected: string): Promise<HomeCountryDecision> {
-  // 1. Comptage des produits affichables par pays (vendeur en ligne/hybride + actif).
-  const { data: prodRows, error: prodErr } = await supabaseAdmin
-    .from('products')
-    .select('vendors!inner(country, business_type)')
-    .eq('is_active', true)
-    .in('vendors.business_type', ONLINE_VENDOR_TYPES as unknown as string[]);
-  if (prodErr) throw prodErr;
-
-  const counts: Record<string, number> = {};
-  (prodRows || []).forEach((p: any) => {
-    const k = norm(p?.vendors?.country);
-    if (k) counts[k] = (counts[k] || 0) + 1;
-  });
-
-  // 2. Liste des pays « chips » = vendeurs visibles (non strictement physiques).
+  // 1. Liste des pays « chips » = vendeurs visibles (non strictement physiques).
+  //    .limit(5000) : garde-fou explicite contre le plafond silencieux PostgREST (~1000).
   const { data: vendorRows } = await supabaseAdmin
     .from('vendors')
     .select('country')
     .eq('is_active', true)
     .not('country', 'is', null)
     .neq('country', '')
-    .or('business_type.is.null,business_type.neq.physical');
+    .or('business_type.is.null,business_type.neq.physical')
+    .limit(5000);
 
   const countriesMap = new Map<string, string>();
   (vendorRows || []).forEach((v: any) => {
@@ -83,7 +94,7 @@ async function computeHomeCountryFallback(detected: string): Promise<HomeCountry
   });
   const countries = [...countriesMap.values()].sort();
 
-  // 3. Résolution du pays détecté → un pays connu.
+  // 2. Résolution du pays détecté → un pays connu (AVANT le comptage : on ne compte que lui).
   let homeCountry: string | null = null;
   if (detected) {
     const directKey = norm(detected);
@@ -95,8 +106,25 @@ async function computeHomeCountryFallback(detected: string): Promise<HomeCountry
     }
   }
 
-  const productCount = homeCountry ? (counts[norm(homeCountry)] || 0) : 0;
-  const qualifies = !!homeCountry && productCount >= HOME_COUNTRY_MIN_PRODUCTS;
+  // 3. Comptage EXACT côté serveur du SEUL pays résolu : `count: 'exact', head: true` ne
+  //    rapatrie AUCUNE ligne (pas de plafond 1000, comptage juste au-delà de 1000 produits).
+  //    Multi-variantes : le pays peut être stocké en NOM ('France') OU en CODE ISO ('FR') dans
+  //    vendors.country → on matche toutes ses variantes (aligné sur la RPC v2).
+  let productCount = 0;
+  if (homeCountry) {
+    const orExpr = countryVariants(homeCountry).map((v) => `country.ilike.${v}`).join(',');
+    const { count, error: cntErr } = await supabaseAdmin
+      .from('products')
+      .select('id, vendors!inner(country, business_type)', { count: 'exact', head: true })
+      .eq('is_active', true)
+      .in('vendors.business_type', ONLINE_VENDOR_TYPES as unknown as string[])
+      .or(orExpr, { referencedTable: 'vendors' });
+    if (cntErr) throw cntErr;
+    productCount = count || 0;
+  }
+
+  // Règle PDG : « dépasse les 30 » = STRICTEMENT plus (≤ 30 → Mondial, ≥ 31 → Produits).
+  const qualifies = !!homeCountry && productCount > HOME_COUNTRY_MIN_PRODUCTS;
   return {
     success: true, homeCountry, qualifies, productCount,
     threshold: HOME_COUNTRY_MIN_PRODUCTS, countries,
@@ -108,6 +136,9 @@ async function computeHomeCountryFallback(detected: string): Promise<HomeCountry
 // public à fort trafic, sans figer l'expérience plus d'une minute.
 const HOME_COUNTRY_CACHE_TTL = 60;
 
+// ⚠️ La RPC get_marketplace_home_country doit être en version « seuil strict » (migration
+// MIGRATION_HOME_COUNTRY_SEUIL_STRICT.sql). Tant qu'elle ne l'est pas, la RPC applique >=
+// (écart d'1 produit à la frontière exacte de 30) — le repli JS, lui, applique déjà >.
 /** Résolution complète de la décision pays (RPC atomique, repli JS, dégradé sûr). */
 async function resolveHomeCountry(detected: string): Promise<HomeCountryDecision> {
   // 1. RPC atomique (source unique de vérité, 1 aller-retour DB).

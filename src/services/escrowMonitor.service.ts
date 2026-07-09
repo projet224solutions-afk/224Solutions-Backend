@@ -214,6 +214,48 @@ export async function syncDomainAlerts(
   return { generated_at: report.generated_at, checks, overall: computeOverall(checks) };
 }
 
+// ── Auto-résolution des alertes ÉVÉNEMENTIELLES périmées ────────────────────────────────────
+// Les alertes des monitors (source='platform_monitor') s'auto-résolvent quand count=0 ; les
+// alertes ÉVÉNEMENTIELLES (224Guard, trigger role.changed, observateur frontend…) n'ont AUCUN
+// signal de fin → sans ceci elles restent « actives » pour toujours et noient le panneau PDG.
+// Règle : plus AUCUNE occurrence (metadata->>last_seen, sinon created_at) depuis 24 h
+// (72 h pour les critiques — on ne masque pas une critique trop vite) → status 'resolved'
+// (l'historique est conservé, comme pour les monitors).
+const EVENT_ALERT_STALE_HOURS = Number(process.env.EVENT_ALERT_STALE_HOURS || 24);
+
+export async function autoResolveStaleEventAlerts(): Promise<number> {
+  const now = Date.now();
+  const cutoff = new Date(now - EVENT_ALERT_STALE_HOURS * 3600_000).toISOString();
+  const cutoffCritical = new Date(now - 3 * EVENT_ALERT_STALE_HOURS * 3600_000).toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from('system_alerts')
+    .select('id, severity, created_at, metadata')
+    .eq('status', 'active')
+    .or('metadata->>source.is.null,metadata->>source.neq.platform_monitor')
+    .limit(500); // borne par cycle — le suivant (60 s) reprend le reste
+  if (error) throw error;
+
+  const staleIds = (data || [])
+    .filter((a: any) => {
+      const lastSeen = a.metadata?.last_seen || a.created_at;
+      if (!lastSeen) return false;
+      return lastSeen < (a.severity === 'critical' ? cutoffCritical : cutoff);
+    })
+    .map((a: any) => a.id);
+  if (!staleIds.length) return 0;
+
+  const { error: updErr } = await supabaseAdmin
+    .from('system_alerts')
+    .update({ status: 'resolved', resolved_at: new Date().toISOString() })
+    .in('id', staleIds)
+    .eq('status', 'active'); // garde anti-course : ne résout que ce qui est encore actif
+  if (updErr) throw updErr;
+
+  logger.info(`[Monitor] ${staleIds.length} alerte(s) événementielle(s) périmée(s) auto-résolue(s) (> ${EVENT_ALERT_STALE_HOURS} h sans occurrence)`);
+  return staleIds.length;
+}
+
 /**
  * Lance les domaines + renvoie leurs rapports et les alertes associées.
  * @param opts.skipFnDomains  ignore les domaines à scan RÉSEAU (ex. sécurité frontend) — utilisé par

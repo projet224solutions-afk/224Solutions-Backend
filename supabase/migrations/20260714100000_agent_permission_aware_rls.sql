@@ -45,10 +45,13 @@ AS $$
               replace(p_permission_key, 'view_', 'manage_')
             )
         )
-        -- Colonne legacy agents_management.permissions (text[]) toujours fusionnée
-        -- en OR côté front (useAgentPermissionsUnified) → même règle ici.
-        OR p_permission_key = ANY(COALESCE(am.permissions, ARRAY[]::text[]))
-        OR replace(p_permission_key, 'view_', 'manage_') = ANY(COALESCE(am.permissions, ARRAY[]::text[]))
+        -- Colonne legacy agents_management.permissions (JSONB array) toujours fusionnée
+        -- en OR côté front (useAgentPermissionsUnified) → même règle ici. L'opérateur jsonb `?`
+        -- teste l'appartenance d'une chaîne aux éléments d'un tableau jsonb (null-safe via le guard).
+        OR (am.permissions IS NOT NULL AND jsonb_typeof(am.permissions) = 'array'
+            AND am.permissions ? p_permission_key)
+        OR (am.permissions IS NOT NULL AND jsonb_typeof(am.permissions) = 'array'
+            AND am.permissions ? replace(p_permission_key, 'view_', 'manage_'))
       )
   );
 $$;

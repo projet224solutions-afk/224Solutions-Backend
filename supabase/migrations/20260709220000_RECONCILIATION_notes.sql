@@ -1,0 +1,45 @@
+-- ============================================================================
+-- 🧾 RÉCONCILIATION REPO ↔ BASE — journal des changements exécutés directement en
+-- production le 2026-07-08/09 via l'API de gestion Supabase (Management API).
+-- ----------------------------------------------------------------------------
+-- RÈGLE : le repo est la source de vérité. Chaque changement de base a SON fichier
+-- de migration (listés ci-dessous). Ce fichier est un INVENTAIRE — il ne re-exécute
+-- rien (tout est déjà couvert par les migrations nommées) ; il documente aussi les
+-- opérations de MAINTENANCE (VACUUM) qui ne sont pas des DDL et n'ont donc pas de
+-- fichier de migration propre.
+--
+-- ── A. BUNDLE DES 13 MIGRATIONS EN ATTENTE (appliqué 2026-07-08, sur demande PDG) ──
+--   20260608280000_wallet_aml_foundation.sql
+--   20260608280001_wallet_aml_enforce_quarantine.sql
+--   20260608280002_wallet_aml_monitor.sql          ← DROP IF EXISTS ajouté (42P13, cf. fichier)
+--   20260608280003_wallet_aml_quarantine_decisions.sql
+--   20260615380000_auto_healing.sql
+--   20260615400000_restaurant_atomic_payment.sql
+--   20260616240000_enforce_video_premium.sql
+--   20260618100000_country_pricing_foundation.sql
+--   20260618110000_subscription_purchase_by_country.sql
+--   20260619240000_vendor_affiliate_digital_only.sql
+--   20260703120000_system_alerts_dedup_active.sql
+--   20260704180000_lockdown_surveillance_chain.sql
+--   20260714100000_agent_permission_aware_rls.sql  ← corrigé JSONB (permissions ? '…')
+--
+-- ── B. SANTÉ BASE (2026-07-09) ──
+--   20260709200000_fix_update_user_presence_enum_cast.sql
+--       → CAUSE des ~241k erreurs/jour : rpc/update_user_presence renvoyait 400
+--         (varchar→enum sans cast, régression de 20260705170003). Cast ajouté.
+--         PROUVÉ guéri : 0 erreur 400 post-fix, succès API 50,8% → 99,4%.
+--   20260709210000_security_advisor_gps_view.sql
+--       → Advisor CRITICAL : v_vehicle_unified_gps passée en security_invoker + REVOKE anon.
+--       → spatial_ref_sys (RLS Disabled) = faux positif PostGIS, NON touché.
+--
+-- ── C. MAINTENANCE (pas une DDL, pas de fichier propre) ──
+--   VACUUM (ANALYZE) public.system_alerts;   -- exécuté 2026-07-09, non bloquant.
+--       Récupère les lignes mortes du bloat (17 Mo pour 382 lignes vivantes, séquelle
+--       de l'ancien emballement à 36k alertes). NON exécuté (locking, à valider) :
+--       VACUUM FULL public.system_alerts;   -- rendrait l'espace physique en fenêtre calme.
+--
+-- Aucune opération destructrice (DROP TABLE / DELETE massif / TRUNCATE) n'a été exécutée.
+-- ============================================================================
+
+-- Aucune instruction exécutable ici (inventaire documentaire).
+SELECT 'reconciliation_20260709_ok' AS note;

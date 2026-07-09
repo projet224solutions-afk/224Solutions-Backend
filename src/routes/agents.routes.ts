@@ -134,6 +134,20 @@ router.post('/sub-agents', verifyJWT, async (req: AuthenticatedRequest, res: Res
       return;
     }
 
+    // Unicité téléphone (1 numéro = 1 compte) — refuser AVANT de créer le compte auth.
+    if (phone && String(phone).replace(/[^0-9]/g, '').length >= 8) {
+      const { data: phoneOwner } = await supabaseAdmin.rpc('resolve_user_id_by_phone', { p_phone: String(phone) });
+      if (phoneOwner) {
+        res.status(409).json({
+          success: false,
+          error: 'Ce numéro est déjà lié à un compte. Veuillez récupérer votre compte existant pour y accéder.',
+          code: 'PHONE_ALREADY_LINKED',
+          action: 'account_recovery',
+        });
+        return;
+      }
+    }
+
     // 5) Compte auth Supabase
     const subAgentAccessToken = crypto.randomUUID();
     const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
@@ -382,6 +396,22 @@ router.post('/users', async (req, res: Response): Promise<void> => {
     const countryName = body.country || 'Guinée';
     const currency = currencyFor(countryCode);
     const fullName = `${body.firstName} ${body.lastName || ''}`.trim();
+
+    // ── Unicité téléphone (1 numéro = 1 compte) : refuser AVANT de créer le compte auth.
+    //    Sinon l'index unique fait échouer l'INSERT profil DANS le trigger (catch-all) →
+    //    compte auth orphelin sans profil. La garde explicite donne une erreur propre.
+    if (body.phone && String(body.phone).replace(/[^0-9]/g, '').length >= 8) {
+      const { data: phoneOwner } = await supabaseAdmin.rpc('resolve_user_id_by_phone', { p_phone: String(body.phone) });
+      if (phoneOwner) {
+        res.status(409).json({
+          success: false,
+          error: 'Ce numéro est déjà lié à un compte. Veuillez récupérer votre compte existant pour y accéder.',
+          code: 'PHONE_ALREADY_LINKED',
+          action: 'account_recovery',
+        });
+        return;
+      }
+    }
 
     // ── 1) Compte auth (le trigger handle_new_user crée profil + wallet) ────────
     const { data: authData, error: authErr } = await supabaseAdmin.auth.admin.createUser({

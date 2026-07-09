@@ -19,6 +19,7 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
 import { getClientIp } from '../middlewares/ipBlocklist.js';
+import { authRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
@@ -164,6 +165,46 @@ router.post('/finalize-phone-signup', verifyJWT, async (req: AuthenticatedReques
   } catch (err: any) {
     logger.error(`[auth/finalize] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la finalisation' });
+  }
+});
+
+/**
+ * POST /auth/check-phone  { phone }
+ * Unicité « 1 numéro = 1 compte » : vérifie qu'un numéro n'est PAS déjà lié à un compte
+ * AVANT l'inscription. Public + rate-limité (anti-énumération ; l'existence est déjà
+ * révélée par le flux OTP existant). Forme canonique = 9 derniers chiffres (RPC déterministe).
+ * → 409 { action:'account_recovery' } si pris : le front propose la récupération OTP SMS.
+ */
+router.post('/check-phone', authRateLimit, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const phone = String(req.body?.phone ?? '').trim();
+    const digits = phone.replace(/[^0-9]/g, '');
+    if (digits.length < 8) {
+      res.status(400).json({ success: false, error: 'Numéro de téléphone invalide.' });
+      return;
+    }
+
+    // resolve_user_id_by_phone : déterministe (ORDER BY created_at), compare les 9 derniers chiffres.
+    const { data: existingId, error } = await supabaseAdmin.rpc('resolve_user_id_by_phone', { p_phone: phone });
+    if (error) {
+      logger.error(`[auth/check-phone] resolve error: ${error.message}`);
+      res.status(500).json({ success: false, error: 'Vérification du numéro impossible.' });
+      return;
+    }
+
+    if (existingId) {
+      res.status(409).json({
+        success: false,
+        error: 'Ce numéro est déjà lié à un compte. Veuillez récupérer votre compte existant pour y accéder.',
+        action: 'account_recovery',
+      });
+      return;
+    }
+
+    res.json({ success: true, data: { available: true } });
+  } catch (err: any) {
+    logger.error(`[auth/check-phone] ${err?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de la vérification du numéro.' });
   }
 });
 

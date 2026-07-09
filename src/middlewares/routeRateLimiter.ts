@@ -179,3 +179,10 @@ export const subscriptionRateLimit = routeRateLimit({
 export const adminRateLimit = routeRateLimit({
   maxRequests: 30, windowSeconds: 60, keyPrefix: 'admin', perUser: true, perIp: true,
 });
+
+/** Cadeaux live (débit wallet réel) : 30 req / min per user — un envoi légitime est
+ *  rare/manuel ; ce plafond coupe le spam de micro-cadeaux sans gêner un vrai donateur.
+ *  Combiné à idempotencyGuard AVANT → les rejeux réseau ne comptent pas. */
+export const giftRateLimit = routeRateLimit({
+  maxRequests: 30, windowSeconds: 60, keyPrefix: 'live:gift', perUser: true, perIp: true,
+});

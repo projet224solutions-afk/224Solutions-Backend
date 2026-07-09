@@ -12,6 +12,7 @@ import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { idempotencyGuard } from '../middlewares/idempotency.middleware.js';
+import { giftRateLimit } from '../middlewares/routeRateLimiter.js';
 import { issueLiveToken, currentLiveProvider } from '../services/liveToken.service.js';
 import { startLiveRecording, stopLiveRecording } from '../services/agoraRecording.service.js';
 import { uuidToNumericUid } from '../services/agoraToken.js';
@@ -587,7 +588,7 @@ const GIFT_ERR_MAP: Record<string, { status: number; msg: string; code: string }
 
 // POST /streams/:id/gift — envoie un cadeau (débit atomique wallet + commission coffre PDG).
 // idempotencyGuard (après verifyJWT) dédoublonne les rejeux (double-clic / réseau).
-router.post('/streams/:id([0-9a-fA-F-]{36})/gift', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/streams/:id([0-9a-fA-F-]{36})/gift', verifyJWT, idempotencyGuard, giftRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const streamId = req.params.id;

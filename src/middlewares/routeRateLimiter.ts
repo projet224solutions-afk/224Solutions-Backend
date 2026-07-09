@@ -186,3 +186,9 @@ export const adminRateLimit = routeRateLimit({
 export const giftRateLimit = routeRateLimit({
   maxRequests: 30, windowSeconds: 60, keyPrefix: 'live:gift', perUser: true, perIp: true,
 });
+
+/** Copilote IA (appel LLM = coût tokens réel) : 20 req / min per user. Un chat est
+ *  manuel ; ce plafond stoppe l'abus/le scriptage qui ferait exploser la facture LLM. */
+export const copilotRateLimit = routeRateLimit({
+  maxRequests: 20, windowSeconds: 60, keyPrefix: 'copilot', perUser: true, perIp: true,
+});

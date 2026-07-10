@@ -12,6 +12,8 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { authRateLimit, paymentRateLimit } from '../middlewares/routeRateLimiter.js';
 import { sendSms } from '../services/sms.service.js';
+import { userHasFcmToken, sendPushToUser } from '../services/push.service.js';
+import { verifyWalletPin } from '../services/walletPin.service.js';
 
 const router = Router();
 
@@ -61,6 +63,38 @@ function mapRpcError(msg: string): { code: number; error: string } {
 
 const newKey = () => crypto.randomUUID();
 const posInt = (v: any) => Number.isFinite(Number(v)) && Number(v) > 0 && Number.isInteger(Number(v));
+const gnf = (n: any) => `${Number(n || 0).toLocaleString('fr-FR')} GNF`;
+
+// Frais de retrait (MÊME formule que la RPC) — pour affichage/notification (le serveur fait foi).
+async function computeWithdrawalFee(amount: number): Promise<number> {
+  const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
+  const c = cfg as any;
+  if (!c) return 0;
+  return Math.min(Math.max(Math.round(amount * c.withdrawal_fee_percent / 100), c.withdrawal_fee_min), c.withdrawal_fee_max);
+}
+
+async function clientPhone(userId: string): Promise<string | null> {
+  const { data } = await supabaseAdmin.from('profiles').select('phone').eq('id', userId).maybeSingle();
+  return (data as any)?.phone || null;
+}
+
+// Émet un OTP client (réutilisé par /withdrawal/otp, la bascule AUTO et le fallback manuel).
+async function issueClientOtp(agentId: string, clientId: string, phone: string, amount: number | null): Promise<boolean> {
+  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+  const { error } = await supabaseAdmin.from('agent_cash_otp').insert({
+    agent_id: agentId, client_user_id: clientId, otp_hash: otpHash, amount,
+    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  });
+  if (error) return false;
+  await sendSms(phone, `224Solutions : code de retrait ${otp} (valable 5 min). Ne le communiquez qu'à l'agent pour valider votre retrait.`);
+  return true;
+}
+
+// SMS post-transaction (preuve pour le client à téléphone simple), best-effort.
+async function postTxSms(userId: string, text: string): Promise<void> {
+  try { const ph = await clientPhone(userId); if (ph) await sendSms(ph, text); } catch { /* non bloquant */ }
+}
 
 // ── Config ────────────────────────────────────────────────────────────────
 router.get('/config', verifyJWT, async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
@@ -112,6 +146,9 @@ router.post('/deposit', verifyJWT, paymentRateLimit, async (req: AuthenticatedRe
     p_agent_id: agent.id, p_client_user_id: client.id, p_amount: amount, p_idempotency_key: req.body?.idempotency_key || newKey(),
   });
   if (error) { const e = mapRpcError(error.message); logger.warn(`[agent-cash/deposit] ${error.message}`); res.status(e.code).json({ success: false, error: e.error }); return; }
+  // Notice de dépôt : push simple SANS PIN (recevoir = zéro risque) + SMS de confirmation (preuve).
+  void sendPushToUser(client.id, { title: 'Dépôt reçu', message: `${agent.name} vous a déposé ${gnf(amount)}.`, data: { type: 'agent_cash_deposit', amount } });
+  void postTxSms(client.id, `224Solutions : depot de ${gnf(amount)} recu via l'agent ${agent.name}.`);
   res.json({ success: true, data: { ...(data as any), client_name: client.name } });
 });
 
@@ -124,14 +161,8 @@ router.post('/withdrawal/otp', verifyJWT, authRateLimit, async (req: Authenticat
   const client = await resolveClient(phone);
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
 
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-  const { error } = await supabaseAdmin.from('agent_cash_otp').insert({
-    agent_id: agent.id, client_user_id: client.id, otp_hash: otpHash, amount: posInt(amount) ? amount : null,
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-  });
-  if (error) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
-  await sendSms(phone, `224Solutions : code de retrait ${otp} (valable 5 min). Ne le communiquez qu'à l'agent pour valider votre retrait.`);
+  const ok = await issueClientOtp(agent.id, client.id, phone, posInt(amount) ? amount : null);
+  if (!ok) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
   res.json({ success: true, data: { sent: true, client_name: client.name } });
 });
 
@@ -164,7 +195,141 @@ router.post('/withdrawal', verifyJWT, paymentRateLimit, async (req: Authenticate
     p_agent_id: agent.id, p_client_user_id: client.id, p_amount: amount, p_idempotency_key: req.body?.idempotency_key || newKey(),
   });
   if (error) { const e = mapRpcError(error.message); logger.warn(`[agent-cash/withdrawal] ${error.message}`); res.status(e.code).json({ success: false, error: e.error }); return; }
+  void postTxSms(client.id, `224Solutions : retrait de ${gnf(amount)} effectue via l'agent ${agent.name}.`);
   res.json({ success: true, data: { ...(data as any), client_name: client.name } });
+});
+
+// ── FLUX 1 (défaut) : demande de retrait → PUSH+PIN, ou bascule AUTO OTP si pas de token FCM ──
+router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  const phone = String(req.body?.phone || '');
+  const amount = Number(req.body?.amount);
+  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide (entier positif)' }); return; }
+  const client = await resolveClient(phone);
+  if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
+
+  const key = req.body?.idempotency_key || newKey();
+  const fee = await computeWithdrawalFee(amount);
+  const channel = (await userHasFcmToken(client.id)) ? 'push' : 'otp';   // bascule AUTO
+
+  const { data: reqRow, error } = await supabaseAdmin.from('agent_cash_requests').insert({
+    type: 'withdrawal', agent_id: agent.id, client_user_id: client.id, amount, fees: fee, channel,
+    status: 'pending', idempotency_key: key, expires_at: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
+  }).select('id').single();
+  if (error) { res.status(500).json({ success: false, error: 'Demande impossible' }); return; }
+
+  if (channel === 'push') {
+    void sendPushToUser(client.id, {
+      title: 'Confirmation de retrait',
+      message: `L'agent ${agent.name} demande un retrait de ${gnf(amount)} — Frais ${gnf(fee)} — Total débité ${gnf(amount + fee)}.`,
+      actionUrl: `/cash-confirm/${(reqRow as any).id}`,
+      data: { type: 'agent_cash_withdrawal_request', request_id: (reqRow as any).id, amount, fees: fee },
+    });
+  } else {
+    await issueClientOtp(agent.id, client.id, phone, amount);   // fallback auto (téléphone simple)
+  }
+  res.json({ success: true, data: { request_id: (reqRow as any).id, channel, client_name: client.name, amount, fees: fee } });
+});
+
+// ── FLUX 1 : le CLIENT confirme (PIN wallet) → exécute la RPC EXISTANTE ──
+router.post('/withdrawal/confirm', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const clientId = req.user!.id;
+  const requestId = String(req.body?.request_id || '');
+  const pin = String(req.body?.pin || '');
+  await supabaseAdmin.rpc('agent_cash_expire_stale_requests');   // expiration lazy
+  const { data: rq } = await supabaseAdmin.from('agent_cash_requests').select('*').eq('id', requestId).eq('client_user_id', clientId).maybeSingle();
+  if (!rq) { res.status(404).json({ success: false, error: 'Demande introuvable' }); return; }
+  const r = rq as any;
+  if (r.status !== 'pending') { res.status(409).json({ success: false, error: 'Demande déjà traitée ou expirée' }); return; }
+  if (new Date(r.expires_at).getTime() < Date.now()) {
+    await supabaseAdmin.from('agent_cash_requests').update({ status: 'expired' }).eq('id', requestId);
+    res.status(409).json({ success: false, error: 'Demande expirée' }); return;
+  }
+
+  const pinRes = await verifyWalletPin(clientId, pin);   // service PIN EXISTANT (verrous inclus)
+  if (!pinRes.valid) {
+    const attempts = r.pin_attempts + 1;
+    const canceled = attempts >= 3;
+    await supabaseAdmin.from('agent_cash_requests').update({ pin_attempts: attempts, status: canceled ? 'rejected' : 'pending' }).eq('id', requestId);
+    res.status(401).json({ success: false, error: canceled ? 'Trop de tentatives — demande annulée.' : (pinRes.error || 'Code PIN invalide'), locked_until: pinRes.lockedUntil }); return;
+  }
+
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_withdrawal', {
+    p_agent_id: r.agent_id, p_client_user_id: clientId, p_amount: r.amount, p_idempotency_key: r.idempotency_key,
+  });
+  if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  await supabaseAdmin.from('agent_cash_requests').update({ status: 'executed', parent_tx_id: (data as any)?.parent_tx_id }).eq('id', requestId);
+  void postTxSms(clientId, `224Solutions : retrait de ${gnf(r.amount)} confirme.`);
+  res.json({ success: true, data });
+});
+
+// ── FLUX 1 : le CLIENT refuse ──
+router.post('/withdrawal/reject', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { error } = await supabaseAdmin.from('agent_cash_requests')
+    .update({ status: 'rejected' }).eq('id', String(req.body?.request_id || '')).eq('client_user_id', req.user!.id).eq('status', 'pending');
+  if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  res.json({ success: true });
+});
+
+// ── Bascule MANUELLE agent → OTP (« le client n'a pas reçu la notification ? ») ──
+router.post('/withdrawal/fallback-otp', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  const { data: rq } = await supabaseAdmin.from('agent_cash_requests').select('*').eq('id', String(req.body?.request_id || '')).eq('agent_id', agent.id).maybeSingle();
+  if (!rq || (rq as any).status !== 'pending') { res.status(409).json({ success: false, error: 'Demande non en attente' }); return; }
+  const r = rq as any;
+  const ph = await clientPhone(r.client_user_id);
+  if (!ph) { res.status(409).json({ success: false, error: 'Numéro client indisponible' }); return; }
+  await supabaseAdmin.from('agent_cash_requests').update({ channel: 'otp' }).eq('id', r.id);
+  const ok = await issueClientOtp(agent.id, r.client_user_id, ph, r.amount);
+  if (!ok) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
+  res.json({ success: true, data: { sent: true } });
+});
+
+// ── FLUX 2 : le CLIENT pré-autorise (montant + PIN) → QR à présenter à l'agent ──
+router.post('/withdrawal/client-qr', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const clientId = req.user!.id;
+  const amount = Number(req.body?.amount);
+  const pin = String(req.body?.pin || '');
+  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+  const pinRes = await verifyWalletPin(clientId, pin);   // PIN vérifié ICI (avant), l'agent n'en a pas besoin
+  if (!pinRes.valid) { res.status(401).json({ success: false, error: pinRes.error || 'Code PIN invalide', locked_until: pinRes.lockedUntil }); return; }
+
+  // Une seule demande QR active à la fois par client (la précédente non expirée bloque).
+  await supabaseAdmin.rpc('agent_cash_expire_stale_requests');
+  const { data: active } = await supabaseAdmin.from('agent_cash_requests').select('id').eq('client_user_id', clientId).eq('channel', 'qr').eq('status', 'confirmed').limit(1).maybeSingle();
+  if (active) { res.status(409).json({ success: false, error: 'Vous avez déjà un QR de retrait actif.' }); return; }
+
+  const reference = crypto.randomBytes(24).toString('base64url');
+  const fee = await computeWithdrawalFee(amount);
+  const { data: reqRow, error } = await supabaseAdmin.from('agent_cash_requests').insert({
+    type: 'withdrawal', agent_id: null, client_user_id: clientId, amount, fees: fee, channel: 'qr',
+    status: 'confirmed', reference, idempotency_key: newKey(), expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  }).select('id').single();
+  if (error) { res.status(500).json({ success: false, error: 'QR indisponible' }); return; }
+  res.json({ success: true, data: { request_id: (reqRow as any).id, reference, amount, fees: fee, expires_in: 300 } });
+});
+
+// ── FLUX 2 : l'AGENT scanne le QR pré-autorisé → exécution immédiate (PIN déjà validé) ──
+router.post('/withdrawal/scan', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  await supabaseAdmin.rpc('agent_cash_expire_stale_requests');
+  const { data: rq } = await supabaseAdmin.from('agent_cash_requests').select('*').eq('reference', String(req.body?.reference || '')).maybeSingle();
+  if (!rq || (rq as any).status !== 'confirmed') { res.status(409).json({ success: false, error: 'QR invalide ou déjà utilisé' }); return; }
+  const r = rq as any;
+  if (new Date(r.expires_at).getTime() < Date.now()) {
+    await supabaseAdmin.from('agent_cash_requests').update({ status: 'expired' }).eq('id', r.id);
+    res.status(409).json({ success: false, error: 'QR expiré' }); return;
+  }
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_withdrawal', {
+    p_agent_id: agent.id, p_client_user_id: r.client_user_id, p_amount: r.amount, p_idempotency_key: r.idempotency_key,
+  });
+  if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  await supabaseAdmin.from('agent_cash_requests').update({ status: 'executed', agent_id: agent.id, parent_tx_id: (data as any)?.parent_tx_id }).eq('id', r.id);
+  void postTxSms(r.client_user_id, `224Solutions : retrait de ${gnf(r.amount)} effectue.`);
+  res.json({ success: true, data: { ...(data as any), amount: r.amount } });
 });
 
 // ── Retrait des commissions agent (4 canaux) ─────────────────────────────────
@@ -201,7 +366,13 @@ router.get('/pdg/overview', verifyJWT, async (req: AuthenticatedRequest, res: Re
   const { data: pending } = await supabaseAdmin.from('agent_commission_pending').select('*').eq('status', 'pending').order('created_at', { ascending: false });
   const { data: payouts } = await supabaseAdmin.from('agent_commission_payout_requests').select('*').eq('status', 'pending_pdg').order('created_at', { ascending: false });
   const { data: recon } = await supabaseAdmin.rpc('agent_cash_reconciliation_check');
-  res.json({ success: true, data: { agents: agents || [], pending: pending || [], payouts: payouts || [], reconciliation: recon } });
+  // Répartition des canaux de confirmation (suivi du coût SMS) sur les retraits exécutés 30j.
+  const { data: chanRows } = await supabaseAdmin.from('agent_cash_requests')
+    .select('channel').eq('type', 'withdrawal').eq('status', 'executed')
+    .gte('created_at', new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString());
+  const channels = { push: 0, qr: 0, otp: 0 };
+  (chanRows || []).forEach((r: any) => { if (r.channel in channels) (channels as any)[r.channel]++; });
+  res.json({ success: true, data: { agents: agents || [], pending: pending || [], payouts: payouts || [], reconciliation: recon, channels } });
 });
 
 router.post('/pdg/suspend/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {

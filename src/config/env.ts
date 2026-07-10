@@ -69,6 +69,27 @@ export const env = {
   TWILIO_PHONE_NUMBER: optionalEnv('TWILIO_PHONE_NUMBER', ''),
   TWILIO_MESSAGING_SERVICE_SID: optionalEnv('TWILIO_MESSAGING_SERVICE_SID', ''),
 
+  // Live shopping : fournisseur du transport vidéo (agora en Vague 1, livekit en Vague 2).
+  // Doit rester aligné avec VITE_LIVE_PROVIDER côté frontend.
+  LIVE_PROVIDER: optionalEnv('LIVE_PROVIDER', 'agora'),
+
+  // Agora (appels + live) : App ID + Certificate signent les tokens RTC. Source de vérité =
+  // backend (jamais côté client). Quand présents, le backend génère le token NATIVEMENT
+  // (services/agoraToken.ts) au lieu de proxifier l'edge Supabase — le certificat vit ici,
+  // aligné sur la console Agora. Optionnels au boot ; si absents, repli sur l'edge (transition).
+  AGORA_APP_ID: optionalEnv('AGORA_APP_ID', ''),
+  AGORA_APP_CERTIFICATE: optionalEnv('AGORA_APP_CERTIFICATE', ''),
+
+  // Agora Cloud Recording (replay serveur GARANTI) — REST acquire/start/stop en Basic auth avec
+  // les clés RESTful de la console Agora (DISTINCTES de l'App Certificate). Le fichier est écrit
+  // DIRECTEMENT dans notre bucket GCS via l'API S3-compatible → il faut une clé HMAC GCS (≠ service
+  // account RSA). TOUS optionnels : absents → l'enregistrement serveur est désactivé (best-effort,
+  // le repli client prend le relais). JAMAIS en base — process.env uniquement.
+  AGORA_CUSTOMER_ID: optionalEnv('AGORA_CUSTOMER_ID', ''),
+  AGORA_CUSTOMER_SECRET: optionalEnv('AGORA_CUSTOMER_SECRET', ''),
+  GCS_HMAC_ACCESS_KEY: optionalEnv('GCS_HMAC_ACCESS_KEY', ''),
+  GCS_HMAC_SECRET: optionalEnv('GCS_HMAC_SECRET', ''),
+
   // OAuth (Google)
   OAUTH_CLIENT_ID: optionalEnv('OAUTH_CLIENT_ID', ''),
   OAUTH_CLIENT_SECRET: optionalEnv('OAUTH_CLIENT_SECRET', ''),

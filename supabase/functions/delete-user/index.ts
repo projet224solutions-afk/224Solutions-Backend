@@ -389,7 +389,6 @@ Deno.serve(async (req) => {
           await safeDelete('order_items', 'order_id', orderId);
           await safeDelete('order_status_history', 'order_id', orderId);
           await safeDelete('delivery_tracking', 'order_id', orderId);
-          await safeDelete('china_logistics', 'order_id', orderId);
           await safeDelete('payment_schedules', 'order_id', orderId);
         }
       }
@@ -433,8 +432,6 @@ Deno.serve(async (req) => {
       await safeDelete('vendor_settings', 'vendor_id', vendor.id);
       await safeDelete('vendor_analytics', 'vendor_id', vendor.id);
       await safeDelete('vendor_subscriptions', 'vendor_id', vendor.id);
-      await safeDelete('china_dropship_settings', 'vendor_id', vendor.id);
-      await safeDelete('china_dropship_reports', 'vendor_id', vendor.id);
       await safeDelete('dropship_settings', 'vendor_id', vendor.id);
       await safeDelete('service_products', 'vendor_id', vendor.id);
       await safeDelete('quotes', 'vendor_id', vendor.id);

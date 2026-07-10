@@ -14,6 +14,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { auditTrail } from '../services/auditTrail.service.js';
 import { webhookRateLimit } from '../middlewares/routeRateLimiter.js';
+import { creditWallet } from '../services/wallet.service.js';
 
 const router = Router();
 
@@ -198,15 +199,23 @@ export async function applyPaymentSucceeded(
     const currency = paymentIntent.currency?.toUpperCase() || 'GNF';
     const amount = stripeAmountToReal(paymentIntent.amount, currency);
 
-    await supabaseAdmin.rpc('credit_wallet', {
-      p_user_id: userId,
-      p_amount: amount,
-      p_description: `Dépôt carte Stripe (${paymentIntent.id})`,
-      p_transaction_type: 'deposit',
-      p_reference: paymentIntent.id,
-    });
-
-    logger.info(`Wallet credited: user=${userId}, amount=${amount} ${currency}`);
+    // Crédit via la primitive canonique (verrou + plafond/quarantaine AML + ledger atomique).
+    // idempotencyKey = id du PaymentIntent → Stripe peut re-livrer le webhook sans double-crédit.
+    // L'ancien appel rpc('credit_wallet', {p_reference}) ne matchait AUCUNE signature (404
+    // silencieux, erreur avalée) → les dépôts carte n'étaient jamais crédités.
+    const creditRes = await creditWallet(
+      userId,
+      amount,
+      `Dépôt carte Stripe (${paymentIntent.id})`,
+      paymentIntent.id,
+      'deposit',
+      `stripe_deposit_${paymentIntent.id}`
+    );
+    if (!creditRes.success) {
+      logger.error(`Wallet deposit credit FAILED: user=${userId}, PI=${paymentIntent.id}: ${creditRes.error}`);
+    } else {
+      logger.info(`Wallet credited: user=${userId}, amount=${amount} ${currency}`);
+    }
   }
 
   await auditTrail.log({

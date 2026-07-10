@@ -29,6 +29,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { deleteUserCompletely } from '../services/userDeletion.service.js';
+import { createAuthUserWithPhone } from '../services/authPhone.service.js';
 
 /** Vérifie un mot de passe via Supabase Auth (login éphémère, client jetable). */
 async function verifyAuthPassword(email: string, password: string): Promise<boolean> {
@@ -148,22 +149,24 @@ router.post('/sub-agents', verifyJWT, async (req: AuthenticatedRequest, res: Res
       }
     }
 
-    // 5) Compte auth Supabase
+    // 5) Compte auth Supabase — téléphone comme identifiant (login email OU téléphone).
     const subAgentAccessToken = crypto.randomUUID();
-    const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
+    const authCreate = await createAuthUserWithPhone({
       email: emailLc,
       password,
-      email_confirm: true,
+      phone: phone.trim(),
+      // Pas de pays au schéma sous-agent → repli GN (voir formatPhoneIntl).
       user_metadata: {
         name: name.trim(), phone: phone.trim(), role: 'agent',
         agent_type: effectiveAgentType, agent_role: effectiveAgentRole,
       },
     });
-    if (authError || !authUser.user) {
-      res.status(500).json({ success: false, error: `Erreur création compte: ${authError?.message || 'inconnue'}` });
+    if (authCreate.error || !authCreate.user) {
+      res.status(500).json({ success: false, error: `Erreur création compte: ${authCreate.error?.message || 'inconnue'}` });
       return;
     }
-    const newUserId = authUser.user.id;
+    const newUserId = authCreate.user.id;
+    const subAgentPhoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // 6) agents_management ; rollback du compte auth si échec
     const { data: newAgent, error: insertError } = await supabaseAdmin
@@ -262,7 +265,13 @@ router.post('/sub-agents', verifyJWT, async (req: AuthenticatedRequest, res: Res
     } catch (e) { logger.warn(`[agents/sub-agents] audit_logs: ${(e as Error)?.message}`); }
 
     logger.info(`[agents/sub-agents] sous-agent ${newAgent.agent_code} créé (parent ${parent_agent_id})`);
-    res.json({ success: true, data: { agent: newAgent }, agent: newAgent });
+    res.json({
+      success: true,
+      data: { agent: newAgent, phone_login_available: subAgentPhoneLoginAvailable },
+      agent: newAgent,
+      phone_login_available: subAgentPhoneLoginAvailable,
+      ...(subAgentPhoneLoginAvailable ? {} : { message: 'Ce numéro est déjà lié à un autre compte — connexion par email uniquement.' }),
+    });
   } catch (err: any) {
     logger.error(`[agents/sub-agents] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur serveur interne' });
@@ -414,10 +423,13 @@ router.post('/users', async (req, res: Response): Promise<void> => {
     }
 
     // ── 1) Compte auth (le trigger handle_new_user crée profil + wallet) ────────
-    const { data: authData, error: authErr } = await supabaseAdmin.auth.admin.createUser({
+    //    Téléphone = identifiant auth (login email OU téléphone + mot de passe). Dégrade en
+    //    email-only si le numéro est déjà pris (phone_login_available:false + message).
+    const authCreate = await createAuthUserWithPhone({
       email: body.email,
       password: body.password,
-      email_confirm: true,
+      phone: body.phone,
+      countryCode,
       user_metadata: {
         first_name: body.firstName, last_name: body.lastName || '', full_name: fullName,
         phone: body.phone, role: body.role, country: countryName,
@@ -425,12 +437,14 @@ router.post('/users', async (req, res: Response): Promise<void> => {
         city: body.city || '', created_by_agent: body.agentCode, agent_id: effectiveAgentId,
       },
     });
-    if (authErr || !authData.user) {
+    if (authCreate.error || !authCreate.user) {
+      const authErr = authCreate.error;
       const dup = (authErr as any)?.code === 'email_exists' || /already.*registered|email_exists/i.test(authErr?.message || '');
       res.status(dup ? 409 : 400).json({ success: false, error: dup ? 'Un utilisateur avec cet email existe déjà' : (authErr?.message || 'Erreur création'), code: dup ? 'EMAIL_EXISTS' : 'AUTH_ERROR' });
       return;
     }
-    const userId = authData.user.id;
+    const userId = authCreate.user.id;
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // Helper de rollback complet (compensation) — supprime tout ce qui a pu être créé.
     const rollback = async () => {
@@ -557,13 +571,22 @@ router.post('/users', async (req, res: Response): Promise<void> => {
         `Connectez-vous et changez votre mot de passe a votre premiere connexion.`,
       ].join(' ');
 
-      sendSms(body.phone, welcomeMsg).catch((e) =>
+      sendSms(body.phone, welcomeMsg, countryCode).catch((e) =>
         logger.warn(`[agents/users] SMS bienvenue echoue: ${e?.message}`)
       );
     }
 
-    logger.info(`[agents/users] utilisateur ${body.role} ${userId} créé par agent ${effectiveAgentId || 'PDG'}`);
-    res.json({ success: true, data: { user: { id: userId, email: body.email, public_id: publicId, role: body.role } }, user: { id: userId, email: body.email, public_id: publicId, role: body.role }, message: `Utilisateur ${body.role} créé avec succès` });
+    logger.info(`[agents/users] utilisateur ${body.role} ${userId} créé par agent ${effectiveAgentId || 'PDG'} (phone_login=${phoneLoginAvailable})`);
+    const userPayload = { id: userId, email: body.email, public_id: publicId, role: body.role, phone_login_available: phoneLoginAvailable };
+    res.json({
+      success: true,
+      data: { user: userPayload, phone_login_available: phoneLoginAvailable },
+      user: userPayload,
+      phone_login_available: phoneLoginAvailable,
+      message: phoneLoginAvailable
+        ? `Utilisateur ${body.role} créé avec succès (connexion par email ou téléphone)`
+        : `Utilisateur ${body.role} créé — ce numéro est déjà lié à un autre compte, connexion par email uniquement`,
+    });
   } catch (err: any) {
     logger.error(`[agents/users] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur serveur interne', code: 'GENERAL_ERROR' });
@@ -744,14 +767,17 @@ router.post('/affiliate-links/register', async (req, res: Response): Promise<voi
     // MODE B : créer l'utilisateur (rollback si l'affiliation échoue ensuite)
     let effectiveUserId = user_id;
     let createdHere = false;
+    let phoneLoginAvailableB = false;
     if (isModeB) {
-      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
-        email, password, email_confirm: true,
+      // Téléphone = identifiant auth (login email OU téléphone). Dégrade en email-only si doublon.
+      const authCreate = await createAuthUserWithPhone({
+        email, password, phone, countryCode: b.country_code,
         user_metadata: { first_name, last_name, phone, role, affiliate_agent_id: agentId },
       });
-      if (authError || !authData.user) { res.status(400).json({ success: false, error: authError?.message || 'Échec création utilisateur' }); return; }
-      effectiveUserId = authData.user.id;
+      if (authCreate.error || !authCreate.user) { res.status(400).json({ success: false, error: authCreate.error?.message || 'Échec création utilisateur' }); return; }
+      effectiveUserId = authCreate.user.id;
       createdHere = true;
+      phoneLoginAvailableB = authCreate.phoneLoginAvailable;
     }
     if (!effectiveUserId) { res.status(400).json({ success: false, error: 'user_id introuvable' }); return; }
 
@@ -798,7 +824,11 @@ router.post('/affiliate-links/register', async (req, res: Response): Promise<voi
     } catch (e) { logger.warn(`[agents/affiliate-register] bonus: ${(e as Error)?.message}`); }
 
     logger.info(`[agents/affiliate-register] user ${effectiveUserId} affilié à agent ${agentId}`);
-    res.status(201).json({ success: true, user_id: effectiveUserId, affiliated_to_agent: true, agent_id: agentId, message: 'Affiliation enregistrée avec succès — commissions activées' });
+    res.status(201).json({
+      success: true, user_id: effectiveUserId, affiliated_to_agent: true, agent_id: agentId,
+      ...(createdHere ? { phone_login_available: phoneLoginAvailableB } : {}),
+      message: 'Affiliation enregistrée avec succès — commissions activées',
+    });
   } catch (err: any) {
     logger.error(`[agents/affiliate-register] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur serveur interne' });

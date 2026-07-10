@@ -74,34 +74,11 @@ async function resolvePosVendorId(userId: string, requestedVendorId?: string | n
   return agent.vendor_id;
 }
 
-async function getConfiguredStripeSecretKey(): Promise<string | null> {
-  const envKey = process.env.STRIPE_SECRET_KEY?.trim();
-  if (envKey) {
-    return envKey;
-  }
-
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('stripe_config')
-      .select('stripe_secret_key')
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      logger.warn(`[POS Stripe] stripe_config inaccessible: ${error.message}`);
-      return null;
-    }
-
-    const dbKey = data?.stripe_secret_key?.trim();
-    if (dbKey) {
-      logger.warn('[POS Stripe] STRIPE_SECRET_KEY absent du runtime, fallback stripe_config activé');
-      return dbKey;
-    }
-  } catch (error: any) {
-    logger.warn(`[POS Stripe] Fallback stripe_config échoué: ${error?.message || 'unknown'}`);
-  }
-
-  return null;
+// 🔒 Le secret Stripe vit UNIQUEMENT en process.env — jamais en base (voir CLAUDE.md).
+// Le fallback DB (stripe_config.stripe_secret_key) a été RETIRÉ : un secret ne doit
+// jamais résider en table.
+function getConfiguredStripeSecretKey(): string | null {
+  return process.env.STRIPE_SECRET_KEY?.trim() || null;
 }
 
 // ==================== VALIDATION SCHEMAS ====================
@@ -720,10 +697,10 @@ router.post('/stripe-payment', verifyJWT, async (req: AuthenticatedRequest, res:
   const { amount, currency, orderId, sellerId: rawSellerId, description } = parsed.data;
 
   // ── 2. Stripe configuré ? ─────────────────────────────────────────────────
-  const stripeKey = await getConfiguredStripeSecretKey();
+  const stripeKey = getConfiguredStripeSecretKey();
   if (!stripeKey) {
-    logger.error('[POS Stripe] STRIPE_SECRET_KEY manquant dans le runtime et stripe_config');
-    res.status(503).json({ success: false, error: 'Paiement par carte non disponible (Stripe non configuré)' });
+    logger.error('[POS Stripe] STRIPE_SECRET_KEY manquant dans le runtime (process.env)');
+    res.status(503).json({ success: false, error: 'Paiement par carte non disponible (Stripe non configuré)', error_code: 'STRIPE_NOT_CONFIGURED' });
     return;
   }
 

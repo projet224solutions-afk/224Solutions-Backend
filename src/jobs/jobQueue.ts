@@ -21,8 +21,11 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
+import { loadServiceAccount, getPrivateBucketName, getBucketName, generateSignedUrl } from '../services/gcs.service.js';
 import { dispatchDueScheduledCampaigns } from '../routes/campaigns.routes.js';
 import { applyPaymentSucceeded, getStripeSecretKey } from '../routes/webhooks.routes.js';
+import { autoReconcileMonitorCases } from '../services/escrowMonitor.service.js';
+import { finalizeRecordingIfReady, isCloudRecordingConfigured } from '../services/agoraRecording.service.js';
 
 const REDIS_JOBS_ENABLED = (process.env.REDIS_ENABLED ?? (env.isProduction ? 'true' : 'false')) === 'true';
 
@@ -206,13 +209,33 @@ registerHandler('delivery-proof.cleanup', async () => {
 
   let purged = 0;
   for (const o of orders as any[]) {
-    const paths: string[] = [];
-    if (o.delivery_proof_photo_path) paths.push(o.delivery_proof_photo_path);
-    if (o.delivery_proof_video_path) paths.push(o.delivery_proof_video_path);
-    if (paths.length) {
-      const { error: delErr } = await supabaseAdmin.storage.from('delivery-proofs').remove(paths);
-      if (delErr) { logger.error(`[delivery-proof.cleanup] storage ${o.id}: ${delErr.message}`); continue; }
+    // Séparer les chemins GCS privé (préfixe « gcs: ») des chemins Supabase (héritage).
+    const supabasePaths: string[] = [];
+    const gcsPaths: string[] = [];
+    for (const p of [o.delivery_proof_photo_path, o.delivery_proof_video_path]) {
+      if (!p) continue;
+      if (String(p).startsWith('gcs:')) gcsPaths.push(String(p).slice(4));
+      else supabasePaths.push(p);
     }
+    let delOk = true;
+    if (supabasePaths.length) {
+      const { error: delErr } = await supabaseAdmin.storage.from('delivery-proofs').remove(supabasePaths);
+      if (delErr) { logger.error(`[delivery-proof.cleanup] supabase ${o.id}: ${delErr.message}`); delOk = false; }
+    }
+    if (gcsPaths.length) {
+      const sa = loadServiceAccount();
+      if (!sa) { logger.error(`[delivery-proof.cleanup] GCS non configuré, purge ${o.id} différée`); delOk = false; }
+      else {
+        for (const op of gcsPaths) {
+          try {
+            const url = generateSignedUrl(sa, getPrivateBucketName(), op, { method: 'DELETE', expiresInSeconds: 120 });
+            const r = await fetch(url, { method: 'DELETE' });
+            if (!(r.ok || r.status === 404)) { logger.error(`[delivery-proof.cleanup] GCS ${o.id}: HTTP ${r.status}`); delOk = false; }
+          } catch (e: any) { logger.error(`[delivery-proof.cleanup] GCS ${o.id}: ${e?.message}`); delOk = false; }
+        }
+      }
+    }
+    if (!delOk) continue; // ne pas marquer purgé si la suppression a échoué (réessai prochain run)
     const { error: updErr } = await supabaseAdmin.from('orders').update({
       delivery_proof_photo_path: null,
       delivery_proof_video_path: null,
@@ -367,6 +390,88 @@ registerHandler('taxi.reassign-stale-requests', async () => {
   logger.info(`taxi.reassign: ${closed}/${stale.length} course(s) sans chauffeur clôturée(s)`);
 });
 
+// 🎥 Live shopping : purge des replays expirés (> 30 j). purge_expired_replays() renvoie
+// les (id, replay_url) échus → suppression de l'objet GCS (bucket public 224solutions) puis
+// replay_url = null. Canonique côté VPS (le job réel). L'app ne planifie pas de Supabase
+// scheduled functions ; ce handler EST le planificateur de purge.
+registerHandler('live-replays.purge', async () => {
+  const { data: expired, error } = await supabaseAdmin.rpc('purge_expired_replays');
+  if (error) { logger.error(`[live-replays.purge] ${error.message}`); return; }
+  const rows = (expired || []) as Array<{ id: string; replay_url: string | null }>;
+  if (!rows.length) { logger.info('Live replays purge: rien à purger'); return; }
+
+  const sa = loadServiceAccount();
+  let purged = 0;
+  for (const r of rows) {
+    let delOk = true;
+    if (r.replay_url && sa) {
+      // Extraire l'objectPath après le nom de bucket dans l'URL publique GCS.
+      const marker = `/${getBucketName()}/`;
+      const idx = r.replay_url.indexOf(marker);
+      const objectPath = idx >= 0 ? r.replay_url.slice(idx + marker.length).split('?')[0] : null;
+      if (objectPath) {
+        try {
+          const url = generateSignedUrl(sa, getBucketName(), decodeURIComponent(objectPath), { method: 'DELETE', expiresInSeconds: 120 });
+          const resp = await fetch(url, { method: 'DELETE' });
+          if (!(resp.ok || resp.status === 404)) { logger.error(`[live-replays.purge] GCS ${r.id}: HTTP ${resp.status}`); delOk = false; }
+        } catch (e: any) { logger.error(`[live-replays.purge] GCS ${r.id}: ${e?.message}`); delOk = false; }
+      }
+    } else if (r.replay_url && !sa) {
+      logger.error(`[live-replays.purge] GCS non configuré, purge ${r.id} différée`); delOk = false;
+    }
+    if (!delOk) continue; // réessai au prochain run
+    const { error: updErr } = await supabaseAdmin.from('live_streams').update({ replay_url: null }).eq('id', r.id);
+    if (updErr) { logger.error(`[live-replays.purge] db ${r.id}: ${updErr.message}`); continue; }
+    purged++;
+  }
+  logger.info(`Live replays purge: ${purged}/${rows.length} purgés`);
+});
+
+// 📸 Stories vendeur : purge des stories expirées (> 24 h). purge_expired_stories()
+// SUPPRIME déjà les lignes DB et renvoie les (id, media_url) échus → il ne reste qu'à
+// libérer le média du stockage (best-effort ; la DB est déjà propre). Le média peut être
+// sur GCS public (bucket 224solutions) OU sur Supabase Storage (fallback dev).
+registerHandler('stories.purge', async () => {
+  const { data: expired, error } = await supabaseAdmin.rpc('purge_expired_stories');
+  if (error) { logger.error(`[stories.purge] ${error.message}`); return; }
+  const rows = (expired || []) as Array<{ id: string; media_url: string | null }>;
+  if (!rows.length) { logger.info('Stories purge: rien à purger'); return; }
+
+  const sa = loadServiceAccount();
+  let freed = 0;
+  for (const r of rows) {
+    const url = r.media_url;
+    if (!url) { freed++; continue; }
+    try {
+      const gcsMarker = `/${getBucketName()}/`;
+      const gcsIdx = url.indexOf(gcsMarker);
+      const supMarker = '/storage/v1/object/public/';
+      const supIdx = url.indexOf(supMarker);
+      if (gcsIdx >= 0 && sa) {
+        // GCS public : DELETE signé de l'objet.
+        const objectPath = decodeURIComponent(url.slice(gcsIdx + gcsMarker.length).split('?')[0]);
+        const signed = generateSignedUrl(sa, getBucketName(), objectPath, { method: 'DELETE', expiresInSeconds: 120 });
+        const resp = await fetch(signed, { method: 'DELETE' });
+        if (!(resp.ok || resp.status === 404)) logger.error(`[stories.purge] GCS ${r.id}: HTTP ${resp.status}`);
+      } else if (supIdx >= 0) {
+        // Supabase Storage : bucket = 1er segment après /object/public/, reste = chemin.
+        const rest = url.slice(supIdx + supMarker.length).split('?')[0];
+        const slash = rest.indexOf('/');
+        if (slash > 0) {
+          const bucket = rest.slice(0, slash);
+          const path = decodeURIComponent(rest.slice(slash + 1));
+          const { error: delErr } = await supabaseAdmin.storage.from(bucket).remove([path]);
+          if (delErr) logger.error(`[stories.purge] supabase ${r.id}: ${delErr.message}`);
+        }
+      }
+    } catch (e: any) {
+      logger.error(`[stories.purge] ${r.id}: ${e?.message}`);
+    }
+    freed++; // la ligne DB est déjà supprimée par la RPC ; le stockage est best-effort.
+  }
+  logger.info(`Stories purge: ${freed}/${rows.length} traitées`);
+});
+
 registerHandler('escrow.auto-release', async () => {
   const now = new Date().toISOString();
   const { data: escrows } = await supabaseAdmin
@@ -394,11 +499,24 @@ registerHandler('escrow.auto-release', async () => {
         order?.payment_method === 'cash' &&
         (orderMetadata.is_cod === true || shippingAddress.is_cod === true || orderMetadata.payment_type === 'cash_on_delivery');
 
+      // 🛑 Commande ANNULÉE avec escrow encore 'held' = argent acheteur coincé (constaté :
+      // ORD-MR2KTMCB-WXNQ). On REMBOURSE atomiquement au lieu d'ignorer en silence —
+      // sinon l'escrow reste bloqué à vie (et l'ancien code prod le libérait au vendeur).
+      if (order?.status === 'cancelled') {
+        const { data: refRes, error: refErr } = await supabaseAdmin.rpc('refund_order_escrow', { p_order_id: escrow.order_id });
+        if (refErr || (refRes && (refRes as any).success === false)) {
+          logger.warn(`[escrow] auto-refund commande annulée ${order?.order_number || escrow.order_id}: ${refErr?.message || (refRes as any)?.error}`);
+        } else {
+          logger.info(`[escrow] escrow ${escrow.id} REMBOURSÉ (commande annulée ${order?.order_number || escrow.order_id})`);
+        }
+        continue;
+      }
+
       if (
         !order ||
         !escrow.seller_confirmed_at ||
         isCashOnDelivery ||
-        ['pending', 'cancelled', 'completed'].includes(order.status) ||
+        ['pending', 'completed'].includes(order.status) ||
         orderMetadata.buyer_confirmed_delivery === true
       ) {
         continue;
@@ -470,6 +588,124 @@ registerHandler('affiliate.confirm-digital', async () => {
       logger.info(`[affiliate] commissions confirmées (commande numérique ${order.id})`);
     }
   }
+});
+
+// 🧹 224Guard : auto-résolution des erreurs ÉTEINTES — une famille (même error_message)
+// sans AUCUNE réapparition depuis 7 jours = bug corrigé → 'resolved'. Sans ce job, les
+// compteurs du Command Center cumulaient l'historique (ex. « 50 critiques » dont 0 active)
+// et fabriquaient de fausses urgences à chaque rapport IA. Les familles actives sont intactes.
+registerHandler('errors.auto-resolve-stale', async () => {
+  const STALE_DAYS = 7;
+  const cutoff = new Date(Date.now() - STALE_DAYS * 86400000).toISOString();
+  const { data: detected } = await supabaseAdmin
+    .from('system_errors')
+    .select('id, error_message, created_at')
+    .eq('status', 'detected')
+    .order('created_at', { ascending: false })
+    .limit(1000);
+  if (!detected?.length) return;
+
+  // Famille = error_message ; éteinte si sa DERNIÈRE occurrence est plus vieille que le cutoff.
+  const families = new Map<string, { last: string; ids: string[] }>();
+  for (const e of detected as any[]) {
+    const k = e.error_message || '(vide)';
+    const f = families.get(k) || { last: e.created_at, ids: [] };
+    if (e.created_at > f.last) f.last = e.created_at;
+    f.ids.push(e.id);
+    families.set(k, f);
+  }
+
+  let resolved = 0;
+  for (const [, f] of families) {
+    if (f.last >= cutoff) continue; // famille encore active → on n'y touche pas
+    for (let i = 0; i < f.ids.length; i += 100) {
+      const { error } = await supabaseAdmin
+        .from('system_errors')
+        .update({
+          status: 'resolved',
+          fixed_at: new Date().toISOString(),
+          fix_description: `Auto-résolue : famille éteinte depuis > ${STALE_DAYS} j (aucune réapparition)`,
+        })
+        .in('id', f.ids.slice(i, i + 100));
+      if (error) { logger.warn(`[errors] auto-resolve-stale: ${error.message}`); return; }
+      resolved += Math.min(100, f.ids.length - i);
+    }
+  }
+  if (resolved > 0) logger.info(`[errors] auto-resolve-stale: ${resolved} erreur(s) éteinte(s) résolue(s)`);
+});
+
+// ☎️ Appels : filet « pas de réponse » — tout appel resté 'ringing' > 60 s passe en 'missed'
+// via la RPC expire_stale_ringing_calls (migration 20260703130000). Doublonne volontairement
+// le pg_cron éventuel : la RPC est idempotente, deux exécutions/minute sont sans effet de bord.
+registerHandler('calls.expire-ringing', async () => {
+  const { error } = await supabaseAdmin.rpc('expire_stale_ringing_calls' as any);
+  if (error) logger.warn(`[calls] expire-ringing: ${error.message}`);
+});
+
+// Live : FILET DE SÉCURITÉ anti-fantômes. Clôture les lives restés `live` anormalement
+// longtemps — cas d'un hôte crashé qui n'est jamais revenu (ni /end explicite, ni beacon
+// d'unload). La clôture NORMALE se fait côté client (pagehide/unmount) + à chaque nouveau
+// live du vendeur (un seul actif). Ce reaper ne rattrape que les crashes. Seuil : LIVE_MAX_HOURS.
+registerHandler('live.reap-orphans', async () => {
+  const maxHours = Number(process.env.LIVE_MAX_HOURS || 3);
+  const cutoff = new Date(Date.now() - maxHours * 3600 * 1000).toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('live_streams')
+    .update({ status: 'ended', ended_at: new Date().toISOString() })
+    .eq('status', 'live')
+    .lt('started_at', cutoff)
+    .select('id');
+  if (error) { logger.warn(`[live] reap-orphans: ${error.message}`); return; }
+  if (data && data.length) logger.info(`[live] ${data.length} live(s) orphelin(s) clôturé(s) (> ${maxHours}h sans fin)`);
+});
+
+// CHANTIER 2 — FILET REPLAY SERVEUR + STOP D'OFFICE (anti-facturation). Pour tout live TERMINÉ
+// dont l'enregistrement Agora n'est pas encore publié (recording_status recording/processing,
+// pas de replay_url), on tente le stop (idempotent → arrête la facturation) et on publie le MP4
+// dès qu'il est prêt en GCS. Aucun live avec un fichier existant ne reste orphelin.
+registerHandler('live.recording-safety-net', async () => {
+  if (!isCloudRecordingConfigured()) return; // enregistrement serveur désactivé → repli client
+  const { data, error } = await supabaseAdmin
+    .from('live_streams')
+    .select('id, channel, recording_resource_id, recording_sid, recording_uid, ended_at')
+    .eq('status', 'ended')
+    .is('replay_url', null)
+    .in('recording_status', ['recording', 'processing'])
+    .not('recording_sid', 'is', null)
+    .limit(50);
+  if (error) { logger.warn(`[live/recording] safety-net: ${error.message}`); return; }
+  for (const s of (data || []) as any[]) {
+    // Abandon après 6 h sans fichier → 'failed' (la reprise vendeur / le repli client prend le relais).
+    if (s.ended_at && Date.now() - new Date(s.ended_at).getTime() > 6 * 3600 * 1000) {
+      await supabaseAdmin.from('live_streams').update({ recording_status: 'failed' }).eq('id', s.id).is('replay_url', null);
+      continue;
+    }
+    try {
+      const url = await finalizeRecordingIfReady(s);
+      if (url) logger.info(`[live/recording] replay serveur publié (filet) ${s.id}`);
+    } catch (e: any) { logger.warn(`[live/recording] finalize ${s.id}: ${e?.message}`); }
+  }
+});
+
+// 🤖 Surveillance : réconciliation automatique — un cas signalé dont la CORRECTION est
+// PROUVÉE en base (trace de frais apparue, régularisation liée, mouvement documenté) est
+// acquitté AUTOMATIQUEMENT → compteur retombe → pastille verte + alerte en Historique,
+// sans aucun clic PDG. Ce qui n'est pas prouvable reste signalé.
+// ⚛️ Chemin principal = RPC SQL auto_reconcile_monitor_cases (migration 20260704170000) :
+// UNE transaction set-based, ON CONFLICT DO NOTHING — atomique et sans N+1. Le repli JS
+// (équivalent, idempotent) n'est utilisé QUE si la RPC n'est pas encore appliquée, et il
+// est LOGGÉ à chaque fois — jamais silencieux.
+registerHandler('monitor.auto-reconcile', async () => {
+  const { data, error } = await supabaseAdmin.rpc('auto_reconcile_monitor_cases' as any);
+  if (!error) {
+    const d = data as any;
+    if (d?.acked_missing_fee || d?.acked_untraced) {
+      logger.info(`[Monitor] auto-réconciliation SQL : ${d.acked_missing_fee} frais + ${d.acked_untraced} hausses acquittés`);
+    }
+    return;
+  }
+  logger.warn(`[Monitor] RPC auto_reconcile_monitor_cases indisponible (${error.message}) → repli JS équivalent — appliquer la migration 20260704170000`);
+  await autoReconcileMonitorCases();
 });
 
 // Restaurant : annule + rembourse (atomique) les commandes payées mais NON acceptées après 3 min.
@@ -1005,6 +1241,14 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('restaurant.auto-cancel', {}).catch(() => {}), 60 * 1000));
       // Campagnes programmées : check toutes les 60s pour lancer celles arrivées à échéance
       recurringTimers.push(setInterval(() => this.enqueue('campaigns.dispatch-scheduled', {}).catch(() => {}), 60 * 1000));
+      // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
+      recurringTimers.push(setInterval(() => this.enqueue('calls.expire-ringing', {}).catch(() => {}), 60 * 1000));
+      // Live : reaper des fantômes (hôte crashé) toutes les heures
+      recurringTimers.push(setInterval(() => this.enqueue('live.reap-orphans', {}).catch(() => {}), everyHour));
+      // Live : filet replay serveur + stop d'office (anti-facturation) toutes les 5 min
+      recurringTimers.push(setInterval(() => this.enqueue('live.recording-safety-net', {}).catch(() => {}), 5 * 60 * 1000));
+      // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
+      recurringTimers.push(setInterval(() => this.enqueue('monitor.auto-reconcile', {}).catch(() => {}), 5 * 60 * 1000));
 
       recurringTimers.push(setInterval(() => this.enqueue('escrow.auto-release', {}).catch(() => {}), every6Hours));
       recurringTimers.push(setInterval(() => this.enqueue('affiliate.confirm-digital', {}).catch(() => {}), every6Hours));
@@ -1013,7 +1257,13 @@ export const jobQueue = {
 
       recurringTimers.push(setInterval(() => this.enqueue('recommendations.recalculate', {}).catch(() => {}), every24Hours));
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
+      // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
+      // Live shopping : purge quotidienne des replays expirés (> 30 j) — objet GCS + replay_url=null
+      recurringTimers.push(setInterval(() => this.enqueue('live-replays.purge', {}).catch(() => {}), every24Hours));
+      recurringTimers.push(setInterval(() => this.enqueue('stories.purge', {}).catch(() => {}), every6Hours));
+      // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
+      recurringTimers.push(setInterval(() => this.enqueue('errors.auto-resolve-stale', {}).catch(() => {}), every24Hours));
       // Rappels beauté J-1/H-2 toutes les 15 minutes
       recurringTimers.push(setInterval(() => this.enqueue('beauty.reminders', {}).catch(() => {}), 15 * 60 * 1000));
       // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
@@ -1045,6 +1295,14 @@ export const jobQueue = {
       await queue.add('restaurant.auto-cancel', {}, { repeat: { every: 60 * 1000 } });
       // Campagnes programmées : lancement automatique à l'échéance (check toutes les 60s)
       await queue.add('campaigns.dispatch-scheduled', {}, { repeat: { every: 60 * 1000 } });
+      // Appels : ringing > 60s → missed (filet serveur, RPC idempotente)
+      await queue.add('calls.expire-ringing', {}, { repeat: { every: 60 * 1000 } });
+      // Live : reaper des fantômes (hôte crashé) toutes les heures
+      await queue.add('live.reap-orphans', {}, { repeat: { every: 3600000 } });
+      // Live : filet replay serveur + stop d'office (anti-facturation) toutes les 5 min
+      await queue.add('live.recording-safety-net', {}, { repeat: { every: 5 * 60 * 1000 } });
+      // Surveillance : auto-réconciliation des cas prouvés corrigés (toutes les 5 min)
+      await queue.add('monitor.auto-reconcile', {}, { repeat: { every: 5 * 60 * 1000 } });
 
       // Every 6 hours: escrow + subscriptions + POS
       await queue.add('escrow.auto-release', {}, { repeat: { every: 6 * 3600000 } });
@@ -1055,7 +1313,12 @@ export const jobQueue = {
       // Daily: recommendations + rappels d'expiration d'abonnement
       await queue.add('recommendations.recalculate', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
+      // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
+      // Live shopping : purge quotidienne des replays expirés (> 30 j)
+      await queue.add('live-replays.purge', {}, { repeat: { every: 24 * 3600000 } });
+      // 224Guard : erreurs éteintes > 7j → resolved (compteurs Command Center fiables)
+      await queue.add('errors.auto-resolve-stale', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('beauty.reminders', {}, { repeat: { every: 15 * 60 * 1000 } });
       // Robustesse carte Stripe : nettoyage des abandons (15 min) + réconciliation des webhooks manqués (10 min)
       await queue.add('orders.cancel-abandoned-card', {}, { repeat: { every: 15 * 60 * 1000 } });

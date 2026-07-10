@@ -685,7 +685,21 @@ router.get('/recipient/resolve', verifyJWT, async (req: AuthenticatedRequest, re
       return;
     }
 
-    res.json({ success: true, data: resolved });
+    // 🔒 Isolation profils : ne JAMAIS renvoyer email/phone du destinataire au client
+    // (résolution par code/tel → on confirme par nom + code public, pas par PII).
+    res.json({
+      success: true,
+      data: {
+        userId: resolved.userId,
+        query: resolved.query,
+        matchedBy: resolved.matchedBy,
+        displayName: resolved.displayName,
+        publicId: resolved.publicId,
+        customId: resolved.customId,
+        email: null,
+        phone: null,
+      },
+    });
   } catch (error: any) {
     logger.error(`Wallet recipient resolve error: ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la resolution du destinataire' });
@@ -831,13 +845,14 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
       receiver: {
         id: resolved.userId,
         name: resolved.displayName,
-        email: resolved.email,
-        phone: resolved.phone,
+        // 🔒 Isolation profils : jamais d'email/phone du destinataire au client.
+        email: null,
+        phone: null,
         custom_id: resolved.customId || resolved.publicId || null,
       },
       receiver_name: resolved.displayName,
-      receiver_email: resolved.email,
-      receiver_phone: resolved.phone,
+      receiver_email: null,
+      receiver_phone: null,
       receiver_code: resolved.customId || resolved.publicId || resolved.userId,
       amount_sent: amount,
       currency_sent: senderCurrency,
@@ -1211,7 +1226,9 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     const { amount, description, idempotency_key, pin } = req.body || {};
 
     if (!amount || typeof amount !== 'number' || amount <= 0) {
-      res.status(400).json({ success: false, error: 'Montant invalide' });
+      // error_code = démonstrateur i18n (docs/API_CONTRACT.md § Erreurs et i18n) :
+      // le frontend traduit t('errors.<code>') et garde `error` (FR) comme repli.
+      res.status(400).json({ success: false, error: 'Montant invalide', error_code: 'AMOUNT_INVALID' });
       return;
     }
 
@@ -1249,7 +1266,11 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         : result.error === 'Wallet bloqué' ? 403
           : result.error?.includes('activité suspecte') ? 403
             : 400;
-      res.status(statusCode).json({ success: false, error: result.error });
+      // error_code machine (i18n frontend) — additif, le message FR reste le repli.
+      const errorCode = result.error === 'Solde insuffisant' ? 'INSUFFICIENT_BALANCE'
+        : result.error === 'Wallet bloqué' ? 'WALLET_BLOCKED'
+          : undefined;
+      res.status(statusCode).json({ success: false, error: result.error, ...(errorCode ? { error_code: errorCode } : {}) });
       return;
     }
 

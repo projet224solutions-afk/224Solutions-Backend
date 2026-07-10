@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { createAuthUserWithPhone } from '../services/authPhone.service.js';
 import { logger } from '../config/logger.js';
 
 const router = Router();
@@ -68,17 +69,20 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
       return;
     }
 
-    // 1) Créer le compte auth
-    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+    // 1) Créer le compte auth — téléphone = identifiant (login email OU téléphone). Dégrade si doublon.
+    const authCreate = await createAuthUserWithPhone({
       email: emailLc,
       password,
-      email_confirm: true,
+      phone,
+      countryCode: (req.body?.country_code as string | undefined),
       user_metadata: { full_name: name, phone, role: 'vendor_agent' },
     });
-    if (authError || !authData.user) {
-      res.status(500).json({ success: false, error: authError?.message || 'Erreur création compte' });
+    if (authCreate.error || !authCreate.user) {
+      res.status(500).json({ success: false, error: authCreate.error?.message || 'Erreur création compte' });
       return;
     }
+    const authData = { user: authCreate.user };
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     // 2) Insérer l'agent ; ROLLBACK du compte auth si échec
     const agentCode = `VAG${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
@@ -119,8 +123,12 @@ router.post('/agents', verifyJWT, async (req: AuthenticatedRequest, res: Respons
     });
     if (profErr) logger.warn(`[vendors/agents] profile upsert: ${profErr.message}`);
 
-    logger.info(`[vendors/agents] agent ${agentRow.id} créé pour vendor ${vendor.id}`);
-    res.json({ success: true, data: { agent: { id: agentRow.id, agent_code: agentCode, access_token: accessToken, email: emailLc } } });
+    logger.info(`[vendors/agents] agent ${agentRow.id} créé pour vendor ${vendor.id} (phone_login=${phoneLoginAvailable})`);
+    res.json({
+      success: true,
+      data: { agent: { id: agentRow.id, agent_code: agentCode, access_token: accessToken, email: emailLc }, phone_login_available: phoneLoginAvailable },
+      ...(phoneLoginAvailable ? {} : { message: 'Ce numéro est déjà lié à un autre compte — connexion par email uniquement.' }),
+    });
   } catch (err: any) {
     logger.error(`[vendors/agents] ${err?.message}`);
     res.status(500).json({ success: false, error: 'Erreur serveur interne' });
@@ -811,6 +819,98 @@ router.post('/admin/change-currency', verifyJWT, async (req: AuthenticatedReques
   } catch (error: any) {
     logger.error(`[VendorCurrency] Erreur changement devise ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors du changement de devise' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUIVRE UNE BOUTIQUE — /api/vendors/:id/follow, /me/following.
+// Le client gère SES suivis ; le fan-out des notifs est géré par des triggers DB.
+// ════════════════════════════════════════════════════════════════════════════
+const FOLLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** POST /api/vendors/:id/follow — suit/désuit la boutique (idempotent). */
+router.post('/:id/follow', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const { data, error } = await supabaseAdmin.rpc('toggle_follow_vendor', {
+      p_vendor_id: vendorId, p_actor_user_id: userId,
+    });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    const d = data as any;
+    res.json({ success: true, data: { following: d?.following === true, followersCount: d?.followers_count ?? 0 } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** GET /api/vendors/:id/follow-status — état de suivi du user courant + compteur. */
+router.get('/:id/follow-status', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const [{ data: follow }, { data: vendor }] = await Promise.all([
+      supabaseAdmin.from('vendor_followers').select('notify_products, notify_lives')
+        .eq('vendor_id', vendorId).eq('user_id', userId).maybeSingle(),
+      supabaseAdmin.from('vendors').select('followers_count').eq('id', vendorId).maybeSingle(),
+    ]);
+    res.json({ success: true, data: {
+      following: !!follow,
+      notifyProducts: (follow as any)?.notify_products ?? true,
+      notifyLives: (follow as any)?.notify_lives ?? true,
+      followersCount: (vendor as any)?.followers_count ?? 0,
+    } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow-status] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** PATCH /api/vendors/:id/follow-settings — règle notif produits/lives séparément. */
+router.patch('/:id/follow-settings', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const vendorId = req.params.id;
+    if (!FOLLOW_UUID_RE.test(vendorId)) { res.status(400).json({ success: false, error: 'id invalide' }); return; }
+    const patch: Record<string, boolean> = {};
+    if (typeof req.body?.notify_products === 'boolean') patch.notify_products = req.body.notify_products;
+    if (typeof req.body?.notify_lives === 'boolean') patch.notify_lives = req.body.notify_lives;
+    if (Object.keys(patch).length === 0) { res.status(400).json({ success: false, error: 'Aucun réglage' }); return; }
+    const { error } = await supabaseAdmin.from('vendor_followers')
+      .update(patch).eq('vendor_id', vendorId).eq('user_id', userId);
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, data: { updated: true } });
+  } catch (e: any) {
+    logger.error(`[vendor-follow-settings] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
+  }
+});
+
+/** GET /api/vendors/me/following — les boutiques suivies par le user courant. */
+router.get('/me/following', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { data, error } = await supabaseAdmin
+      .from('vendor_followers')
+      .select('vendor_id, notify_products, notify_lives, created_at, vendors(id, business_name, logo_url, shop_slug, followers_count)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    const shops = (data || []).map((r: any) => ({
+      vendorId: r.vendor_id,
+      name: r.vendors?.business_name || null,
+      logoUrl: r.vendors?.logo_url || null,
+      slug: r.vendors?.shop_slug || null,
+      followersCount: r.vendors?.followers_count ?? 0,
+      notifyProducts: r.notify_products, notifyLives: r.notify_lives,
+    }));
+    res.json({ success: true, data: { shops } });
+  } catch (e: any) {
+    logger.error(`[vendor-following] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur' });
   }
 });
 

@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { createAuthUserWithPhone } from "../../services/authPhone.service.js";
 
 const router = Router();
 
@@ -79,10 +80,12 @@ router.post("/create", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "Email et mot de passe requis" });
     }
 
-    const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
+    // Téléphone = identifiant auth (login email OU téléphone). Dégrade en email-only si doublon.
+    const authCreate = await createAuthUserWithPhone({
       email,
       password,
-      email_confirm: true,
+      phone,
+      countryCode: (req.body?.country_code as string | undefined),
       user_metadata: {
         first_name: first_name || "",
         last_name: last_name || "",
@@ -91,9 +94,11 @@ router.post("/create", async (req: Request, res: Response) => {
       },
     });
 
-    if (createErr || !created.user) {
-      return res.status(400).json({ success: false, error: createErr?.message || "Création auth impossible" });
+    if (authCreate.error || !authCreate.user) {
+      return res.status(400).json({ success: false, error: authCreate.error?.message || "Création auth impossible" });
     }
+    const created = { user: authCreate.user };
+    const phoneLoginAvailable = authCreate.phoneLoginAvailable;
 
     const { error: profileErr } = await supabaseAdmin.from("profiles").upsert({
       id: created.user.id,
@@ -128,11 +133,15 @@ router.post("/create", async (req: Request, res: Response) => {
 
     return res.status(201).json({
       success: true,
-      message: "Utilisateur créé",
+      message: phoneLoginAvailable
+        ? "Utilisateur créé (connexion par email ou téléphone)"
+        : "Utilisateur créé — ce numéro est déjà lié à un autre compte, connexion par email uniquement",
+      phone_login_available: phoneLoginAvailable,
       user: {
         id: created.user.id,
         email: created.user.email,
         role,
+        phone_login_available: phoneLoginAvailable,
       },
     });
   } catch (error) {
@@ -464,10 +473,12 @@ router.post("/agents/create", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "Cet email existe déjà" });
     }
 
-    const { data: authCreated, error: authCreateErr } = await supabaseAdmin.auth.admin.createUser({
+    // Téléphone = identifiant auth (login email OU téléphone). Dégrade en email-only si doublon.
+    const authAgentCreate = await createAuthUserWithPhone({
       email,
       password,
-      email_confirm: true,
+      phone,
+      countryCode: (req.body?.country_code as string | undefined),
       user_metadata: {
         first_name: String(name).split(" ")[0] || name,
         last_name: String(name).split(" ").slice(1).join(" ") || "",
@@ -476,9 +487,11 @@ router.post("/agents/create", async (req: Request, res: Response) => {
       },
     });
 
-    if (authCreateErr || !authCreated.user) {
-      return res.status(400).json({ success: false, error: authCreateErr?.message || "Création auth impossible" });
+    if (authAgentCreate.error || !authAgentCreate.user) {
+      return res.status(400).json({ success: false, error: authAgentCreate.error?.message || "Création auth impossible" });
     }
+    const authCreated = { user: authAgentCreate.user };
+    const phoneLoginAvailable = authAgentCreate.phoneLoginAvailable;
 
     const { data: agentCode } = await supabaseAdmin.rpc("generate_sequential_id", { p_prefix: "AGT" });
     if (!agentCode) {
@@ -511,7 +524,7 @@ router.post("/agents/create", async (req: Request, res: Response) => {
 
     await supabaseAdmin.from("wallets").insert({ user_id: authCreated.user.id, balance: 0, currency: "GNF" });
 
-    return res.status(201).json({ success: true, agent });
+    return res.status(201).json({ success: true, agent, phone_login_available: phoneLoginAvailable });
   } catch (error) {
     return res.status(500).json({
       success: false,

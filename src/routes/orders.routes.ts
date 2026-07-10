@@ -23,6 +23,19 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { orderCreateRateLimit, orderManageRateLimit } from '../middlewares/routeRateLimiter.js';
 import { cache } from '../config/redis.js';
+import { loadServiceAccount, getPrivateBucketName, generateSignedUrl } from '../services/gcs.service.js';
+
+// Preuve de livraison stockée sur GCS privé : le chemin est préfixé « gcs: » pour
+// distinguer GCS (bucket privé, URL signée) de Supabase (héritage). URL signée 1h.
+function signDeliveryProofUrl(storedPath: string | null): string | null {
+  if (!storedPath) return null;
+  if (storedPath.startsWith('gcs:')) {
+    const sa = loadServiceAccount();
+    if (!sa) return null;
+    return generateSignedUrl(sa, getPrivateBucketName(), storedPath.slice(4), { method: 'GET', expiresInSeconds: 3600 });
+  }
+  return null; // chemins Supabase gérés séparément (createSignedUrl asynchrone)
+}
 import { createNotification, createNotifications } from '../services/notification.service.js';
 import { buildOrderFinancialSummary } from '../services/marketplacePricing.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
@@ -99,6 +112,13 @@ const CreateOrderSchema = z.object({
     country: z.string().trim().min(2).max(100),
     postal_code: z.string().max(20).nullish(),
     notes: z.string().max(500).nullish(),
+    // Position GPS du client (capturée au checkout, jamais 0/0). Persistée ICI pour que le
+    // livreur navigue vers le client (DeliveryGPSNavigation lit shipping_address.lat/lng).
+    // Optionnelle + nullable (refus/échec de géoloc → null explicite, jamais bloquant).
+    lat: z.number().min(-90).max(90).nullish(),
+    lng: z.number().min(-180).max(180).nullish(),
+    accuracy: z.number().nonnegative().nullish(),
+    captured_at: z.string().max(40).nullish(),
   }),
   payment_method: z.enum(['card', 'mobile_money', 'wallet', 'cash']),
   payment_intent_id: z.string().max(500).nullish(),
@@ -155,7 +175,7 @@ async function attachEscrowToOrders<T extends { id: string }>(orders: T[]) {
 
   const { data: escrows, error } = await supabaseAdmin
     .from('escrow_transactions')
-    .select('id, order_id, status, amount, currency, auto_release_date, released_at, seller_confirmed_at')
+    .select('id, order_id, status, amount, currency, commission_amount, metadata, auto_release_date, released_at, seller_confirmed_at')
     .in('order_id', orders.map(order => order.id))
     .order('created_at', { ascending: false });
 
@@ -452,7 +472,9 @@ async function syncOrderMarketingContacts(params: {
  *   - DB calls: 6+N → 2 (-80%)
  *   - Orders/sec: 10-25 → 40-80 per instance (+3x)
  */
-router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+// Ordre : idempotence AVANT rate-limit → un rejeu (même Idempotency-Key) renvoie la réponse
+// stockée sans consommer de quota ; seules les créations réellement nouvelles comptent.
+router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   const startTime = Date.now();
 
   try {
@@ -515,9 +537,10 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
       p_buyer_fee_amount: number;
       p_seller_commission_amount: number | null;
     } = {
-      // ✅ L'acheteur est TOUJOURS l'utilisateur authentifié (corrige le FK escrow buyer_id
-      //    en COD/carte/mobile money où p_buyer_user_id restait null → customer_id inséré).
-      //    Le débit wallet reste 0 ici ; il n'a lieu que dans le bloc payment_method='wallet'.
+      // 🔴 p_buyer_user_id = IDENTITÉ de l'acheteur (auth.uid()), PAS un paramètre wallet. Doit être
+      // renseigné pour TOUS les moyens de paiement, sinon escrow.payer_id/buyer_id restaient NULL
+      // (carte/mobile money/COD) → confirm-delivery « Non autorisé » + refund crédite un mauvais id
+      // → « Échec de la libération/du remboursement ». Les RLS escrow exigent payer_id = auth.uid().
       p_buyer_user_id: userId, p_wallet_debit_amount: 0, p_buyer_wallet_currency: null,
       p_exchange_rate_used: null, p_buyer_fee_amount: 0, p_seller_commission_amount: null,
     };
@@ -697,11 +720,11 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
     }
 
     // 💰 COMMISSION AGENT (affiliation) sur l'achat marketplace — best-effort, non bloquant.
-    // RÈGLE MÉTIER : l'agent (et son parent) touche un % des FRAIS DE TRANSACTION (la commission
-    // acheteur, ex. 2 %), et NON du montant brut. Ex : achat 100 000, frais 2 % = 2 000 ; sous-agent
-    // 15 % des frais = 300, agent principal 5 % = 100 (total 400 = 20 % des frais ; plateforme garde
-    // 80 %). Base = buyer fee converti en GNF (credit_agent_commission raisonne en GNF). Anti-doublon
-    // par order_id + plafonné. On ne déclenche que sur commande PAYÉE.
+    // RÈGLE MÉTIER : l'agent CRÉATEUR du service (= le VENDEUR, et son parent), PAS l'acheteur,
+    // touche un % des FRAIS DE TRANSACTION (la commission acheteur, ex. 2 %), et NON du montant
+    // brut. Ex : achat 100 000, frais 2 % = 2 000 ; sous-agent 15 % des frais = 300, agent principal
+    // 5 % = 100 (total 400 = 20 % des frais ; plateforme garde 80 %). Base = buyer fee converti en
+    // GNF (credit_agent_commission raisonne en GNF). Anti-doublon par order_id + plafonné. Commande PAYÉE.
     // ⚠️ Réserve : pas de reprise sur annulation/remboursement (même profil que record_pdg_revenue).
     if (finalPaymentStatus === 'paid') {
       try {
@@ -720,8 +743,9 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
           // Pas de taux dispo → on n'invente pas (commission ignorée plutôt que fausse).
           gnfFee = fx?.rate ? feeAmount * Number(fx.rate) : 0;
         }
-        if (gnfFee > 0) {
-          await triggerAffiliateCommission(userId, Math.round(gnfFee), 'achat_produit', result.order_id);
+        if (gnfFee > 0 && vendor.user_id) {
+          // ✅ Agent du CRÉATEUR (le vendeur), et non de l'acheteur.
+          await triggerAffiliateCommission(vendor.user_id, Math.round(gnfFee), 'achat_produit', result.order_id);
         }
       } catch (commErr: any) {
         logger.warn(`commission agent achat non bloquante (commande ${result.order_id}): ${commErr?.message || commErr}`);
@@ -818,7 +842,7 @@ router.post('/', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: 
   }
 });
 
-router.post('/digital', verifyJWT, orderCreateRateLimit, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/digital', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const customerId = await getOrCreateCustomerId(userId);
@@ -1303,7 +1327,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
       .update({
         status: 'delivered',
         updated_at: nowIso,
-        delivery_confirmed_at: nowIso,   // ✅ départ du compte à rebours 7j (purge preuve)
+        delivery_confirmed_at: nowIso, // ancre la rétention : purge de la preuve 7 j après
         metadata: {
           ...(fullOrder.metadata && typeof fullOrder.metadata === 'object' ? fullOrder.metadata : {}),
           delivered_at: nowIso,
@@ -1339,6 +1363,50 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
 });
 
 /**
+ * POST /api/orders/:orderId/delivery-proof-upload-url — URL d'upload SIGNÉE vers le bucket
+ * PRIVÉ Supabase `delivery-proofs`. Réservé au VENDEUR de la commande.
+ * Remplace la voie GCS (Edge gcs-signed-url) qui échoue en 503 tant qu'aucun service
+ * account Google n'est configuré : la chaîne Supabase est complète sans AUCUN secret
+ * supplémentaire (upload signé → POST des chemins → lecture via URL signée 1 h).
+ */
+router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof-upload-url', verifyJWT, orderManageRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    const userId = req.user!.id;
+    const { file_name } = req.body || {};
+    if (!file_name || typeof file_name !== 'string') {
+      res.status(400).json({ success: false, error: 'file_name requis' }); return;
+    }
+    const ext = String(file_name).split('.').pop()?.toLowerCase() || '';
+    const ALLOWED = ['jpg', 'jpeg', 'png', 'webp', 'heic', 'mp4', 'webm', 'mov'];
+    if (!ALLOWED.includes(ext)) {
+      res.status(400).json({ success: false, error: `Extension non autorisée (${ALLOWED.join(', ')})` }); return;
+    }
+
+    const { data: order } = await supabaseAdmin
+      .from('orders').select('id, vendor_id').eq('id', orderId).maybeSingle();
+    if (!order) { res.status(404).json({ success: false, error: 'Commande introuvable' }); return; }
+    const { data: vendor } = await supabaseAdmin
+      .from('vendors').select('id').eq('id', (order as any).vendor_id).eq('user_id', userId).maybeSingle();
+    if (!vendor) { res.status(403).json({ success: false, error: 'Action réservée au vendeur' }); return; }
+
+    // Chemin scopé à la commande (même règle anti-IDOR que le POST delivery-proof).
+    const objectPath = `${orderId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { data: signed, error: signErr } = await supabaseAdmin.storage
+      .from('delivery-proofs')
+      .createSignedUploadUrl(objectPath);
+    if (signErr || !signed?.token) {
+      logger.error(`[delivery-proof upload-url] ${signErr?.message}`);
+      res.status(500).json({ success: false, error: "Impossible de préparer l'upload" }); return;
+    }
+    res.json({ success: true, data: { path: objectPath, token: signed.token } });
+  } catch (e: any) {
+    logger.error(`[delivery-proof upload-url] ${e?.message}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+/**
  * POST /api/orders/:orderId/delivery-proof — le vendeur enregistre les chemins
  * (fichiers déjà uploadés dans le bucket privé delivery-proofs). Réservé au vendeur.
  */
@@ -1346,7 +1414,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManage
   try {
     const orderId = req.params.orderId;
     const userId = req.user!.id;
-    const { photo_path, video_path } = req.body || {};
+    const { photo_path, video_path, storage } = req.body || {};
     if (!photo_path || typeof photo_path !== 'string') {
       res.status(400).json({ success: false, error: 'photo_path requis' }); return;
     }
@@ -1360,9 +1428,13 @@ router.post('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManage
     if (!photo_path.startsWith(`${orderId}/`) || (video_path && !String(video_path).startsWith(`${orderId}/`))) {
       res.status(400).json({ success: false, error: 'Chemin de preuve invalide' }); return;
     }
+    // Preuve stockée sur GCS privé → marquer le chemin « gcs: » (sinon Supabase, héritage).
+    const useGcs = storage === 'gcs';
+    const storedPhoto = useGcs ? `gcs:${photo_path}` : photo_path;
+    const storedVideo = video_path ? (useGcs ? `gcs:${video_path}` : video_path) : null;
     const { error } = await supabaseAdmin.from('orders').update({
-      delivery_proof_photo_path: photo_path,
-      delivery_proof_video_path: video_path || null,
+      delivery_proof_photo_path: storedPhoto,
+      delivery_proof_video_path: storedVideo,
       delivery_proof_uploaded_at: new Date().toISOString(),
     } as any).eq('id', orderId);
     if (error) { res.status(400).json({ success: false, error: error.message }); return; }
@@ -1403,14 +1475,22 @@ router.get('/:orderId([0-9a-fA-F-]{36})/delivery-proof', verifyJWT, orderManageR
     }
     let photo_url: string | null = null, video_url: string | null = null;
     if (o.delivery_proof_photo_path) {
-      const { data } = await supabaseAdmin.storage.from('delivery-proofs')
-        .createSignedUrl(o.delivery_proof_photo_path, 3600);
-      photo_url = data?.signedUrl || null;
+      if (String(o.delivery_proof_photo_path).startsWith('gcs:')) {
+        photo_url = signDeliveryProofUrl(o.delivery_proof_photo_path);
+      } else {
+        const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+          .createSignedUrl(o.delivery_proof_photo_path, 3600);
+        photo_url = data?.signedUrl || null;
+      }
     }
     if (o.delivery_proof_video_path) {
-      const { data } = await supabaseAdmin.storage.from('delivery-proofs')
-        .createSignedUrl(o.delivery_proof_video_path, 3600);
-      video_url = data?.signedUrl || null;
+      if (String(o.delivery_proof_video_path).startsWith('gcs:')) {
+        video_url = signDeliveryProofUrl(o.delivery_proof_video_path);
+      } else {
+        const { data } = await supabaseAdmin.storage.from('delivery-proofs')
+          .createSignedUrl(o.delivery_proof_video_path, 3600);
+        video_url = data?.signedUrl || null;
+      }
     }
     res.json({ success: true, purged: false, photo_url, video_url });
   } catch (e: any) {

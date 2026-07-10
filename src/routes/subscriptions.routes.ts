@@ -33,6 +33,34 @@ import { subscriptionRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
+/**
+ * 🏦 Journalise le prix de l'abonnement comme REVENU du coffre PDG (revenus_pdg → trigger
+ * qui crédite le coffre atomiquement). À appeler AVANT triggerAffiliateCommission : le coffre
+ * doit être crédité du prix (+50 000) AVANT d'être débité de la commission (−10 000).
+ * Best-effort non bloquant, idempotent (UNIQUE (source_type, transaction_id) en base).
+ */
+async function recordSubscriptionRevenue(
+  source: 'abonnement_vendeur' | 'abonnement_service' | 'abonnement_chauffeur',
+  amountGnf: number,
+  transactionId: string | undefined | null,
+  userId: string,
+): Promise<void> {
+  try {
+    if (!amountGnf || amountGnf <= 0 || !transactionId) return;
+    const { error } = await supabaseAdmin.rpc('record_pdg_revenue', {
+      p_source_type: source,
+      p_amount: amountGnf,
+      p_percentage: 100,
+      p_transaction_id: transactionId,
+      p_user_id: userId,
+      p_currency: 'GNF',
+    });
+    if (error) logger.warn(`[treasury] record_pdg_revenue(${source}) échoué: ${error.message}`);
+  } catch (e: any) {
+    logger.warn(`[treasury] record_pdg_revenue(${source}): ${e?.message}`);
+  }
+}
+
 // ==================== Helper : résultat des RPC atomiques d'abonnement ====================
 type AtomicSubResult = { status: 'created' | 'error'; subscription_id?: string; new_balance?: number; mode?: string; error?: string };
 
@@ -443,6 +471,7 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
       }
 
       if (switchCharge > 0) {
+        await recordSubscriptionRevenue('abonnement_vendeur', switchCharge, currentSub.id, userId); // 🏦 revenu AVANT commission
         const commission = await triggerAffiliateCommission(userId, switchCharge, 'abonnement', currentSub.id);
         if (!commission.success) {
           logger.warn(`[subscriptions/purchase] commission switch non créée pour ${currentSub.id}: ${commission.error || 'unknown'}`);
@@ -494,6 +523,7 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
 
     // Commission d'affiliation (plans payants) — best-effort, hors transaction critique
     if (!isFree) {
+      await recordSubscriptionRevenue('abonnement_vendeur', price, newResult.subscription_id!, userId); // 🏦 revenu AVANT commission
       const commission = await triggerAffiliateCommission(userId, price, 'abonnement', newResult.subscription_id!);
       if (!commission.success) {
         logger.warn(`[subscriptions/purchase] commission non créée pour ${newResult.subscription_id}: ${commission.error || 'unknown'}`);
@@ -649,6 +679,7 @@ router.post('/service/purchase', verifyJWT, subscriptionRateLimit, async (req: A
       }
 
       if (switchCharge > 0) {
+        await recordSubscriptionRevenue('abonnement_service', switchCharge, currentSub.id, userId); // 🏦 revenu AVANT commission
         const commission = await triggerAffiliateCommission(userId, switchCharge, 'abonnement', currentSub.id);
         if (!commission.success) logger.warn(`[subscriptions/service/purchase] commission switch non créée: ${commission.error || 'unknown'}`);
       }
@@ -695,6 +726,7 @@ router.post('/service/purchase', verifyJWT, subscriptionRateLimit, async (req: A
     }
 
     if (!isFree) {
+      await recordSubscriptionRevenue('abonnement_service', price, newResult.subscription_id!, userId); // 🏦 revenu AVANT commission
       const commission = await triggerAffiliateCommission(userId, price, 'abonnement', newResult.subscription_id!);
       if (!commission.success) logger.warn(`[subscriptions/service/purchase] commission non créée: ${commission.error || 'unknown'}`);
     }
@@ -813,6 +845,7 @@ router.post('/driver/purchase', verifyJWT, subscriptionRateLimit, async (req: Au
 
     // Commission d'affiliation — best-effort, hors transaction critique
     if (!isFree) {
+      await recordSubscriptionRevenue('abonnement_chauffeur', price, drvResult.subscription_id!, userId); // 🏦 revenu AVANT commission
       const commission = await triggerAffiliateCommission(userId, price, 'abonnement', drvResult.subscription_id!);
       if (!commission.success) logger.warn(`[subscriptions/driver/purchase] commission non créée: ${commission.error || 'unknown'}`);
     }
@@ -906,6 +939,8 @@ router.post('/confirm', verifyJWT, subscriptionRateLimit, async (req: Authentica
 
     const pricePaid = Number(subscription.price_paid_gnf || updated.price_paid_gnf || 0);
     if (pricePaid > 0) {
+      // 🏦 6e site : revenu AVANT commission (table 'subscriptions' = vendeur).
+      await recordSubscriptionRevenue('abonnement_vendeur', pricePaid, subscription_id, userId);
       const commissionResult = await triggerAffiliateCommission(
         userId,
         pricePaid,

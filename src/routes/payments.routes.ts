@@ -195,7 +195,7 @@ router.post('/link/:paymentId/pay', optionalJWT, async (req: AuthenticatedReques
 
     const { data: current, error: fetchError } = await supabaseAdmin
       .from('payment_links')
-      .select('id, status, expires_at, client_id, metadata')
+      .select('id, status, expires_at, client_id, metadata, link_type')
       .eq('payment_id', paymentId)
       .maybeSingle();
 
@@ -203,6 +203,19 @@ router.post('/link/:paymentId/pay', optionalJWT, async (req: AuthenticatedReques
 
     if (!current) {
       res.status(404).json({ success: false, error: 'Lien de paiement non trouvé' });
+      return;
+    }
+
+    // 🔒 Les liens ESCROW exigent une mise en séquestre réelle (débit acheteur, escrow HELD)
+    // et passent EXCLUSIVEMENT par POST /api/payment-links/process (hold_payment_link_escrow).
+    // Ce endpoint legacy se contente de marquer le lien 'success' SANS créer d'escrow ni bouger
+    // d'argent → l'accepter corromprait l'état (lien « payé » fantôme). On le refuse fail-closed.
+    if (current.link_type === 'escrow') {
+      res.status(409).json({
+        success: false,
+        error: 'Ce lien sécurisé (escrow) doit être payé via le paiement sécurisé.',
+        error_code: 'ESCROW_LINK_WRONG_ENDPOINT',
+      });
       return;
     }
 

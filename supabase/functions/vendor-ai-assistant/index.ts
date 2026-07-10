@@ -3137,7 +3137,8 @@ serve(async (req) => {
       messages,
       memorySummary = '',
       pinnedFacts = [],
-      detectedIntent = ''
+      detectedIntent = '',
+      hasImageAttachment = false
     } = body;
     
     // Priorité à l'historique complet (messages[]) — contient tout l'historique + message actuel
@@ -3691,6 +3692,26 @@ CONTEXTE DE CETTE REQUÊTE:
 - Type détecté: ${isPlatformQuery ? "🔍 RECHERCHE PLATEFORME → utiliser search_proximity_services ou get_available_taxi_drivers IMMÉDIATEMENT" : isExternalSearch ? "🌐 RECHERCHE EXTERNE → PROTOCOLE: 1) search_web_deep(query, depth='deep') 2) fetch_webpage sur URLs connues si < 3 résultats 3) Toujours donner des liens réels. JAMAIS 'je n'ai pas trouvé'" : isBoutiqueAnalysis ? "📊 ANALYSE BOUTIQUE → structure en 3 blocs: Faits / Incertitudes / Actions" : "💬 CONVERSATION → répondre directement et naturellement"}
 - Résumé session: ${memorySummary || 'aucun'}
 - Faits épinglés: ${Array.isArray(pinnedFacts) && pinnedFacts.length > 0 ? pinnedFacts.join(' | ') : 'aucun'}
+- Image jointe dans ce tour: ${hasImageAttachment ? 'oui' : 'non'}
+
+════════════════════════════════════════════════════════════════
+📷 MODE 5 — GESTION DES IMAGES (RÈGLE ABSOLUE)
+════════════════════════════════════════════════════════════════
+
+Le message utilisateur peut contenir un bloc commençant par [CONTEXTE_IMAGE].
+Ce bloc est la DESCRIPTION TEXTUELLE d'une photo envoyée par l'utilisateur,
+DÉJÀ ANALYSÉE en amont par un module de vision. Tu n'as pas besoin de voir la photo.
+
+TU DOIS :
+- Traiter le contenu de [CONTEXTE_IMAGE] comme si tu avais vu la photo toi-même.
+- Utiliser le nom du produit et les mots-clés fournis pour chercher, conseiller, comparer.
+- Si le bloc dit seulement "Photo jointe" sans détail (analyse indisponible),
+  demander UNE description courte du produit (type, marque, couleur) SANS t'excuser longuement.
+
+INTERDICTIONS ABSOLUES :
+- ❌ Ne JAMAIS dire "je ne peux pas voir les photos / images".
+- ❌ Ne JAMAIS dire que tu n'as pas accès aux images.
+- ❌ Ne JAMAIS mentionner le tag [CONTEXTE_IMAGE] ni le module de vision à l'utilisateur.
 
 RÈGLES DE SORTIE SELON LE TYPE:
 ${isPlatformQuery ? "→ APPELER search_proximity_services ou get_available_taxi_drivers AVANT de répondre. Présenter les résultats avec liens cliquables [📍 Voir le service](/services-proximite/{id})." : isExternalSearch ? "→ 1) APPELER search_web_deep(query pertinente, depth='deep'). 2) Si résultats < 3: APPELER fetch_webpage sur URLs de la base de connaissances. 3) Présenter les résultats RÉELS avec [🔗 Titre](url). ⛔ INTERDICTION TOTALE de dire 'je n'ai pas trouvé' — utiliser la base de connaissances si nécessaire." : isBoutiqueAnalysis ? "→ Structure: 1) Faits vérifiés 2) Incertitudes 3) Actions business" : "→ Répondre directement, naturellement, sans structure forcée."}

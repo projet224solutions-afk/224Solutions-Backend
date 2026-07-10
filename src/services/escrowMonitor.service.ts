@@ -22,7 +22,9 @@ export interface MonitorCheck {
 export interface MonitorReport {
   generated_at: string;
   checks: MonitorCheck[];
-  overall: 'ok' | 'warning' | 'critical';
+  // 'unavailable' = la RPC du domaine a échoué ou dépassé le timeout : les compteurs sont
+  // INCONNUS (pas « zéro anomalie ») — le panneau PDG doit l'afficher distinctement du vert.
+  overall: 'ok' | 'warning' | 'critical' | 'unavailable';
 }
 
 interface DomainDef {
@@ -46,6 +48,7 @@ export const MONITOR_DOMAINS: DomainDef[] = [
   { key: 'pos', module: 'pos', label: 'POS (caisse vendeur)', rpc: 'pos_monitor_report' },
   { key: 'aml', module: 'aml', label: 'Provenance & plafonds wallet', rpc: 'wallet_provenance_report' },
   { key: 'money_integrity', module: 'money_integrity', label: 'Intégrité Argent (drift fonctions)', rpc: 'money_integrity_report' },
+  { key: 'pdg_treasury', module: 'pdg_treasury', label: 'Coffre PDG (trésorerie)', rpc: 'pdg_treasury_monitor_report' },
   { key: 'frontend_security', module: 'frontend_security', label: 'Sécurité Frontend', fn: scanFrontendSecurity },
 ];
 
@@ -78,6 +81,7 @@ const SUGGESTED_FIX: Record<string, string> = {
   transfer_rapid: 'Volume anormal de transferts en 5 min. Vérifier une attaque / un blanchiment.',
   // commissions
   commission_revenue_gap: 'Commission acheteur prélevée mais absente de revenus_pdg. Vérifier le log backend record_pdg_revenue.',
+  order_missing_buyer_fee: 'Commande wallet payée SANS frais acheteur : la commission plateforme n\'a jamais été facturée (revenu perdu). Vérifier buildOrderFinancialSummary / create_order_core (p_buyer_fee_amount) — ou acquitter si le vendeur a légitimement un taux 0.',
   agent_bad_rate: 'Taux de commission agent hors [0,100]. Corriger la configuration de l\'agent.',
   revenue_nonpositive: 'Revenu PDG ≤ 0 enregistré. Vérifier la source du revenu.',
   agent_commission_leak: 'GRAVE : commission agent > base (frais). Vérifier le plafond dans credit_agent_commission et max_total_agent_commission_percentage.',
@@ -99,6 +103,15 @@ const SUGGESTED_FIX: Record<string, string> = {
   pos_stock_pending: 'Vente POS enregistrée sans décrément de stock (file pos_stock_reconciliation). Relancer le job de réconciliation ; risque de sur-vente.',
   pos_negative_stock: 'GRAVE : produit au stock négatif. Décrément concurrent incohérent. Vérifier le verrou FOR UPDATE / GREATEST(0,...) dans create_pos_sale_complete et le trigger commande.',
   pos_sale_incoherent: 'Vente POS dont total ≠ sous-total + taxe − remise. Vérifier le calcul server-side (create_pos_sale_complete) — un total client a pu être stocké à la place.',
+  pos_items_without_stock_movement: 'Ventes POS créées par l\'ancien fallback direct (retiré) : order_items SANS décrément de stock → inventaire faux. Corriger le stock des produits concernés à la main (le drill-down liste les commandes). Ne pas régulariser automatiquement.',
+  // 🏦 Coffre PDG
+  revenue_not_credited: 'Revenus journalisés (revenus_pdg) non crédités au coffre depuis > 5 min : le trigger a échoué ou aucun PDG/wallet GNF actif au moment du revenu. Vérifier pdg_management + le wallet GNF PDG, puis réconcilier (backfill idempotent).',
+  treasury_balance_vs_ledger: 'INVARIANT ROMPU : solde du coffre ≠ crédits − débits tracés. Un mouvement a contourné les RPC/trigger (UPDATE direct, manipulation). observed = l\'écart. Auditer les wallet_transactions du coffre + platform_revenue.',
+  payout_without_treasury_debit: 'Versement actionnaire sent_to_wallet SANS débit du coffre (shareholder_payout:<id>) = argent créé ex nihilo. Historique (avant ce chantier) = à lister pour décision PDG ; toute NOUVELLE occurrence = régression à corriger.',
+  commission_without_treasury_debit: 'Commission agent versée SANS trace de débit coffre (platform_revenue agent_commission_payout) = mint pré-ledger. Historique connu ; toute nouvelle occurrence = bug de credit_agent_commission.',
+  shareholder_percent_overflow: 'Somme des parts actionnaires actives > 100 % pour une (catégorie, portée, pays) : sur-distribution. Le trigger BEFORE le bloque en base ; s\'il apparaît, le trigger a été contourné/désactivé — le rétablir.',
+  treasury_low_balance: 'Solde du coffre sous le seuil (pdg_wallet_low_threshold) : risque de blocage des commissions/versements. Approvisionner le coffre.',
+  subscription_revenue_missing: 'Abonnements payés (> 10 min) SANS ligne revenus_pdg : un flux d\'abonnement n\'appelle pas record_pdg_revenue. Brancher le revenu AVANT la commission au site concerné.',
   pos_credit_overdue: 'Ventes à crédit échues impayées. Relancer le recouvrement vendeur (vendor_credit_sales).',
   pos_rapid_sales: 'Rafale de ventes POS en 5 min. Vérifier un bot / abus de synchronisation (posSyncRateLimit).',
   // aml (provenance & plafonds wallet)
@@ -147,13 +160,32 @@ export async function syncDomainAlerts(
 
   for (const c of checks) {
     try {
-      const { data: existing } = await supabaseAdmin
+      // Ligne CANONIQUE du contrôle = la plus ancienne active (garde la date de 1re détection).
+      // ⚠️ Jamais maybeSingle() ici : dès qu'un doublon existe (course entre instances/cycles),
+      // il renvoie une erreur → data null → chaque cycle RÉINSÉRAIT un doublon de plus
+      // (emballement constaté : ~36 000 alertes actives dupliquées).
+      const { data: keptRows } = await supabaseAdmin
         .from('system_alerts')
         .select('id')
         .eq('module', module)
         .eq('status', 'active')
         .filter('metadata->>alert_key', 'eq', c.key)
-        .maybeSingle();
+        .order('created_at', { ascending: true })
+        .limit(1);
+      const kept = keptRows?.[0] || null;
+
+      // Purge des doublons actifs du même contrôle (artefacts du bug ci-dessus) : on ne garde
+      // que la canonique — l'historique (status='resolved') n'est jamais touché.
+      if (kept) {
+        const { count: dupes } = await supabaseAdmin
+          .from('system_alerts')
+          .delete({ count: 'exact' })
+          .eq('module', module)
+          .eq('status', 'active')
+          .filter('metadata->>alert_key', 'eq', c.key)
+          .neq('id', kept.id);
+        if (dupes) logger.warn(`[Monitor:${module}] ${dupes} doublon(s) d'alerte active purgé(s) (${c.key})`);
+      }
 
       if (c.count > 0) {
         const payload = {
@@ -165,12 +197,14 @@ export async function syncDomainAlerts(
           suggested_fix: SUGGESTED_FIX[c.key] || '',
           metadata: { alert_key: c.key, count: c.count, observed: c.observed, source: 'platform_monitor', last_seen: nowIso },
         };
-        if (existing) await supabaseAdmin.from('system_alerts').update(payload).eq('id', existing.id);
+        if (kept) await supabaseAdmin.from('system_alerts').update(payload).eq('id', kept.id);
         else await supabaseAdmin.from('system_alerts').insert(payload);
-      } else if (existing) {
+      } else if (kept) {
+        // Anomalie corrigée → l'alerte passe 'resolved' et RESTE en base : c'est l'historique
+        // consultable côté PDG (panneau Surveillance, section « Historique »).
         await supabaseAdmin.from('system_alerts')
           .update({ status: 'resolved', resolved_at: nowIso })
-          .eq('id', existing.id);
+          .eq('id', kept.id);
       }
     } catch (e: any) {
       logger.warn(`[Monitor:${module}] alert sync failed (${c.key}): ${e?.message || e}`);
@@ -180,56 +214,46 @@ export async function syncDomainAlerts(
   return { generated_at: report.generated_at, checks, overall: computeOverall(checks) };
 }
 
-// Fenêtre (heures) au-delà de laquelle une alerte ÉVÉNEMENTIELLE non revue est
-// considérée résolue. Configurable via env. 12h par défaut.
-const STALE_EVENT_ALERT_HOURS = Math.max(1, Number(process.env.STALE_EVENT_ALERT_HOURS || 12));
+// ── Auto-résolution des alertes ÉVÉNEMENTIELLES périmées ────────────────────────────────────
+// Les alertes des monitors (source='platform_monitor') s'auto-résolvent quand count=0 ; les
+// alertes ÉVÉNEMENTIELLES (224Guard, trigger role.changed, observateur frontend…) n'ont AUCUN
+// signal de fin → sans ceci elles restent « actives » pour toujours et noient le panneau PDG.
+// Règle : plus AUCUNE occurrence (metadata->>last_seen, sinon created_at) depuis 24 h
+// (72 h pour les critiques — on ne masque pas une critique trop vite) → status 'resolved'
+// (l'historique est conservé, comme pour les monitors).
+const EVENT_ALERT_STALE_HOURS = Number(process.env.EVENT_ALERT_STALE_HOURS || 24);
 
-/**
- * Auto-résolution des alertes ÉVÉNEMENTIELLES obsolètes (erreurs frontend
- * poussées par le 224Guard : ReferenceError, échec de chargement de composant…).
- * Contrairement aux checks récurrents (escrow/money/aml, auto-résolus quand
- * count=0), ces alertes n'ont aucun signal de fin → si l'anomalie ne se reproduit
- * plus (BUG CORRIGÉ), elle doit DISPARAÎTRE. On résout donc les alertes 'active'
- * NON issues du moniteur (source != 'platform_monitor') dont la dernière
- * occurrence (metadata.last_seen sinon created_at) dépasse la fenêtre.
- * Renvoie le nombre d'alertes résolues.
- */
-export async function autoResolveStaleEventAlerts(windowHours = STALE_EVENT_ALERT_HOURS): Promise<number> {
-  const nowMs = Date.now();
-  const cutoffIso = new Date(nowMs - windowHours * 3_600_000).toISOString();
-  try {
-    const { data: candidates } = await supabaseAdmin
-      .from('system_alerts')
-      .select('id, created_at, metadata')
-      .eq('status', 'active')
-      // Exclut les alertes du moniteur récurrent (elles ont leur propre résolution par count=0).
-      .or('metadata->>source.is.null,metadata->>source.neq.platform_monitor')
-      .lt('created_at', cutoffIso)
-      .limit(2000);
+export async function autoResolveStaleEventAlerts(): Promise<number> {
+  const now = Date.now();
+  const cutoff = new Date(now - EVENT_ALERT_STALE_HOURS * 3600_000).toISOString();
+  const cutoffCritical = new Date(now - 3 * EVENT_ALERT_STALE_HOURS * 3600_000).toISOString();
 
-    // Sécurité : ne pas résoudre une alerte dédupliquée encore vue récemment (last_seen frais).
-    const ids = (candidates || [])
-      .filter((a: any) => {
-        const lastSeen = a.metadata?.last_seen || a.created_at;
-        return new Date(lastSeen).getTime() < nowMs - windowHours * 3_600_000;
-      })
-      .map((a: any) => a.id);
+  const { data, error } = await supabaseAdmin
+    .from('system_alerts')
+    .select('id, severity, created_at, metadata')
+    .eq('status', 'active')
+    .or('metadata->>source.is.null,metadata->>source.neq.platform_monitor')
+    .limit(500); // borne par cycle — le suivant (60 s) reprend le reste
+  if (error) throw error;
 
-    if (ids.length === 0) return 0;
+  const staleIds = (data || [])
+    .filter((a: any) => {
+      const lastSeen = a.metadata?.last_seen || a.created_at;
+      if (!lastSeen) return false;
+      return lastSeen < (a.severity === 'critical' ? cutoffCritical : cutoff);
+    })
+    .map((a: any) => a.id);
+  if (!staleIds.length) return 0;
 
-    // Traitement par lots (limite la taille de la clause IN).
-    for (let i = 0; i < ids.length; i += 200) {
-      await supabaseAdmin
-        .from('system_alerts')
-        .update({ status: 'resolved', resolved_at: new Date().toISOString() })
-        .in('id', ids.slice(i, i + 200));
-    }
-    logger.info(`[Monitor] auto-résolu ${ids.length} alerte(s) événementielle(s) obsolète(s) (> ${windowHours}h sans récurrence)`);
-    return ids.length;
-  } catch (e: any) {
-    logger.warn(`[Monitor] autoResolveStaleEventAlerts: ${e?.message || e}`);
-    return 0;
-  }
+  const { error: updErr } = await supabaseAdmin
+    .from('system_alerts')
+    .update({ status: 'resolved', resolved_at: new Date().toISOString() })
+    .in('id', staleIds)
+    .eq('status', 'active'); // garde anti-course : ne résout que ce qui est encore actif
+  if (updErr) throw updErr;
+
+  logger.info(`[Monitor] ${staleIds.length} alerte(s) événementielle(s) périmée(s) auto-résolue(s) (> ${EVENT_ALERT_STALE_HOURS} h sans occurrence)`);
+  return staleIds.length;
 }
 
 /**
@@ -239,13 +263,42 @@ export async function autoResolveStaleEventAlerts(windowHours = STALE_EVENT_ALER
  *   relues depuis system_alerts). Évite le timeout serverless → plus de spinner infini côté PDG.
  * @param opts.timeoutMs      garde-fou par domaine (un RPC lent ne bloque pas tout le panneau).
  */
-export async function runPlatformMonitors(
-  opts: { skipFnDomains?: boolean; timeoutMs?: number } = {}
-): Promise<{
+type PlatformReport = {
   domains: { key: string; label: string; report: MonitorReport }[];
   alerts: any[];
-}> {
-  const { skipFnDomains = false, timeoutMs = 8000 } = opts;
+};
+
+// 🗄️ Cache mémoire du DERNIER rapport calculé — partagé (même process Node) entre l'endpoint HTTP
+// PDG et le cycle 24/7. Évite de relancer les 10 RPC à CHAQUE requête (refetch 20s + realtime +
+// plusieurs onglets) : la cause n°1 de la lenteur et des 500 par timeout serverless.
+let _lastPlatform: { at: number; data: PlatformReport } | null = null;
+
+/**
+ * Renvoie le dernier rapport plateforme si < maxAgeMs, sinon le recalcule.
+ * ⚠️ maxAge DOIT être > l'intervalle de refetch du front (20s) sinon CHAQUE refetch rate le cache
+ * et recalcule les 10 RPC → lenteur/échec en boucle. 45s : le cache couvre les refetch 20s ET les
+ * invalidations realtime, tout en restant frais (le cycle 24/7 le rafraîchit aussi toutes les 60s).
+ * STALE-WHILE-REVALIDATE : si le recalcul échoue (RPC lente, réseau), on SERT le dernier rapport connu
+ * plutôt que de faire échouer le panneau PDG (fini « Dernière actualisation échouée »). On ne lève
+ * QUE s'il n'existe AUCUN cache (tout premier appel qui échoue).
+ */
+export async function getPlatformMonitorReport(maxAgeMs = 45000): Promise<PlatformReport> {
+  if (_lastPlatform && (Date.now() - _lastPlatform.at) < maxAgeMs) return _lastPlatform.data;
+  try {
+    return await runPlatformMonitors({ skipFnDomains: true });
+  } catch (e: any) {
+    logger.warn(`[Monitor] recalcul échoué → service du dernier cache (stale): ${e?.message || e}`);
+    if (_lastPlatform) return _lastPlatform.data;
+    throw e;
+  }
+}
+
+export async function runPlatformMonitors(
+  opts: { skipFnDomains?: boolean; timeoutMs?: number } = {}
+): Promise<PlatformReport> {
+  // 3.5s/domaine : une RPC de surveillance saine répond en <1s ; garde la réponse totale bien sous
+  // la limite serverless (~10s) même si un domaine est lent (Promise.allSettled isole les échecs).
+  const { skipFnDomains = false, timeoutMs = 3500 } = opts;
   const withTimeout = <T>(p: Promise<T>, label: string): Promise<T> =>
     Promise.race([
       p,
@@ -265,26 +318,125 @@ export async function runPlatformMonitors(
   const domains = settled.map((s, i) => {
     if (s.status === 'fulfilled') return s.value;
     logger.warn(`[Monitor] domaine ${targets[i].key} échoué: ${s.reason?.message || s.reason}`);
-    return { key: targets[i].key, label: targets[i].label, report: { generated_at: new Date().toISOString(), checks: [], overall: 'ok' as const } };
+    // ⚠️ JAMAIS 'ok' ici : une RPC en panne affichée verte = angle mort (le PDG croirait
+    // « zéro anomalie » alors que le gardien est mort). 'unavailable' = compteurs inconnus.
+    return { key: targets[i].key, label: targets[i].label, report: { generated_at: new Date().toISOString(), checks: [], overall: 'unavailable' as const } };
   });
 
-  // ✅ Auto-résout les alertes événementielles obsolètes (bug corrigé → l'erreur
-  // ne se reproduit plus → l'alerte disparaît) AVANT de relire la liste affichée.
-  await autoResolveStaleEventAlerts();
-
   const modules = MONITOR_DOMAINS.map((d) => d.module);
-  const { data: alerts } = await supabaseAdmin
-    .from('system_alerts')
-    .select('id, title, message, severity, status, module, suggested_fix, created_at, metadata')
-    .in('module', modules)
-    .eq('status', 'active')
-    .order('created_at', { ascending: false })
-    .limit(60);
+  // Alertes COURANTES (active/acknowledged) et HISTORIQUE (resolved) en 2 requêtes séparées :
+  // une vague de résolutions ne peut pas évincer les alertes actives d'une limite partagée, et
+  // l'historique reste visible côté PDG même quand l'anomalie est corrigée (auto-résolution).
+  const ALERT_COLS = 'id, title, message, severity, status, module, suggested_fix, created_at, resolved_at, metadata';
+  const [{ data: currentAlerts }, { data: resolvedAlerts }] = await Promise.all([
+    supabaseAdmin.from('system_alerts').select(ALERT_COLS)
+      .in('module', modules).neq('status', 'resolved')
+      .order('created_at', { ascending: false }).limit(60),
+    supabaseAdmin.from('system_alerts').select(ALERT_COLS)
+      .in('module', modules).eq('status', 'resolved')
+      .order('resolved_at', { ascending: false }).limit(60),
+  ]);
 
-  return { domains, alerts: alerts || [] };
+  const result: PlatformReport = { domains, alerts: [...(currentAlerts || []), ...(resolvedAlerts || [])] };
+  _lastPlatform = { at: Date.now(), data: result }; // alimente le cache partagé (endpoint + cycle 24/7)
+  return result;
 }
 
 /** Compat : surveillance escrow seule. */
 export async function runEscrowMonitor(): Promise<MonitorReport> {
   return runDomainMonitor('escrow_monitor_report', 'escrow');
+}
+
+/**
+ * 🤖 RÉCONCILIATION AUTOMATIQUE — le système s'auto-acquitte quand il PROUVE la correction.
+ * Pour chaque cas signalé par un contrôle « fait historique », on cherche une PREUVE en base
+ * que l'argent a été réglé (trace de frais apparue, trace de régularisation liée à la
+ * commande/l'escrow, mouvement documenté après coup). Preuve trouvée → acquittement AUTO
+ * (money_integrity_acknowledged, reason 'AUTO: …') → le compteur retombe au cycle suivant →
+ * pastille VERTE + alerte basculée en Historique. AUCUN clic PDG.
+ * Ce que le système ne peut PAS prouver corrigé RESTE signalé : c'est un vrai problème.
+ * (Le bouton « Marquer comme traité » ne sert plus que de secours pour les cas non prouvables.)
+ */
+export async function autoReconcileMonitorCases(): Promise<{ acked: number }> {
+  let acked = 0;
+  const since = new Date(Date.now() - 7 * 864e5).toISOString();
+
+  // ── 1) order_missing_buyer_fee : preuve = trace buyer_commission apparue OU trace de
+  //       régularisation (metadata.regularization) référençant la commande / son escrow ──
+  try {
+    const { data: orders } = await supabaseAdmin.from('orders')
+      .select('id, order_number, total_amount, status')
+      .gt('created_at', since).neq('status', 'cancelled').gt('total_amount', 0).limit(300);
+    for (const o of (orders || []) as any[]) {
+      const { count: isAcked } = await supabaseAdmin.from('money_integrity_acknowledged')
+        .select('ref_id', { count: 'exact', head: true })
+        .eq('check_key', 'order_missing_buyer_fee').eq('ref_id', o.id);
+      if (isAcked) continue;
+      const { data: escrow } = await supabaseAdmin.from('escrow_transactions')
+        .select('id').eq('order_id', o.id).maybeSingle();
+      if (!escrow) continue;
+      const { count: fee } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'commission')
+        .filter('metadata->>source', 'eq', 'buyer_commission')
+        .filter('metadata->>order_id', 'eq', o.id);
+      if (fee) continue; // non signalé par le contrôle → rien à réconcilier
+      const { data: proof } = await supabaseAdmin.from('wallet_transactions')
+        .select('transaction_id')
+        .filter('metadata->>regularization', 'eq', 'true')
+        .or(`metadata->>order_id.eq.${o.id},metadata->>escrow_id.eq.${(escrow as any).id},metadata->>order_number.eq.${o.order_number}`)
+        .limit(1);
+      if (proof?.length) {
+        await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+          check_key: 'order_missing_buyer_fee', ref_id: String(o.id),
+          reason: `AUTO: régularisation vérifiée (${(proof[0] as any).transaction_id})`,
+        }, { onConflict: 'check_key,ref_id' });
+        acked++;
+      }
+    }
+  } catch (e: any) {
+    logger.warn(`[Monitor] auto-réconciliation order_missing_buyer_fee: ${e?.message || e}`);
+  }
+
+  // ── 2) untraced_increase : preuve = mouvement documenté APRÈS COUP — une trace du même
+  //       montant (±0,01) pour le même utilisateur dans une fenêtre élargie (±48 h) ──────
+  try {
+    const { data: audits } = await supabaseAdmin.from('wallet_balance_audit')
+      .select('id, user_id, delta, changed_at')
+      .gt('delta', 0).gt('changed_at', since).limit(500);
+    for (const a of (audits || []) as any[]) {
+      const { count: isAcked } = await supabaseAdmin.from('money_integrity_acknowledged')
+        .select('ref_id', { count: 'exact', head: true })
+        .eq('check_key', 'untraced_increase').eq('ref_id', String(a.id));
+      if (isAcked) continue;
+      const t = new Date(a.changed_at).getTime();
+      // Déjà couvert par le matching de base (±10 min) ? Rien à faire.
+      const { count: near } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('receiver_user_id', a.user_id)
+        .gte('created_at', new Date(t - 10 * 60000).toISOString())
+        .lte('created_at', new Date(t + 10 * 60000).toISOString());
+      if (near) continue;
+      const { data: proof } = await supabaseAdmin.from('wallet_transactions')
+        .select('transaction_id, amount')
+        .eq('receiver_user_id', a.user_id)
+        .gte('created_at', new Date(t - 48 * 3600000).toISOString())
+        .lte('created_at', new Date(t + 48 * 3600000).toISOString())
+        .gte('amount', Number(a.delta) - 0.01)
+        .lte('amount', Number(a.delta) + 0.01)
+        .limit(1);
+      if (proof?.length) {
+        await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+          check_key: 'untraced_increase', ref_id: String(a.id),
+          reason: `AUTO: mouvement documenté (${(proof[0] as any).transaction_id}, ${(proof[0] as any).amount})`,
+        }, { onConflict: 'check_key,ref_id' });
+        acked++;
+      }
+    }
+  } catch (e: any) {
+    logger.warn(`[Monitor] auto-réconciliation untraced_increase: ${e?.message || e}`);
+  }
+
+  if (acked) logger.info(`[Monitor] auto-réconciliation : ${acked} cas prouvés corrigés → acquittés automatiquement`);
+  return { acked };
 }

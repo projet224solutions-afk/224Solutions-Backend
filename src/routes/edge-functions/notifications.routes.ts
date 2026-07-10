@@ -5,6 +5,7 @@ import { sendSms } from "../../services/sms.service.js";
 import {
   loadServiceAccount,
   getBucketName,
+  getPrivateBucketName,
   generateUniqueFileName,
   generateSignedUrl,
   computeDeleteToken,
@@ -185,7 +186,7 @@ router.post("/security-alert", async (req: any, res: any) => {
 
 router.post("/sms", async (req: any, res: any) => {
   try {
-    const { phone_number, message_body, user_id } = req.body;
+    const { phone_number, message_body, user_id, country_code } = req.body;
     if (!phone_number || !message_body) return res.status(400).json({ success: false, error: "phone_number et message_body requis" });
     // Store as in_app notification (SMS provider à configurer via TWILIO_API_KEY ou autre)
     if (user_id) {
@@ -198,7 +199,8 @@ router.post("/sms", async (req: any, res: any) => {
       });
     }
     // Envoi RÉEL via le service SMS (Twilio backend → repli Edge Function send-sms).
-    const smsResult = await sendSms(phone_number, message_body);
+    // country_code (ISO-2) optionnel : format E.164 pan-africain (sinon repli GN + warn).
+    const smsResult = await sendSms(phone_number, message_body, country_code);
     if (!smsResult.ok) {
       logger.warn(`[notifications/sms] Échec envoi SMS à ${phone_number}: ${smsResult.error}`);
       return res.status(503).json({ success: false, error: smsResult.error || "Service SMS indisponible" });
@@ -726,10 +728,12 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
       folder,
       expiresInMinutes,
       deleteToken,
+      visibility, // 'private' → bucket privé (preuves de livraison), sinon public
     } = req.body || {};
 
     const serviceAccount = loadServiceAccount();
-    const bucketName = getBucketName();
+    const isPrivate = visibility === "private";
+    const bucketName = isPrivate ? getPrivateBucketName() : getBucketName();
 
     if (!serviceAccount) {
       logger?.warn?.("[gcs-signed-url] Compte de service GCS absent/invalide → fallback Supabase");
@@ -768,7 +772,8 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
     const method = action === "upload" ? "PUT" : "GET";
 
     const signedUrl = generateSignedUrl(serviceAccount, bucketName, objectPath, { method, expiresInSeconds });
-    const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectPath}`;
+    // Bucket privé → pas d'URL publique (accès uniquement via URL signée côté serveur).
+    const publicUrl = isPrivate ? null : `https://storage.googleapis.com/${bucketName}/${objectPath}`;
     const deleteTokenOut = computeDeleteToken(serviceAccount.private_key_id, objectPath);
 
     return res.json({
@@ -777,6 +782,7 @@ router.post("/gcs-signed-url", async (req: any, res: any) => {
       publicUrl,
       objectPath,
       bucket: bucketName,
+      private: isPrivate,
       deleteToken: deleteTokenOut,
     });
   } catch (err: any) {

@@ -170,9 +170,12 @@ export const authRateLimit = routeRateLimit({
   maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true, failClosed: true,
 });
 
-/** Create order: 5 req / min per user */
+/** Create order: 20 req / min per user (un checkout génère plusieurs POST légitimes :
+ *  paiement mobile money retenté, cross-currency re-soumis, double-clic). 5/min bloquait
+ *  des clients honnêtes. Combiné à idempotencyGuard AVANT ce middleware → seules les
+ *  créations réellement nouvelles comptent. */
 export const orderCreateRateLimit = routeRateLimit({
-  maxRequests: 5, windowSeconds: 60, keyPrefix: 'order:create', perUser: true, perIp: true,
+  maxRequests: 20, windowSeconds: 60, keyPrefix: 'order:create', perUser: true, perIp: true,
 });
 
 /** Manage existing orders: 10 req / min per user */
@@ -208,4 +211,17 @@ export const subscriptionRateLimit = routeRateLimit({
 /** Admin endpoints: 30 req / min per user — FAIL-CLOSED (privilèges) */
 export const adminRateLimit = routeRateLimit({
   maxRequests: 30, windowSeconds: 60, keyPrefix: 'admin', perUser: true, perIp: true, failClosed: true,
+});
+
+/** Cadeaux live (débit wallet réel) : 30 req / min per user — un envoi légitime est
+ *  rare/manuel ; ce plafond coupe le spam de micro-cadeaux sans gêner un vrai donateur.
+ *  Combiné à idempotencyGuard AVANT → les rejeux réseau ne comptent pas. */
+export const giftRateLimit = routeRateLimit({
+  maxRequests: 30, windowSeconds: 60, keyPrefix: 'live:gift', perUser: true, perIp: true,
+});
+
+/** Copilote IA (appel LLM = coût tokens réel) : 20 req / min per user. Un chat est
+ *  manuel ; ce plafond stoppe l'abus/le scriptage qui ferait exploser la facture LLM. */
+export const copilotRateLimit = routeRateLimit({
+  maxRequests: 20, windowSeconds: 60, keyPrefix: 'copilot', perUser: true, perIp: true,
 });

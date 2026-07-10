@@ -1,8 +1,7 @@
 name: Deploy Backend to VPS
 
-# Déploiement automatique : à chaque push sur main, GitHub se connecte au VPS,
-# récupère le code et redémarre le backend (pm2).
-# VPS_SSH_KEY = clé privée encodée en base64 (une seule ligne, copie fiable).
+# Déploiement automatique : à chaque push sur main, GitHub se connecte au VPS
+# via SSH (client natif), récupère le code et redémarre le backend (pm2).
 on:
   push:
     branches: [main]
@@ -17,29 +16,60 @@ jobs:
     name: Deploy over SSH
     runs-on: ubuntu-latest
     steps:
-      - name: Decode SSH key
+      - name: Deploy to VPS
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          GCS_SA_B64: ${{ secrets.GCS_SA_B64 }}
+          ABLY_API_KEY: ${{ secrets.ABLY_API_KEY }}
+          AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
+          AGORA_APP_CERTIFICATE: ${{ secrets.AGORA_APP_CERTIFICATE }}
+          AGORA_CUSTOMER_ID: ${{ secrets.AGORA_CUSTOMER_ID }}
+          AGORA_CUSTOMER_SECRET: ${{ secrets.AGORA_CUSTOMER_SECRET }}
+          GCS_HMAC_ACCESS_KEY: ${{ secrets.GCS_HMAC_ACCESS_KEY }}
+          GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
         run: |
-          {
-            echo "SSH_KEY<<__EOF__"
-            echo "${{ secrets.VPS_SSH_KEY }}" | base64 -d
-            echo "__EOF__"
-          } >> "$GITHUB_ENV"
-
-      - name: SSH deploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ env.SSH_KEY }}
-          port: 22
-          command_timeout: 15m
-          script: |
-            set -e
-            echo "→ Déploiement dans /var/www/backend"
-            cd /var/www/backend
-            git fetch origin main
-            git reset --hard origin/main
-            npm install --no-audit --no-fund
-            pm2 restart 224-backend --update-env
-            pm2 save
-            echo "✅ Backend déployé et redémarré"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Script exécuté sur le VPS via stdin (évite l'enfer des quotes).
+          # ${GCS_SA_B64} est développé ICI (runner) depuis le secret, puis écrit
+          # dans le .env du VPS s'il n'y est pas déjà (idempotent).
+          cat > /tmp/remote_deploy.sh <<REMOTE
+          set -e
+          cd /var/www/backend
+          grep -q '^GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=' .env || echo "GOOGLE_CLOUD_SERVICE_ACCOUNT_B64=${GCS_SA_B64}" >> .env
+          grep -q '^GCS_BUCKET_NAME=' .env || echo "GCS_BUCKET_NAME=224solutions" >> .env
+          # Corriger la limite de requêtes (ancienne conf 100/15min = « Trop de requêtes »
+          # pour tout le monde). Cible : 6000 requêtes / 60 s par IP.
+          if grep -q '^RATE_LIMIT_MAX_REQUESTS=' .env; then sed -i 's|^RATE_LIMIT_MAX_REQUESTS=.*|RATE_LIMIT_MAX_REQUESTS=6000|' .env; else echo 'RATE_LIMIT_MAX_REQUESTS=6000' >> .env; fi
+          if grep -q '^RATE_LIMIT_WINDOW_MS=' .env; then sed -i 's|^RATE_LIMIT_WINDOW_MS=.*|RATE_LIMIT_WINDOW_MS=60000|' .env; else echo 'RATE_LIMIT_WINDOW_MS=60000' >> .env; fi
+          # Ably (temps reel). Depuis le secret GitHub ABLY_API_KEY, developpe ICI (runner).
+          # Ecriture robuste : on supprime toute ancienne ligne puis on reecrit (gere la mise
+          # a jour de cle sans casse sed sur les caracteres speciaux). Ne fait rien si le secret
+          # est vide (backend reste alors sur Supabase Realtime par defaut).
+          if [ -n "${ABLY_API_KEY}" ]; then sed -i '/^ABLY_API_KEY=/d' .env; echo "ABLY_API_KEY=${ABLY_API_KEY}" >> .env; fi
+          # Agora (appels + live). Certificat = source de verite backend (token signe cote Node).
+          # Meme ecriture robuste que Ably (supprime puis reecrit ; ne fait rien si secret vide).
+          if [ -n "${AGORA_APP_ID}" ]; then sed -i '/^AGORA_APP_ID=/d' .env; echo "AGORA_APP_ID=${AGORA_APP_ID}" >> .env; fi
+          if [ -n "${AGORA_APP_CERTIFICATE}" ]; then sed -i '/^AGORA_APP_CERTIFICATE=/d' .env; echo "AGORA_APP_CERTIFICATE=${AGORA_APP_CERTIFICATE}" >> .env; fi
+          # Agora Cloud Recording (replay serveur) + cle HMAC GCS (ecriture S3-compatible par Agora).
+          # Meme ecriture robuste (supprime puis reecrit = rotation OK ; rien si secret vide —
+          # l'enregistrement serveur reste alors desactive, repli client). JAMAIS de valeur loguee.
+          if [ -n "${AGORA_CUSTOMER_ID}" ]; then sed -i '/^AGORA_CUSTOMER_ID=/d' .env; echo "AGORA_CUSTOMER_ID=${AGORA_CUSTOMER_ID}" >> .env; fi
+          if [ -n "${AGORA_CUSTOMER_SECRET}" ]; then sed -i '/^AGORA_CUSTOMER_SECRET=/d' .env; echo "AGORA_CUSTOMER_SECRET=${AGORA_CUSTOMER_SECRET}" >> .env; fi
+          if [ -n "${GCS_HMAC_ACCESS_KEY}" ]; then sed -i '/^GCS_HMAC_ACCESS_KEY=/d' .env; echo "GCS_HMAC_ACCESS_KEY=${GCS_HMAC_ACCESS_KEY}" >> .env; fi
+          if [ -n "${GCS_HMAC_SECRET}" ]; then sed -i '/^GCS_HMAC_SECRET=/d' .env; echo "GCS_HMAC_SECRET=${GCS_HMAC_SECRET}" >> .env; fi
+          git fetch origin main
+          git reset --hard origin/main
+          npm install --no-audit --no-fund
+          # Redemarrage : relit le .env via dotenv au boot. Mono-instance = l'API porte AUSSI les
+          # jobs (RUN_BACKGROUND_JOBS) ; si un process worker PM2 dedie existe, il est relance aussi.
+          pm2 restart 224-backend --update-env
+          pm2 describe 224-worker >/dev/null 2>&1 && pm2 restart 224-worker --update-env || true
+          pm2 save
+          echo DEPLOY_OK
+          REMOTE
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" 'bash -s' < /tmp/remote_deploy.sh

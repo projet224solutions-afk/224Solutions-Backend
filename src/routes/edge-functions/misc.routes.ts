@@ -329,33 +329,15 @@ router.post("/cache/cleanup-errors", async (req: any, res: any) => {
   }
 });
 
-// Taxi/Ride Sharing (4)
-router.post("/taxi/accept-ride", validateBearerToken, async (req: any, res: any) => {
-  try {
-    const { ride_id, driver_id } = req.body;
-    const { error } = await supabaseAdmin
-      .from("rides")
-      .update({ driver_id, status: "accepted" })
-      .eq("id", ride_id);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
+// Taxi/Ride Sharing — ⚠️ DÉPRÉCIÉ : doublons morts de la table fantôme `rides`
+// (retirée). Le flux taxi réel = Edge Functions taxi-accept-ride / taxi-refuse-ride
+// → table taxi_trips. Le front appelle ces Edge Deno, jamais ces routes (rides=0 ligne).
+router.post("/taxi/accept-ride", validateBearerToken, async (_req: any, res: any) => {
+  return res.status(410).json({ success: false, error: "Route dépréciée. Acceptation via Edge Function taxi-accept-ride (table taxi_trips)." });
 });
 
-router.post("/taxi/refuse-ride", async (req: any, res: any) => {
-  try {
-    const { ride_id, reason } = req.body;
-    const { error } = await supabaseAdmin
-      .from("rides")
-      .update({ status: "refused", refuse_reason: reason })
-      .eq("id", ride_id);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
+router.post("/taxi/refuse-ride", async (_req: any, res: any) => {
+  return res.status(410).json({ success: false, error: "Route dépréciée. Refus via Edge Function taxi-refuse-ride (table taxi_trips)." });
 });
 
 router.post("/taxi/payment", async (req: any, res: any) => {

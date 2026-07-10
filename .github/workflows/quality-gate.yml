@@ -1,0 +1,27 @@
+name: Quality Gate (backend)
+
+# Typecheck du backend Express. Ce repo est SÉPARÉ du frontend (vista-flows) : c'est ici que
+# vit le garde-fou backend. Le backend tourne via tsx (pas de build) et n'a pas `typescript` en
+# dépendance → on l'installe à la volée via npx --package (sans polluer package.json).
+#
+# ✅ BLOQUANT : `tsc -p tsconfig.json --noEmit` passe à 0 erreur au 2026-07-03 (strict:false).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: backend-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx --yes --package typescript tsc -p tsconfig.json --noEmit

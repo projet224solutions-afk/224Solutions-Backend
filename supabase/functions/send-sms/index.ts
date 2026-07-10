@@ -23,9 +23,12 @@ const handler = async (req: Request): Promise<Response> => {
     const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
     const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
     const twilioPhone = Deno.env.get("TWILIO_PHONE_NUMBER");
+    // Expéditeur : Messaging Service SID (recommandé, mêmes credentials que les SMS/TURN)
+    // en priorité, sinon numéro From. Aligné sur le backend Node (sms.service.ts).
+    const messagingServiceSid = Deno.env.get("TWILIO_MESSAGING_SERVICE_SID");
 
-    if (!accountSid || !authToken || !twilioPhone) {
-      throw new Error("Twilio credentials not configured");
+    if (!accountSid || !authToken || (!messagingServiceSid && !twilioPhone)) {
+      throw new Error("Twilio credentials not configured (TWILIO_MESSAGING_SERVICE_SID ou TWILIO_PHONE_NUMBER requis)");
     }
 
     // Formater le numéro de téléphone au format international si nécessaire
@@ -51,7 +54,8 @@ const handler = async (req: Request): Promise<Response> => {
     
     const formData = new URLSearchParams();
     formData.append('To', formattedPhone);
-    formData.append('From', twilioPhone);
+    if (messagingServiceSid) formData.append('MessagingServiceSid', messagingServiceSid);
+    else formData.append('From', twilioPhone!);
     formData.append('Body', message);
 
     const response = await fetch(twilioUrl, {

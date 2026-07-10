@@ -42,11 +42,17 @@ import paymentsV2Routes from './routes/payments.v2.routes.js';
 import deliveryRoutes from './routes/delivery.routes.js';
 import taxiRoutes from './routes/taxi.routes.js';
 import restaurantRoutes from './routes/restaurant.routes.js';
+import travelRoutes from './routes/travel.routes.js';
+import profilesRoutes from './routes/profiles.routes.js';
 import pharmacyRoutes from './routes/pharmacy.routes.js';
 import notificationDispatchRoutes from './routes/notificationDispatch.routes.js';
 import countryPricingRoutes from './routes/countryPricing.routes.js';
 import authFailoverRoutes from './routes/auth.failover.routes.js';
 import realtimeRoutes from './routes/realtime.routes.js';
+import liveRoutes from './routes/live.routes.js';
+import storiesRoutes from './routes/stories.routes.js';
+import agoraRoutes from './routes/agora.routes.js';
+import turnRoutes from './routes/turn.routes.js';
 import shareholderRoutes from './routes/shareholders.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import identityRoutes from './routes/identity.routes.js';
@@ -70,7 +76,10 @@ import groupBuyRoutes from './routes/groupbuy.routes.js';
 import constructionRoutes from './routes/construction.routes.js';
 import educationRoutes from './routes/education.routes.js';
 import realestateRoutes from './routes/realestate.routes.js';
+import aiRoutes from './routes/ai.routes.js';
+import clinicRoutes from './routes/clinic.routes.js';
 import quotesRoutes from './routes/quotes.routes.js';
+import freightRoutes from './routes/freight.routes.js';
 import contractsRoutes from './routes/contracts.routes.js';
 import returnsRoutes from './routes/returns.routes.js';
 import vendorAffiliateRoutes from './routes/vendorAffiliate.routes.js';
@@ -105,6 +114,13 @@ import { rateLimiter } from './middlewares/rateLimiter.js';
 import { ipBlocklist, autoBlockGuard, refreshBlocklist } from './middlewares/ipBlocklist.js';
 
 const app = express();
+
+// 🔒 Derrière nginx (VPS) + proxy Vercel : faire confiance à X-Forwarded-For pour
+// que req.ip = l'IP RÉELLE du client (pas 127.0.0.1 du proxy nginx). SANS ça, tous
+// les utilisateurs partagent la même clé de rate-limit (global:127.0.0.1) → la
+// limite saute pour tout le monde (« Trop de requêtes »). Indispensable au bon
+// fonctionnement du rate-limiting par IP.
+app.set('trust proxy', true);
 
 function originMatchesPattern(origin: string, pattern: string): boolean {
   if (!pattern) return false;
@@ -262,6 +278,8 @@ app.use('/api/v2/payments', paymentsV2Routes);
 app.use('/api/v2/delivery', deliveryRoutes);
 app.use('/api/v2/taxi', taxiRoutes);
 app.use('/api/v2/restaurant', restaurantRoutes);
+app.use('/api/v2/travel', travelRoutes);
+app.use('/api/v2/profiles', profilesRoutes);
 app.use('/api/v2/pharmacy', pharmacyRoutes);
 app.use('/api/v2/notifications', notificationDispatchRoutes);
 app.use('/api/v2/country-pricing', countryPricingRoutes);
@@ -269,6 +287,10 @@ app.use('/api/v2/agent-cash', agentCashRoutes);
 app.use('/api/v2/wallet-pay', walletPayRoutes);
 app.use('/api/auth/failover', authFailoverRoutes);
 app.use('/api/v2/realtime', realtimeRoutes);
+app.use('/api/v2/live', liveRoutes);
+app.use('/api/v2/stories', storiesRoutes);
+app.use('/api/v2/agora', agoraRoutes);
+app.use('/api/v2', turnRoutes);
 app.use('/api/shareholders', shareholderRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/identity', identityRoutes);
@@ -295,7 +317,10 @@ app.use('/api/v2/group-buy', groupBuyRoutes);
 app.use('/api/v2/construction', constructionRoutes);
 app.use('/api/v2/education', educationRoutes);
 app.use('/api/v2/realestate', realestateRoutes);
+app.use('/api/v2/ai', aiRoutes);
+app.use('/api/v2/clinic', clinicRoutes);
 app.use('/api/v2/quotes', quotesRoutes);
+app.use('/api/v2/freight', freightRoutes);
 app.use('/api/contracts', contractsRoutes);
 app.use('/api/returns', returnsRoutes);
 app.use('/api/v2/mobility', mobilityRoutes);

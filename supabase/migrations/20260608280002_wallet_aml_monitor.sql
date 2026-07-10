@@ -63,6 +63,12 @@ GRANT EXECUTE ON FUNCTION public.wallet_provenance_report() TO service_role;
 -- ───────────── Aperçu par wallet (pour le panneau PDG) ─────────────
 -- Renvoie chaque wallet enrichi : rôle, palier KYC, solde, solde GNF, plafond effectif,
 -- dépassement, total en quarantaine. p_only_flagged=true → uniquement les wallets au-dessus du plafond.
+-- ⚠️ IDEMPOTENCE (réconciliation 2026-07-09) : si une VERSION ANTÉRIEURE de cette fonction
+-- existe avec un TYPE DE RETOUR différent (RETURNS TABLE modifié), CREATE OR REPLACE échoue
+-- (42P13 « cannot change return type of existing function »). On la DROP d'abord pour que la
+-- migration se rejoue proprement sur une base déjà partiellement provisionnée (cas rencontré en prod).
+DROP FUNCTION IF EXISTS public.aml_wallet_overview(boolean, int);
+DROP FUNCTION IF EXISTS public.aml_wallet_overview(boolean, integer);
 CREATE OR REPLACE FUNCTION public.aml_wallet_overview(
   p_only_flagged boolean DEFAULT false,
   p_limit        int     DEFAULT 200

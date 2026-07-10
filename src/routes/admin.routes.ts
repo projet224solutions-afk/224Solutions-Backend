@@ -18,9 +18,10 @@ import { Router, Response } from 'express';
 import { verifyJWT, requireRole } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { ok, fail } from '../utils/apiResponse.js';
 import { createNotification, createNotifications } from '../services/notification.service.js';
 import { logger } from '../config/logger.js';
-import { runPlatformMonitors } from '../services/escrowMonitor.service.js';
+import { getPlatformMonitorReport } from '../services/escrowMonitor.service.js';
 import * as autoHealing from '../services/autoHealing.service.js';
 import { getAlertDetails } from '../services/alertDetails.service.js';
 import * as aml from '../services/aml.service.js';
@@ -268,7 +269,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
         await safeDelete('order_items', 'order_id', o.id);
         await safeDelete('order_status_history', 'order_id', o.id);
         await safeDelete('delivery_tracking', 'order_id', o.id);
-        await safeDelete('china_logistics', 'order_id', o.id);
         await safeDelete('payment_schedules', 'order_id', o.id);
         await safeDelete('deliveries', 'order_id', o.id);
       }
@@ -302,7 +302,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
           await safeDelete('order_items', 'order_id', o.id);
           await safeDelete('order_status_history', 'order_id', o.id);
           await safeDelete('delivery_tracking', 'order_id', o.id);
-          await safeDelete('china_logistics', 'order_id', o.id);
           await safeDelete('payment_schedules', 'order_id', o.id);
         }
       }
@@ -343,8 +342,6 @@ router.post('/delete-user', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA,
       await safeDelete('vendor_settings', 'vendor_id', vendorId);
       await safeDelete('vendor_analytics', 'vendor_id', vendorId);
       await safeDelete('vendor_subscriptions', 'vendor_id', vendorId);
-      await safeDelete('china_dropship_settings', 'vendor_id', vendorId);
-      await safeDelete('china_dropship_reports', 'vendor_id', vendorId);
       await safeDelete('dropship_settings', 'vendor_id', vendorId);
       await safeDelete('service_products', 'vendor_id', vendorId);
       await safeDelete('quotes', 'vendor_id', vendorId);
@@ -746,14 +743,86 @@ router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: 
   try {
     // skipFnDomains : on évite le scan RÉSEAU sécurité-frontend dans la requête (timeout serverless →
     // spinner infini). Ses alertes restent visibles (relues depuis system_alerts, écrites par le cycle 24/7).
-    const data = await runPlatformMonitors({ skipFnDomains: true });
-    // Connexion à l'auto-réparation : ingestion RAPIDE des alertes actives en incidents (sans LLM ici).
+    // Rapport depuis le CACHE (recalcul uniquement s'il date de > 15s) → réponse rapide, plus de 500
+    // par timeout serverless quand plusieurs onglets PDG rafraîchissent (refetch 20s + realtime).
+    const data = await getPlatformMonitorReport(45000); // > refetch front 20s → cache couvre les refetch
+    // Auto-réparation : la ré-ingestion (~100 aller-retours séquentiels) est DÉJÀ faite par le cycle
+    // 24/7 (60s) → fire-and-forget HORS chemin de réponse + on renvoie le résumé LÉGER (1 requête).
+    void autoHealing.ingestAndSummarize().catch(() => { /* best-effort, hors chemin de réponse */ });
     let autoHealingSummary: { open: number; proposed: number; escalated: number; detected: number } | undefined;
-    try { autoHealingSummary = await autoHealing.ingestAndSummarize(); } catch { /* best-effort */ }
+    try { autoHealingSummary = await autoHealing.summarizeOpenIncidents(); } catch { /* best-effort */ }
     res.json({ success: true, data: { ...data, autoHealing: autoHealingSummary } });
   } catch (error: any) {
     logger.error(`[admin/platform-monitor] ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la surveillance plateforme' });
+  }
+});
+
+/**
+ * POST /api/admin/withdrawals — traitement admin/PDG des demandes de retrait bancaire.
+ * Remplace l'Edge Function 'admin-process-withdrawal' (souvent non déployée → « Failed to send
+ * a request to the Edge Function »). Le virement bancaire reste MANUEL : aucun payout auto,
+ * 'complete' ne fait que transitionner le statut via le RPC atomique admin_process_withdrawal.
+ */
+const WITHDRAWAL_ACTIONS = ['approve', 'reject', 'mark_sent', 'complete', 'fail'];
+router.post('/withdrawals', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const adminId = req.user!.id;
+    const { action, withdrawalId, notes } = req.body || {};
+
+    if (action === 'list') {
+      const { data: rows, error } = await supabaseAdmin
+        .from('stripe_withdrawals')
+        .select('id, user_id, amount, fee, net_amount, currency, status, bank_account_name, bank_account_number, bank_details, admin_notes, created_at, reviewed_at, processed_at')
+        .in('status', ['pending_review', 'approved', 'processing'])
+        .order('created_at', { ascending: true });
+      if (error) return fail(res, 400, error.message);
+
+      const userIds = [...new Set((rows || []).map((r: any) => r.user_id).filter(Boolean))];
+      const profiles: Record<string, unknown> = {};
+      if (userIds.length) {
+        const { data: profs } = await supabaseAdmin
+          .from('profiles').select('id, first_name, last_name, email, phone').in('id', userIds);
+        for (const p of (profs || []) as Array<{ id: string }>) profiles[p.id] = p;
+      }
+      const withdrawals = (rows || []).map((r: any) => ({ ...r, requester: profiles[r.user_id] || null }));
+      return ok(res, { withdrawals });
+    }
+
+    if (!WITHDRAWAL_ACTIONS.includes(action)) return fail(res, 400, `Action invalide: ${action}`);
+    if (!withdrawalId || typeof withdrawalId !== 'string') return fail(res, 400, 'withdrawalId requis');
+
+    const { data: result, error: rpcError } = await supabaseAdmin.rpc('admin_process_withdrawal', {
+      p_admin_id: adminId,          // id vérifié de l'appelant, jamais du body
+      p_withdrawal_id: withdrawalId,
+      p_action: action,
+      p_notes: notes ? String(notes) : null,
+    });
+    if (rpcError) return fail(res, 400, rpcError.message);
+    return ok(res, result);
+  } catch (e: any) {
+    logger.error(`[admin/withdrawals] ${e?.message}`);
+    return fail(res, 500, 'Erreur lors du traitement du retrait');
+  }
+});
+
+/**
+ * GET /api/admin/pdg/revenue?granularity=&from=&to=
+ * Reporting du coffre PDG : total, ventilation par source, série temporelle, solde, redistribué.
+ */
+router.get('/pdg/revenue', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const granularity = String(req.query.granularity || 'day');
+    const from = req.query.from ? new Date(String(req.query.from)).toISOString() : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)).toISOString() : undefined;
+    const { data, error } = await supabaseAdmin.rpc('get_pdg_revenue_report', {
+      p_granularity: granularity, ...(from ? { p_from: from } : {}), ...(to ? { p_to: to } : {}),
+    });
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[admin/pdg/revenue] ${e?.message}`);
+    return fail(res, 500, 'Erreur lors du reporting revenus');
   }
 });
 
@@ -772,6 +841,54 @@ router.get('/platform-monitor/details', verifyJWT, requireRole(PDG_ROLES), async
   } catch (error: any) {
     logger.error(`[admin/platform-monitor] ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de la surveillance plateforme' });
+  }
+});
+
+/**
+ * POST /api/admin/platform-monitor/acknowledge — « Marquer comme traité ».
+ * Acquitte UN cas précis d'un contrôle (check_key + ref_id) : le contrôle SQL exclut
+ * les cas acquittés → le compteur retombe, la pastille redevient VERTE, et l'alerte
+ * part automatiquement dans l'Historique (résolue au cycle suivant). Ne s'applique
+ * qu'aux contrôles qui constatent des FAITS HISTORIQUES (liste blanche) — les états
+ * vivants (plafond dépassé, quarantaine) se résolvent par une vraie action, pas un clic.
+ */
+router.post('/platform-monitor/acknowledge', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { check_key, ref_id, reason } = req.body || {};
+    const ACKABLE = new Set(['order_missing_buyer_fee', 'untraced_increase', 'escrow_released_zero_credit']);
+    if (!check_key || typeof check_key !== 'string' || !ref_id || typeof ref_id !== 'string') {
+      res.status(400).json({ success: false, error: 'check_key et ref_id requis' }); return;
+    }
+    if (!ACKABLE.has(check_key)) {
+      res.status(400).json({ success: false, error: 'Ce contrôle ne s\'acquitte pas par un clic — traitez la cause réelle.' }); return;
+    }
+    // 🛡️ Blindage : la référence doit EXISTER réellement pour le contrôle visé —
+    // interdit d'acquitter préventivement un id arbitraire (angle mort volontaire).
+    const REF_TABLE: Record<string, { table: string; col: string }> = {
+      order_missing_buyer_fee: { table: 'orders', col: 'id' },
+      untraced_increase: { table: 'wallet_balance_audit', col: 'id' },
+      escrow_released_zero_credit: { table: 'wallet_transactions', col: 'id' },
+    };
+    const refCfg = REF_TABLE[check_key];
+    const { count: refExists } = await supabaseAdmin
+      .from(refCfg.table)
+      .select(refCfg.col, { count: 'exact', head: true })
+      .eq(refCfg.col, ref_id);
+    if (!refExists) {
+      res.status(404).json({ success: false, error: `Référence introuvable pour ${check_key}` }); return;
+    }
+    const { error } = await supabaseAdmin.from('money_integrity_acknowledged').upsert({
+      check_key,
+      ref_id,
+      reason: typeof reason === 'string' && reason.trim() ? reason.trim() : 'Traité par le PDG (panneau Surveillance)',
+      acknowledged_by: req.user!.id,
+    }, { onConflict: 'check_key,ref_id' });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    logger.info(`[platform-monitor] cas acquitté ${check_key}/${ref_id} par ${req.user!.id}`);
+    res.json({ success: true });
+  } catch (error: any) {
+    logger.error(`[admin/platform-monitor ack] ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de l\'acquittement' });
   }
 });
 
@@ -1141,7 +1258,7 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
     const userId = req.user!.id;
     const { data: esc, error: e1 } = await supabaseAdmin
       .from('escrow_transactions')
-      .select('id, status, commission_percent, receiver_id, order_id')
+      .select('id, status, receiver_id, order_id')
       .eq('id', escrowId).maybeSingle();
     if (e1) throw e1;
     if (!esc) { res.status(404).json({ success: false, error: 'Transaction escrow introuvable' }); return; }
@@ -1149,16 +1266,29 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
       res.status(409).json({ success: false, error: `Déjà traité (statut: ${(esc as any).status})` }); return;
     }
 
-    const commission = Number((esc as any).commission_percent) || 2.5;
-    const { error: rpcErr } = await supabaseAdmin.rpc('release_escrow', {
+    // 🧱 PRIMITIVE CANONIQUE release_escrow_to_seller (même RPC que le job auto-release) :
+    // FOR UPDATE + idempotente + CONVERSION de devise (credit_user_wallet_safe) + commission PDG
+    // + ligne wallet_transactions 'escrow_release', tout-ou-rien. Remplace l'ancienne release_escrow
+    // qui (1) ne traitait QUE 'pending' → RETURN FALSE MUET sur 'held' (statut normal après paiement) :
+    // le vendeur n'était pas crédité alors que la commande passait 'paid' ; (2) n'écrivait AUCUN
+    // ledger 'escrow_release' → fausse alerte de surveillance « Escrow libéré sans trace ». La
+    // commission est calculée par la RPC (modèle frais-acheteur), plus besoin de commission_percent.
+    const { data: relData, error: rpcErr } = await supabaseAdmin.rpc('release_escrow_to_seller', {
       p_escrow_id: escrowId,
-      p_commission_percent: commission,
-      p_released_by: userId,
+      p_reason: `pdg_manual_release:${userId}`,
     });
     if (rpcErr) {
       const msg = String(rpcErr.message || '');
       logger.warn(`[escrow/release] ${escrowId}: ${msg}`);
       res.status(/not.*held|already|status/i.test(msg) ? 409 : 400).json({ success: false, error: `Libération impossible: ${msg}` });
+      return;
+    }
+    // La RPC renvoie { success:false, error } si elle refuse (vendeur manquant…) : ne PAS marquer
+    // la commande payée dans ce cas (c'était le bug de l'ancien chemin qui ignorait le retour).
+    const rel = relData as any;
+    if (rel && rel.success === false) {
+      logger.warn(`[escrow/release] ${escrowId}: ${rel.error}`);
+      res.status(400).json({ success: false, error: `Libération impossible: ${rel.error || 'inconnu'}` });
       return;
     }
 
@@ -1172,7 +1302,7 @@ router.post('/escrow/:escrowId/release', verifyJWT, requireRole(PDG_ROLES), requ
       });
     } catch (e: any) { logger.warn(`[escrow/release] notif: ${e?.message}`); }
 
-    logger.info(`[escrow/release] ${escrowId} released by ${userId} (commission ${commission}%)`);
+    logger.info(`[escrow/release] ${escrowId} released by ${userId}${rel?.skipped ? ' (déjà libéré)' : ''}`);
     res.json({ success: true });
   } catch (error: any) {
     logger.error(`[escrow/release] ${error.message}`);
@@ -1284,6 +1414,48 @@ router.put('/aml/caps', verifyJWT, requireRole(PDG_ROLES), requireStepUpMFA, asy
     res.json({ success: true });
   } catch (error: any) {
     logger.error(`[admin/aml/caps PUT] ${error.message}`);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================================
+// 💸 NOTIFICATIONS SMS — politique COÛT : quels types de notifications déclenchent un
+// SMS (le reste reste email + in-app). Réglage pdg_settings clé `sms_notification_types`
+// (jsonb liste). Piloté par le PDG. Le dispatcher lit ce réglage (cache mémoire ~60s).
+// ➜ UI PDG (cases à cocher) à câbler sur ces 2 endpoints.
+// ============================================================================
+const DEFAULT_SMS_NOTIFICATION_TYPES = ['transfer', 'withdrawal', 'security', 'otp', 'payment_received'];
+
+router.get('/sms-notification-types', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings').select('setting_value').eq('setting_key', 'sms_notification_types').maybeSingle();
+    const raw: any = data?.setting_value;
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.types) ? raw.types : Array.isArray(raw?.value) ? raw.value : null;
+    const types = (arr && arr.length ? arr : DEFAULT_SMS_NOTIFICATION_TYPES).map((s: any) => String(s));
+    res.json({ success: true, data: { types, defaults: DEFAULT_SMS_NOTIFICATION_TYPES } });
+  } catch (error: any) {
+    logger.error(`[admin/sms-notification-types GET] ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lecture réglage SMS' });
+  }
+});
+
+router.put('/sms-notification-types', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const types = req.body?.types;
+    if (!Array.isArray(types)) { res.status(400).json({ success: false, error: 'types (liste) requis' }); return; }
+    const clean = Array.from(new Set(types.map((s: any) => String(s).toLowerCase().trim()).filter(Boolean)));
+    const { error } = await supabaseAdmin.from('pdg_settings').upsert({
+      setting_key: 'sms_notification_types',
+      setting_value: clean,
+      description: 'Types de notifications qui déclenchent un SMS (politique coût). Les autres restent email + in-app.',
+      updated_by: req.user!.id,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'setting_key' });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, data: { types: clean } });
+  } catch (error: any) {
+    logger.error(`[admin/sms-notification-types PUT] ${error.message}`);
     res.status(400).json({ success: false, error: error.message });
   }
 });

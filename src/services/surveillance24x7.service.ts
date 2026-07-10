@@ -3,7 +3,7 @@ import { logger } from '../config/logger.js';
 import { checkSupabaseConnection, supabaseAdmin } from '../config/supabase.js';
 import { redisHealthCheck, locks, isRedisConnected } from '../config/redis.js';
 import { emitCoreFeatureEvent, type FeatureHealthStatus } from './coreFeatureEvents.service.js';
-import { runPlatformMonitors } from './escrowMonitor.service.js';
+import { runPlatformMonitors, autoResolveStaleEventAlerts } from './escrowMonitor.service.js';
 import { ingestAndSummarize, scanAndDiagnose } from './autoHealing.service.js';
 
 type ServiceStatus = 'healthy' | 'degraded' | 'critical' | 'unknown';
@@ -114,6 +114,14 @@ class Surveillance24x7Service {
         await runPlatformMonitors({ skipFnDomains: !includeFrontendScan });
       } catch (e: any) {
         logger.warn(`[Surveillance24x7] platform monitor failed: ${e?.message || e}`);
+      }
+
+      // Alertes ÉVÉNEMENTIELLES (224Guard, role.changed, observateur frontend…) : pas de
+      // signal de fin → auto-résolution quand plus aucune occurrence depuis 24 h (72 h critiques).
+      try {
+        await autoResolveStaleEventAlerts();
+      } catch (e: any) {
+        logger.warn(`[Surveillance24x7] stale event alerts resolve failed: ${e?.message || e}`);
       }
 
       // Auto-réparation : ingestion RAPIDE des alertes actives en incidents (toujours, sans LLM).

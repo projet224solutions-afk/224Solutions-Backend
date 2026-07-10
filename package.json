@@ -5,7 +5,8 @@
   "main": "api/index.js",
   "scripts": {
     "start": "npx --yes tsx src/server.ts",
-    "dev": "npx --yes tsx watch src/server.ts"
+    "dev": "npx --yes tsx watch src/server.ts",
+    "typecheck": "npx --yes --package typescript tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.4",

@@ -29,6 +29,13 @@ const within = (iso: string, mins: number) => {
   return { lo: new Date(t - mins * 60000).toISOString(), hi: new Date(t + mins * 60000).toISOString() };
 };
 
+/** Réfs déjà « marquées traitées » par le PDG pour un contrôle (exclues du compteur ET du détail). */
+async function ackedRefs(checkKey: string): Promise<Set<string>> {
+  const { data } = await supabaseAdmin.from('money_integrity_acknowledged')
+    .select('ref_id').eq('check_key', checkKey);
+  return new Set((data || []).map((r: any) => String(r.ref_id)));
+}
+
 // ── Détails par clé d'anomalie ──────────────────────────────────────────────
 type DetailFetcher = () => Promise<any[]>;
 
@@ -36,11 +43,13 @@ const DETAILS: Record<string, DetailFetcher> = {
   // AML — hausse de solde SANS transaction (argent hors circuit)
   untraced_increase: async () => {
     const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const acked = await ackedRefs('untraced_increase');
     const { data: audits } = await supabaseAdmin.from('wallet_balance_audit')
       .select('id, user_id, wallet_id, old_balance, new_balance, delta, currency, changed_at')
       .gt('delta', 0).gt('changed_at', since).order('changed_at', { ascending: false }).limit(300);
     const out: any[] = [];
     for (const a of audits || []) {
+      if (acked.has(String(a.id))) continue;
       const { lo, hi } = within(a.changed_at, 10);
       const { count } = await supabaseAdmin.from('wallet_transactions')
         .select('id', { count: 'exact', head: true })
@@ -73,6 +82,35 @@ const DETAILS: Record<string, DetailFetcher> = {
     return Promise.all((data || []).map(async (w: any) => ({ ...w, user: await enrichUser(w.user_id) })));
   },
 
+  // COMMISSION — commande wallet payée SANS frais acheteur facturés (revenu plateforme perdu).
+  // Même définition que la RPC commission_monitor_report (migration 20260704150000).
+  order_missing_buyer_fee: async () => {
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const acked = await ackedRefs('order_missing_buyer_fee');
+    const { data: orders } = await supabaseAdmin.from('orders')
+      .select('id, order_number, status, payment_method, total_amount, subtotal, currency, customer_id, vendor_id, created_at')
+      .gt('created_at', since).neq('status', 'cancelled').gt('total_amount', 0)
+      .order('created_at', { ascending: false }).limit(200);
+    const out: any[] = [];
+    for (const o of orders || []) {
+      if (acked.has(String(o.id))) continue;
+      const { count: hasEscrow } = await supabaseAdmin.from('escrow_transactions')
+        .select('id', { count: 'exact', head: true }).eq('order_id', o.id);
+      if (!hasEscrow) continue;
+      const { count: fee } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'commission')
+        .filter('metadata->>source', 'eq', 'buyer_commission')
+        .filter('metadata->>order_id', 'eq', o.id);
+      if (fee) continue;
+      const { data: vendor } = await supabaseAdmin.from('vendors')
+        .select('user_id').eq('id', (o as any).vendor_id).maybeSingle();
+      out.push({ ...o, vendor_user: await enrichUser(vendor?.user_id) });
+      if (out.length >= 50) break;
+    }
+    return out;
+  },
+
   // WALLET — solde négatif (sur-débit)
   wallet_negative_balance: async () => {
     const { data } = await supabaseAdmin.from('wallets')
@@ -81,7 +119,10 @@ const DETAILS: Record<string, DetailFetcher> = {
     return Promise.all((data || []).map(async (w: any) => ({ ...w, user: await enrichUser(w.user_id) })));
   },
 
-  // ESCROW — libéré sans trace d'historique (vendeur potentiellement non payé)
+  // ESCROW — libéré sans trace d'historique (vendeur potentiellement non payé).
+  // Même définition que la RPC escrow_monitor_report (migration 20260704120000) : une trace
+  // HÉRITÉE de l'ancienne Edge ('payment' + « Libération escrow… ») compte comme historique
+  // — le vendeur a été payé, le cas n'est PAS une anomalie.
   released_no_ledger: async () => {
     const since = new Date(Date.now() - 7 * 864e5).toISOString();
     const { data: escrows } = await supabaseAdmin.from('escrow_transactions')
@@ -89,11 +130,19 @@ const DETAILS: Record<string, DetailFetcher> = {
       .eq('status', 'released').gt('released_at', since).order('released_at', { ascending: false }).limit(100);
     const out: any[] = [];
     for (const e of escrows || []) {
-      const { count } = await supabaseAdmin.from('wallet_transactions')
+      const { count: modern } = await supabaseAdmin.from('wallet_transactions')
         .select('id', { count: 'exact', head: true })
         .eq('transaction_type', 'escrow_release')
         .or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
-      if (!count) { out.push({ ...e, user: await enrichUser(e.seller_id) }); if (out.length >= 50) break; }
+      if (modern) continue;
+      const { count: legacy } = await supabaseAdmin.from('wallet_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('transaction_type', 'payment')
+        .like('description', 'Libération escrow%')
+        .or(`reference_id.eq.${e.id},metadata->>escrow_id.eq.${e.id}`);
+      if (legacy) continue;
+      out.push({ ...e, user: await enrichUser(e.seller_id) });
+      if (out.length >= 50) break;
     }
     return out;
   },

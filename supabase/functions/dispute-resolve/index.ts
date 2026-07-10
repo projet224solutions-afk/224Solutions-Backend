@@ -72,7 +72,43 @@ Deno.serve(async (req) => {
       });
     }
 
-    // Update dispute to resolved
+    // 💰 Appliquer la résolution à l'escrow AVANT de marquer le litige résolu : si le mouvement
+    // d'argent échoue, on NE marque PAS un litige « résolu » sans que les fonds aient bougé.
+    // Primitives CANONIQUES (conversion de devise + ligne wallet_transactions + atomiques,
+    // pending+held, idempotentes). Remplacent : release_escrow({p_notes}) [MALFORMÉ — aucune
+    // signature correspondante → échouait en silence, vendeur jamais payé] et refund_escrow
+    // [sans conversion ni ledger wallet_transactions].
+    if (apply_to_escrow && dispute.escrow_id) {
+      const isRefund = resolution.includes('remboursement');
+      if (isRefund) {
+        // refund_order_escrow prend l'ORDER id → on le résout depuis l'escrow.
+        const { data: escRow } = await supabaseClient
+          .from('escrow_transactions').select('order_id').eq('id', dispute.escrow_id).maybeSingle();
+        if (escRow?.order_id) {
+          const { data: refRes, error: refErr } = await supabaseClient
+            .rpc('refund_order_escrow', { p_order_id: escRow.order_id });
+          if (refErr || (refRes && (refRes as any).success === false)) {
+            const msg = refErr?.message || (refRes as any)?.error || 'inconnu';
+            console.error('[dispute-resolve] refund escrow échoué:', msg);
+            return new Response(JSON.stringify({ error: `Remboursement escrow échoué: ${msg}` }), {
+              status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+        }
+      } else {
+        const { data: relRes, error: relErr } = await supabaseClient
+          .rpc('release_escrow_to_seller', { p_escrow_id: dispute.escrow_id, p_reason: `Litige résolu: ${resolution}` });
+        if (relErr || (relRes && (relRes as any).success === false)) {
+          const msg = relErr?.message || (relRes as any)?.error || 'inconnu';
+          console.error('[dispute-resolve] libération escrow échouée:', msg);
+          return new Response(JSON.stringify({ error: `Libération escrow échouée: ${msg}` }), {
+            status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+
+    // Marquer le litige résolu (APRÈS le mouvement d'argent réussi).
     const { data: updatedDispute, error: updateError } = await supabaseClient
       .from('disputes')
       .update({
@@ -91,23 +127,6 @@ Deno.serve(async (req) => {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
-    }
-
-    // Apply resolution to escrow if needed
-    if (apply_to_escrow && dispute.escrow_id) {
-      const escrowAction = resolution.includes('remboursement') ? 'refund' : 'release';
-      
-      if (escrowAction === 'refund') {
-        await supabaseClient.rpc('refund_escrow', {
-          p_escrow_id: dispute.escrow_id,
-          p_reason: `Litige résolu: ${resolution}`
-        });
-      } else {
-        await supabaseClient.rpc('release_escrow', {
-          p_escrow_id: dispute.escrow_id,
-          p_notes: `Litige résolu: ${resolution}`
-        });
-      }
     }
 
     // Log action

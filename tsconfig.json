@@ -10,5 +10,5 @@
     "outDir": "./dist"
   },
   "include": ["src/**/*", "api/**/*"],
-  "exclude": ["node_modules", "dist", "src/__tests__"]
+  "exclude": ["node_modules", "dist", "src/__tests__", "src/**/*.test.ts"]
 }

@@ -23,7 +23,8 @@ const HOME_COUNTRY_MIN_PRODUCTS = 30;
 const ONLINE_VENDOR_TYPES = ['online', 'hybrid'] as const;
 
 // ISO-2 → nom de pays FR (tel que stocké dans vendors.country). Aligné sur le front.
-const COUNTRY_CODE_TO_NAME: Record<string, string> = {
+// Exporté : le copilote s'en sert pour le palier « pays » de l'escalade de recherche.
+export const COUNTRY_CODE_TO_NAME: Record<string, string> = {
   GN: 'Guinée', SN: 'Sénégal', ML: 'Mali', CI: "Côte d'Ivoire", BF: 'Burkina Faso',
   NE: 'Niger', TG: 'Togo', BJ: 'Bénin', GW: 'Guinée-Bissau', SL: 'Sierra Leone',
   LR: 'Liberia', GM: 'Gambie', NG: 'Nigeria', GH: 'Ghana', CM: 'Cameroun',

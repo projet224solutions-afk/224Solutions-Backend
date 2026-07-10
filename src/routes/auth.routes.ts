@@ -7,6 +7,8 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { z } from 'zod';
+import { createClient } from '@supabase/supabase-js';
+import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { oauthConfig } from '../config/oauth.config.js';
 import {
@@ -63,8 +65,13 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // 2) Authentification
-    const { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+    // 2) Authentification — client JETABLE obligatoire : un signIn sur le client
+    // admin PARTAGÉ stockait la session utilisateur en mémoire et contaminait
+    // toutes les requêtes suivantes du process (RLS + RPC refusés). Voir config/supabase.ts.
+    const disposableAuthClient = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data, error } = await disposableAuthClient.auth.signInWithPassword({ email, password });
 
     if (error) {
       // 3) Echec -> incrementer (best-effort)

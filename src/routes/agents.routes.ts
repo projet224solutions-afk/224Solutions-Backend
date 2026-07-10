@@ -317,6 +317,8 @@ const CreateUserByAgentSchema = z.object({
     service_type: z.string().max(50).trim().optional(),
     business_description: z.string().max(1000).trim().optional(),
     business_address: z.string().max(500).trim().optional(),
+    latitude: z.number().optional(),
+    longitude: z.number().optional(),
   }).optional(),
   driverData: z.object({
     license_number: z.string().max(50).trim(),

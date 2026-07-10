@@ -142,7 +142,18 @@ router.post('/activate-user', verifyJWT, authRateLimit, async (req: Authenticate
   const { data, error } = await supabaseAdmin.rpc('activate_cash_agent', {
     p_target_user_id: target.id, p_actor_user_id: req.user!.id, p_actor_is_pdg: actorIsPdg,
   });
-  if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  if (error) {
+    const m = (error.message || '').toUpperCase();
+    if (m.includes('SPONSORSHIP_DISABLED')) {
+      res.status(403).json({ success: false, error: "Le parrainage d'agents est désactivé par la direction.", error_code: 'SPONSORSHIP_DISABLED' }); return;
+    }
+    if (m.includes('SPONSORSHIP_LIMIT_REACHED')) {
+      const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
+      const max = (cfg as any)?.max_sub_agents_per_sponsor;
+      res.status(409).json({ success: false, error: `Limite de sous-agents atteinte${max != null ? ` (${max})` : ''} — contactez la direction.`, error_code: 'SPONSORSHIP_LIMIT_REACHED' }); return;
+    }
+    const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return;
+  }
   logger.info(`[agent-cash] ${req.user!.id} a activé ${target.id} comme agent cash (pdg=${actorIsPdg})`);
   res.json({ success: true, data: { ...(data as any), name: (data as any)?.name || target.name } });
 });
@@ -377,7 +388,26 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
   const { data: ledger } = await supabaseAdmin.from('agent_cash_ledger').select('*').eq('agent_id', agent.id).order('created_at', { ascending: false }).limit(50);
   const { data: pending } = await supabaseAdmin.from('agent_commission_pending').select('*').eq('agent_id', agent.id).eq('status', 'pending');
   const { data: payouts } = await supabaseAdmin.from('agent_commission_payout_requests').select('*').eq('agent_id', agent.id).order('created_at', { ascending: false }).limit(20);
-  res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [] } });
+
+  // Capacité de parrainage EFFECTIVE (miroir exact des gardes de activate_cash_agent) :
+  // interrupteur global + plafond de sous-agents actifs → le bouton frontend se grise seul.
+  const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
+  const sponsorshipOn = (cfg as any)?.allow_agent_sponsorship !== false;
+  const maxSub = Number((cfg as any)?.max_sub_agents_per_sponsor ?? 0);
+  const { count: subCount } = await supabaseAdmin.from('agents_management')
+    .select('id', { count: 'exact', head: true })
+    .eq('parent_agent_id', agent.id).eq('cash_agent_enabled', true);
+  const subAgents = subCount || 0;
+  const remaining = Math.max(0, maxSub - subAgents);
+  let reason: string | null = null;
+  if (agent.cash_agent_suspended) reason = 'Compte cash suspendu.';
+  else if (!agent.cash_agent_enabled) reason = "Compte cash non activé.";
+  else if (!sponsorshipOn) reason = "Le parrainage d'agents est désactivé par la direction.";
+  else if (remaining <= 0) reason = `Limite de sous-agents atteinte (${maxSub}).`;
+  const canRecruit = !reason && !!agent.can_create_sub_agent;
+  const recruit = { can_recruit: canRecruit, reason, sub_agents: subAgents, max_sub_agents: maxSub, remaining, sponsorship_enabled: sponsorshipOn };
+
+  res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [], recruit } });
 });
 
 // ── SUPERVISION PDG ──────────────────────────────────────────────────────────
@@ -404,14 +434,35 @@ router.get('/pdg/agents', verifyJWT, async (req: AuthenticatedRequest, res: Resp
   // Anti-injection filtre PostgREST : on retire les caractères significatifs de la syntaxe .or().
   const q = String(req.query.q || '').replace(/[,()*%\\:]/g, '').trim().slice(0, 50);
   let query = supabaseAdmin.from('agents_management')
-    .select('id, name, agent_code, phone, cash_float_balance, cash_commission_balance, cash_agent_enabled, cash_agent_active, cash_agent_suspended, cash_suspended_reason, created_at')
+    .select('id, name, agent_code, phone, parent_agent_id, cash_float_balance, cash_commission_balance, cash_agent_enabled, cash_agent_active, cash_agent_suspended, cash_suspended_reason, created_at')
     .or('cash_agent_enabled.eq.true,cash_agent_active.eq.true,cash_float_balance.gt.0')
     .order('created_at', { ascending: false })
     .limit(200);
   if (q) query = query.or(`name.ilike.%${q}%,phone.ilike.%${q}%,agent_code.ilike.%${q}%`);
   const { data, error } = await query;
   if (error) { res.status(500).json({ success: false, error: 'Liste indisponible' }); return; }
-  res.json({ success: true, data: { agents: data || [], truncated: (data || []).length >= 200 } });
+  const agents = (data || []) as any[];
+
+  // Enrichissement chaînes de parrainage : nom du parrain + nombre de sous-agents actifs.
+  const ids = agents.map((a) => a.id);
+  const parentIds = [...new Set(agents.map((a) => a.parent_agent_id).filter(Boolean))];
+  const parentNames: Record<string, string> = {};
+  if (parentIds.length) {
+    const { data: parents } = await supabaseAdmin.from('agents_management').select('id, name').in('id', parentIds);
+    (parents || []).forEach((p: any) => { parentNames[p.id] = p.name; });
+  }
+  const subCounts: Record<string, number> = {};
+  if (ids.length) {
+    const { data: subs } = await supabaseAdmin.from('agents_management')
+      .select('parent_agent_id').in('parent_agent_id', ids).eq('cash_agent_enabled', true);
+    (subs || []).forEach((s: any) => { if (s.parent_agent_id) subCounts[s.parent_agent_id] = (subCounts[s.parent_agent_id] || 0) + 1; });
+  }
+  const enriched = agents.map((a) => ({
+    ...a,
+    parent_name: a.parent_agent_id ? (parentNames[a.parent_agent_id] || null) : null,
+    sub_agents_count: subCounts[a.id] || 0,
+  }));
+  res.json({ success: true, data: { agents: enriched, truncated: agents.length >= 200 } });
 });
 
 router.post('/pdg/suspend/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {

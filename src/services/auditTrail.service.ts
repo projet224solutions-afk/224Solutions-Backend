@@ -10,7 +10,7 @@ import { logger } from '../config/logger.js';
 
 interface AuditLogEntry {
   actorId: string;
-  actorType: 'user' | 'system' | 'webhook' | 'cron' | 'admin';
+  actorType: 'user' | 'system' | 'webhook' | 'cron' | 'admin' | 'job';
   action: string;
   resourceType: string;
   resourceId?: string;

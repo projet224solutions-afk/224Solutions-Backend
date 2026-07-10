@@ -647,6 +647,11 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
     if (!result || !result.success) {
       const errorMsg = result?.error || 'Erreur inconnue';
       logger.warn(`Order creation rejected: ${errorMsg}`);
+      // Boutique physique uniquement : produits non commandables en ligne (verrou create_order_core).
+      if (/VENDOR_PHYSICAL_ONLY/i.test(errorMsg)) {
+        res.status(409).json({ success: false, error: "Cette boutique est en magasin uniquement — commande en ligne indisponible. Rendez-vous sur place ou contactez la boutique.", error_code: 'VENDOR_PHYSICAL_ONLY' });
+        return;
+      }
       res.status(409).json({ success: false, error: errorMsg });
       return;
     }

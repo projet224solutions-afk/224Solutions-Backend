@@ -21,7 +21,7 @@ const router = Router();
 async function getAgentForUser(userId: string) {
   const { data } = await supabaseAdmin
     .from('agents_management')
-    .select('id, user_id, name, cash_float_balance, cash_commission_balance, cash_agent_active, cash_agent_suspended, cash_suspended_reason')
+    .select('id, user_id, name, agent_code, cash_float_balance, cash_commission_balance, cash_agent_active, cash_agent_enabled, cash_agent_suspended, cash_suspended_reason, can_create_sub_agent')
     .eq('user_id', userId)
     .maybeSingle();
   return data as any;
@@ -122,6 +122,29 @@ router.post('/activate', verifyJWT, paymentRateLimit, async (req: AuthenticatedR
   const { data, error } = await supabaseAdmin.rpc('agent_activate_cash', { p_agent_id: agent.id, p_topup_amount: amount, p_idempotency_key: req.body?.idempotency_key || newKey() });
   if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
   res.json({ success: true, data });
+});
+
+// ── Activer un utilisateur QUELCONQUE comme agent cash ───────────────────────
+// Autorité : PDG, OU un agent cash déjà activé & non suspendu (parrainage).
+// Le rôle d'origine de la cible est conservé (capacité cash indépendante du rôle).
+router.post('/activate-user', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const actorIsPdg = await isPdg(req.user!.id);
+  if (!actorIsPdg) {
+    const actor = await getAgentForUser(req.user!.id);
+    if (!actor || !actor.cash_agent_enabled || actor.cash_agent_suspended) {
+      res.status(403).json({ success: false, error: 'Réservé au PDG ou à un agent cash actif.' }); return;
+    }
+  }
+  const phone = String(req.body?.phone || '').trim();
+  if (!phone) { res.status(400).json({ success: false, error: 'Numéro de téléphone requis.' }); return; }
+  const target = await resolveClient(phone);
+  if ('error' in target) { res.status(409).json({ success: false, error: target.error }); return; }
+  const { data, error } = await supabaseAdmin.rpc('activate_cash_agent', {
+    p_target_user_id: target.id, p_actor_user_id: req.user!.id, p_actor_is_pdg: actorIsPdg,
+  });
+  if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  logger.info(`[agent-cash] ${req.user!.id} a activé ${target.id} comme agent cash (pdg=${actorIsPdg})`);
+  res.json({ success: true, data: { ...(data as any), name: (data as any)?.name || target.name } });
 });
 
 // ── Lookup client (confirmation visuelle avant opération) ────────────────────

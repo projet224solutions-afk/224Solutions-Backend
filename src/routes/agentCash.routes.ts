@@ -398,6 +398,22 @@ router.get('/pdg/overview', verifyJWT, async (req: AuthenticatedRequest, res: Re
   res.json({ success: true, data: { agents: agents || [], pending: pending || [], payouts: payouts || [], reconciliation: recon, channels } });
 });
 
+// Liste des agents cash + recherche (nom / téléphone / code agent). PDG uniquement.
+router.get('/pdg/agents', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  // Anti-injection filtre PostgREST : on retire les caractères significatifs de la syntaxe .or().
+  const q = String(req.query.q || '').replace(/[,()*%\\:]/g, '').trim().slice(0, 50);
+  let query = supabaseAdmin.from('agents_management')
+    .select('id, name, agent_code, phone, cash_float_balance, cash_commission_balance, cash_agent_enabled, cash_agent_active, cash_agent_suspended, cash_suspended_reason, created_at')
+    .or('cash_agent_enabled.eq.true,cash_agent_active.eq.true,cash_float_balance.gt.0')
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (q) query = query.or(`name.ilike.%${q}%,phone.ilike.%${q}%,agent_code.ilike.%${q}%`);
+  const { data, error } = await query;
+  if (error) { res.status(500).json({ success: false, error: 'Liste indisponible' }); return; }
+  res.json({ success: true, data: { agents: data || [], truncated: (data || []).length >= 200 } });
+});
+
 router.post('/pdg/suspend/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
   const reason = String(req.body?.reason || '').trim();

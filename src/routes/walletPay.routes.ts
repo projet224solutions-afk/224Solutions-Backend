@@ -126,4 +126,25 @@ router.post('/om-momo', verifyJWT, paymentRateLimit, async (req: AuthenticatedRe
   } });
 });
 
+// ── Config frais QR wallet (GET agents/PDG, PUT PDG) ──
+async function isPdg(userId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin.from('pdg_management').select('id').eq('user_id', userId).eq('is_active', true).maybeSingle();
+  if (data) return true;
+  const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
+  return ['pdg', 'admin', 'ceo'].includes(((prof as any)?.role || '').toLowerCase());
+}
+
+router.get('/config', verifyJWT, async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { data, error } = await supabaseAdmin.rpc('wallet_pay_active_config');
+  if (error) { res.status(500).json({ success: false, error: 'Config indisponible' }); return; }
+  res.json({ success: true, data });
+});
+
+router.put('/config', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('wallet_pay_config_update', { p_changes: req.body || {} });
+  if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  res.json({ success: true, data });
+});
+
 export default router;

@@ -49,10 +49,16 @@ export const MONITOR_DOMAINS: DomainDef[] = [
   { key: 'aml', module: 'aml', label: 'Provenance & plafonds wallet', rpc: 'wallet_provenance_report' },
   { key: 'money_integrity', module: 'money_integrity', label: 'Intégrité Argent (drift fonctions)', rpc: 'money_integrity_report' },
   { key: 'pdg_treasury', module: 'pdg_treasury', label: 'Coffre PDG (trésorerie)', rpc: 'pdg_treasury_monitor_report' },
+  // agent_cash_reconciliation_check() renvoie déjà le format monitor ({ checks: [...] }) :
+  // débits≠crédits, drift float, ET opérations sans commission (invariant « pas de commission → pas d'opération »).
+  { key: 'agent_cash', module: 'agent_cash', label: 'Agent Cash (dépôts/retraits)', rpc: 'agent_cash_reconciliation_check' },
   { key: 'frontend_security', module: 'frontend_security', label: 'Sécurité Frontend', fn: scanFrontendSecurity },
 ];
 
 const SUGGESTED_FIX: Record<string, string> = {
+  ledger_unbalanced: 'Opération agent cash dont débits ≠ crédits — incohérence comptable. Inspecter agent_cash_ledger par parent_tx_id ; ne pas corriger à la main sans audit.',
+  float_drift: 'Le float d\'un agent ne correspond plus à la somme de ses legs float. Rapprocher agents_management.cash_float_balance et agent_cash_ledger.',
+  missing_commission: 'Opération dépôt/retrait SANS commission tracée — viole l\'invariant PDG « pas de commission → pas d\'opération ». Bug critique : auditer la RPC agent_cash_*.',
   // escrow
   non_converted_releases: 'Libération ayant contourné le RPC (Edge cassée). Vérifier que confirm-delivery/request-refund déployées sont supprimées.',
   net_mismatch: 'Ligne wallet_transactions violant net = montant − frais. Vérifier les inserts de libération/remboursement.',

@@ -18,6 +18,52 @@ import { createNotification } from '../services/notification.service.js';
 
 const router = Router();
 
+// ── D3 : garde-fous anti-abus (comptages métier, en plus du rate-limit IP générique) ──
+// Constantes (valeurs par défaut ; alignées sur l'intention config PDG).
+const MAX_PENDING_PER_PAIR = 3;          // demandes 'pending' simultanées par couple agent↔client
+const PAIR_COOLDOWN_MS = 2 * 60 * 1000;  // 2 min entre 2 demandes au même client
+const MAX_OPS_PER_AGENT_HOUR = 30;       // opérations/heure par agent
+const MAX_SMS_PER_PAIR_HOUR = 3;         // SMS (OTP) par couple agent↔client par heure
+
+/** Vérifie les limites d'une NOUVELLE demande de retrait. Retourne un message d'erreur FR ou null. */
+async function checkWithdrawalRequestLimits(agentId: string, clientId: string): Promise<string | null> {
+  const hourAgo = new Date(Date.now() - 3600 * 1000).toISOString();
+  // 1) Demandes pending simultanées pour ce couple.
+  const { count: pendingCount } = await supabaseAdmin.from('agent_cash_requests')
+    .select('id', { count: 'exact', head: true })
+    .eq('agent_id', agentId).eq('client_user_id', clientId).eq('type', 'withdrawal').eq('status', 'pending');
+  if ((pendingCount ?? 0) >= MAX_PENDING_PER_PAIR) {
+    return `Trop de demandes en attente pour ce client (max ${MAX_PENDING_PER_PAIR}). Attendez qu'elles soient confirmées ou expirées.`;
+  }
+  // 2) Cooldown entre 2 demandes au même client.
+  const { data: last } = await supabaseAdmin.from('agent_cash_requests')
+    .select('created_at').eq('agent_id', agentId).eq('client_user_id', clientId).eq('type', 'withdrawal')
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (last && (Date.now() - new Date((last as any).created_at).getTime()) < PAIR_COOLDOWN_MS) {
+    return 'Veuillez patienter 2 minutes avant une nouvelle demande à ce client.';
+  }
+  // 3) Débit d'opérations par agent sur la dernière heure.
+  const { count: opsCount } = await supabaseAdmin.from('agent_cash_requests')
+    .select('id', { count: 'exact', head: true })
+    .eq('agent_id', agentId).eq('type', 'withdrawal').gte('created_at', hourAgo);
+  if ((opsCount ?? 0) >= MAX_OPS_PER_AGENT_HOUR) {
+    return `Limite horaire atteinte (${MAX_OPS_PER_AGENT_HOUR} opérations/heure). Réessayez plus tard.`;
+  }
+  return null;
+}
+
+/** Limite anti-gaspillage SMS : max N OTP par couple agent↔client par heure. Message FR ou null. */
+async function checkSmsLimit(agentId: string, clientId: string): Promise<string | null> {
+  const hourAgo = new Date(Date.now() - 3600 * 1000).toISOString();
+  const { count } = await supabaseAdmin.from('agent_cash_otp')
+    .select('id', { count: 'exact', head: true })
+    .eq('agent_id', agentId).eq('client_user_id', clientId).gte('created_at', hourAgo);
+  if ((count ?? 0) >= MAX_SMS_PER_PAIR_HOUR) {
+    return `Trop de SMS envoyés à ce client (max ${MAX_SMS_PER_PAIR_HOUR}/heure). Réessayez plus tard.`;
+  }
+  return null;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 async function getAgentForUser(userId: string) {
   const { data } = await supabaseAdmin
@@ -277,6 +323,10 @@ router.post('/withdrawal/otp', verifyJWT, authRateLimit, async (req: Authenticat
   const client = await resolveClient(phone);
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
 
+  // D3 : anti-gaspillage SMS (max N OTP par couple agent↔client par heure).
+  const smsErr = await checkSmsLimit(agent.id, client.id);
+  if (smsErr) { res.status(429).json({ success: false, error: smsErr }); return; }
+
   const ok = await issueClientOtp(agent.id, client.id, phone, posInt(amount) ? amount : null);
   if (!ok) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
   res.json({ success: true, data: { sent: true, client_name: client.name } });
@@ -324,6 +374,10 @@ router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: Auth
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide (entier positif)' }); return; }
   const client = await resolveClient(phone);
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
+
+  // D3 : garde-fous anti-abus (pending simultanés / cooldown / débit horaire agent).
+  const limitErr = await checkWithdrawalRequestLimits(agent.id, client.id);
+  if (limitErr) { res.status(429).json({ success: false, error: limitErr }); return; }
 
   const key = req.body?.idempotency_key || newKey();
   const fee = await computeWithdrawalFee(amount);
@@ -397,6 +451,9 @@ router.post('/withdrawal/fallback-otp', verifyJWT, authRateLimit, async (req: Au
   const r = rq as any;
   const ph = await clientPhone(r.client_user_id);
   if (!ph) { res.status(409).json({ success: false, error: 'Numéro client indisponible' }); return; }
+  // D3 : anti-gaspillage SMS (max N OTP par couple agent↔client par heure).
+  const smsErr = await checkSmsLimit(agent.id, r.client_user_id);
+  if (smsErr) { res.status(429).json({ success: false, error: smsErr }); return; }
   await supabaseAdmin.from('agent_cash_requests').update({ channel: 'otp' }).eq('id', r.id);
   const ok = await issueClientOtp(agent.id, r.client_user_id, ph, r.amount);
   if (!ok) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
@@ -479,6 +536,49 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
   const self_withdrawal_fee_percent = Number((cfg as any)?.self_withdrawal_fee_percent ?? 0);
 
   res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [], can_activate_cash_agents: canActivate, self_withdrawal_fee_percent } });
+});
+
+// ── Chantier B : historique COMPLET des commissions (dépôts ET retraits), paginé ──
+// Chaque dépôt/retrait a SA commission (invariant PDG) → cet historique EST l'historique des
+// opérations. Lecture seule, filtré sur l'agent authentifié.
+router.get('/me/commissions', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+  const pageSize = 20;
+  const from = (page - 1) * pageSize;
+
+  // Legs de commission (versées + pending) — une par opération.
+  const { data: legs } = await supabaseAdmin.from('agent_cash_ledger')
+    .select('id, parent_tx_id, operation, amount, status, created_at')
+    .eq('agent_id', agent.id).eq('leg', 'agent_commission_credit')
+    .order('created_at', { ascending: false })
+    .range(from, from + pageSize);   // +1 ligne pour détecter has_more
+  const rows = (legs || []) as any[];
+  const hasMore = rows.length > pageSize;
+  const pageRows = rows.slice(0, pageSize);
+
+  // Montant de l'OPÉRATION source (agent_cash_operations.amount) par parent_tx_id.
+  const parentIds = [...new Set(pageRows.map((r) => r.parent_tx_id).filter(Boolean))];
+  const opAmount: Record<string, number> = {};
+  if (parentIds.length) {
+    const { data: ops } = await supabaseAdmin.from('agent_cash_operations')
+      .select('parent_tx_id, amount').in('parent_tx_id', parentIds);
+    (ops || []).forEach((o: any) => { opAmount[o.parent_tx_id] = Number(o.amount || 0); });
+  }
+
+  const items = pageRows.map((r) => ({
+    id: r.id,
+    created_at: r.created_at,
+    type: r.operation,                              // 'deposit' | 'withdrawal'
+    operation_amount: opAmount[r.parent_tx_id] ?? 0,
+    commission_amount: Number(r.amount || 0),
+    reference: r.parent_tx_id,
+    status: r.status === 'pending' ? 'pending' : 'credited',
+  }));
+
+  const { data: stats } = await supabaseAdmin.rpc('agent_cash_commission_stats', { p_agent_id: agent.id });
+  res.json({ success: true, data: { stats: stats || { today: 0, month: 0, total: 0 }, items, page, has_more: hasMore } });
 });
 
 // ── SUPERVISION PDG ──────────────────────────────────────────────────────────

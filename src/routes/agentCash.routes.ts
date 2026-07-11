@@ -14,6 +14,7 @@ import { authRateLimit, paymentRateLimit } from '../middlewares/routeRateLimiter
 import { sendSms } from '../services/sms.service.js';
 import { userHasFcmToken, sendPushToUser } from '../services/push.service.js';
 import { verifyWalletPin } from '../services/walletPin.service.js';
+import { createNotification } from '../services/notification.service.js';
 
 const router = Router();
 
@@ -94,10 +95,12 @@ async function notifyActivation(targetUserId: string, phone: string | null): Pro
   const msg1 = 'Votre compte a été activé pour faire le dépôt et retrait.';
   const msg2 = 'À partir de maintenant, vous pouvez déposer et retirer de l\'argent pour les clients et gagner des commissions sur chaque transaction. 224Solutions vous remercie.';
   try {
-    const hasToken = await userHasFcmToken(targetUserId);
-    if (hasToken) {
+    // 1) IN-APP (source de vérité, toujours visible dans la cloche) — les 2 messages R2.
+    await createNotification({ userId: targetUserId, title, message: msg1, type: 'agent_cash_activated' });
+    await createNotification({ userId: targetUserId, title, message: msg2, type: 'agent_cash_activated' });
+    // 2) Push best-effort (si token FCM), sinon repli SMS.
+    if (await userHasFcmToken(targetUserId)) {
       await sendPushToUser(targetUserId, { title, message: msg1, data: { type: 'agent_cash_activated' } });
-      await sendPushToUser(targetUserId, { title, message: msg2, data: { type: 'agent_cash_activated' } });
     } else if (phone) {
       await sendSms(phone, `224Solutions : ${msg1}`);
       await sendSms(phone, msg2);

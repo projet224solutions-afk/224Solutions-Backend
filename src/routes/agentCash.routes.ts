@@ -47,6 +47,64 @@ async function resolveClient(phone: string): Promise<{ id: string; name: string 
   return { id: data as string, name };
 }
 
+// Peut activer un agent cash = PDG (tranché ailleurs) OU agent de GESTION avec la permission.
+async function canActivateCashAgents(userId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin.from('agents_management')
+    .select('id').eq('user_id', userId).eq('can_activate_cash_agents', true).eq('is_active', true).maybeSingle();
+  return !!data;
+}
+
+// Masque le milieu d'un téléphone pour la préview (garde début + 2 derniers).
+function maskPhone(ph?: string | null): string | null {
+  const s = String(ph || '').trim();
+  if (!s) return null;
+  if (s.length <= 4) return s;
+  return s.slice(0, 4) + '••••' + s.slice(-2);
+}
+
+// Résout une cible par ID 224 (profiles.public_id) OU téléphone (strict) et renvoie un profil
+// de PRÉVIEW (nom, rôle, avatar, téléphone masqué) avant confirmation d'activation.
+async function resolveTargetProfile(identifier: string): Promise<
+  { id: string; name: string; role: string | null; avatar_url: string | null; phone_masked: string | null } | { error: string }
+> {
+  const raw = String(identifier || '').trim();
+  if (!raw) return { error: 'ID 224 ou numéro de téléphone requis.' };
+  let userId: string | null = null;
+  // Heuristique : un ID 224 (public_id) n'est pas un numéro → tente public_id si pas purement numérique/+.
+  const looksPhone = /^\+?[\d\s-]{6,}$/.test(raw);
+  if (!looksPhone) {
+    const { data } = await supabaseAdmin.from('profiles').select('id').eq('public_id', raw.toUpperCase()).maybeSingle();
+    if (data) userId = (data as any).id;
+  }
+  if (!userId) {
+    const r = await resolveClient(raw);
+    if ('error' in r) return { error: r.error };
+    userId = r.id;
+  }
+  const { data: prof } = await supabaseAdmin.from('profiles')
+    .select('first_name, last_name, full_name, role, avatar_url, phone').eq('id', userId).maybeSingle();
+  const p = (prof as any) || {};
+  const name = (p.full_name || `${p.first_name || ''} ${p.last_name || ''}`).trim() || 'Utilisateur 224';
+  return { id: userId, name, role: p.role || null, avatar_url: p.avatar_url || null, phone_masked: maskPhone(p.phone) };
+}
+
+// Les 2 messages EXACTS d'activation (R2). Envoi push si token FCM, sinon repli SMS.
+async function notifyActivation(targetUserId: string, phone: string | null): Promise<void> {
+  const title = 'Compte agent cash activé';
+  const msg1 = 'Votre compte a été activé pour faire le dépôt et retrait.';
+  const msg2 = 'À partir de maintenant, vous pouvez déposer et retirer de l\'argent pour les clients et gagner des commissions sur chaque transaction. 224Solutions vous remercie.';
+  try {
+    const hasToken = await userHasFcmToken(targetUserId);
+    if (hasToken) {
+      await sendPushToUser(targetUserId, { title, message: msg1, data: { type: 'agent_cash_activated' } });
+      await sendPushToUser(targetUserId, { title, message: msg2, data: { type: 'agent_cash_activated' } });
+    } else if (phone) {
+      await sendSms(phone, `224Solutions : ${msg1}`);
+      await sendSms(phone, msg2);
+    }
+  } catch (e: any) { logger.warn(`[agent-cash] notif activation ignorée: ${e?.message}`); }
+}
+
 // Mapping des codes d'erreur SQL → messages FR + HTTP.
 function mapRpcError(msg: string): { code: number; error: string } {
   const m = (msg || '').toUpperCase();
@@ -124,36 +182,57 @@ router.post('/activate', verifyJWT, paymentRateLimit, async (req: AuthenticatedR
   res.json({ success: true, data });
 });
 
-// ── Activer un utilisateur QUELCONQUE comme agent cash ───────────────────────
-// Autorité : PDG, OU un agent cash déjà activé & non suspendu (parrainage).
-// Le rôle d'origine de la cible est conservé (capacité cash indépendante du rôle).
+// ── Retrait moi-même (R4) : wallet perso agent → float, PIN requis, frais self (défaut 0) ─
+router.post('/self-withdrawal', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  if (!agent.cash_agent_enabled || agent.cash_agent_suspended) { res.status(403).json({ success: false, error: 'Agent cash inactif ou suspendu.' }); return; }
+  const amount = Number(req.body?.amount);
+  const pin = String(req.body?.pin || '');
+  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+  if (pin.length < 4) { res.status(400).json({ success: false, error: 'Code PIN requis' }); return; }
+  const pinRes = await verifyWalletPin(req.user!.id, pin);   // c'est SON wallet → SON PIN
+  if (!pinRes.valid) { res.status(403).json({ success: false, error: pinRes.error || 'Code PIN invalide' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_self_withdrawal', {
+    p_agent_id: agent.id, p_amount: amount, p_idempotency_key: req.body?.idempotency_key || newKey(),
+  });
+  if (error) {
+    const m = (error.message || '').toUpperCase();
+    if (m.includes('SOLDE_PERSO_INSUFFISANT')) { res.status(409).json({ success: false, error: 'Solde de votre wallet perso insuffisant (montant + frais).' }); return; }
+    const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return;
+  }
+  res.json({ success: true, data });
+});
+
+// ── Préview de la cible (ID 224 ou téléphone) avant activation — R2 ───────────
+// Autorité (R1) : PDG OU agent de gestion avec permission can_activate_cash_agents.
+router.post('/resolve-target', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const actorIsPdg = await isPdg(req.user!.id);
+  if (!actorIsPdg && !(await canActivateCashAgents(req.user!.id))) {
+    res.status(403).json({ success: false, error: 'Réservé au PDG et aux agents de gestion autorisés.' }); return;
+  }
+  const r = await resolveTargetProfile(String(req.body?.identifier ?? req.body?.phone ?? ''));
+  if ('error' in r) { res.status(409).json({ success: false, error: r.error }); return; }
+  res.json({ success: true, data: r });
+});
+
+// ── Activer un utilisateur comme agent cash ──────────────────────────────────
+// Autorité (R1) : PDG OU agent de GESTION avec permission. AUCUN agent cash n'active
+// (parrainage SUPPRIMÉ). Le rôle d'origine de la cible est conservé.
 router.post('/activate-user', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const actorIsPdg = await isPdg(req.user!.id);
-  if (!actorIsPdg) {
-    const actor = await getAgentForUser(req.user!.id);
-    if (!actor || !actor.cash_agent_enabled || actor.cash_agent_suspended) {
-      res.status(403).json({ success: false, error: 'Réservé au PDG ou à un agent cash actif.' }); return;
-    }
+  if (!actorIsPdg && !(await canActivateCashAgents(req.user!.id))) {
+    res.status(403).json({ success: false, error: 'Réservé au PDG et aux agents de gestion autorisés.' }); return;
   }
-  const phone = String(req.body?.phone || '').trim();
-  if (!phone) { res.status(400).json({ success: false, error: 'Numéro de téléphone requis.' }); return; }
-  const target = await resolveClient(phone);
+  const target = await resolveTargetProfile(String(req.body?.identifier ?? req.body?.phone ?? ''));
   if ('error' in target) { res.status(409).json({ success: false, error: target.error }); return; }
   const { data, error } = await supabaseAdmin.rpc('activate_cash_agent', {
     p_target_user_id: target.id, p_actor_user_id: req.user!.id, p_actor_is_pdg: actorIsPdg,
   });
-  if (error) {
-    const m = (error.message || '').toUpperCase();
-    if (m.includes('SPONSORSHIP_DISABLED')) {
-      res.status(403).json({ success: false, error: "Le parrainage d'agents est désactivé par la direction.", error_code: 'SPONSORSHIP_DISABLED' }); return;
-    }
-    if (m.includes('SPONSORSHIP_LIMIT_REACHED')) {
-      const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
-      const max = (cfg as any)?.max_sub_agents_per_sponsor;
-      res.status(409).json({ success: false, error: `Limite de sous-agents atteinte${max != null ? ` (${max})` : ''} — contactez la direction.`, error_code: 'SPONSORSHIP_LIMIT_REACHED' }); return;
-    }
-    const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return;
-  }
+  if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  // R2 : 2 notifications d'activation (push, repli SMS). Non bloquant.
+  const { data: prof } = await supabaseAdmin.from('profiles').select('phone').eq('id', target.id).maybeSingle();
+  await notifyActivation(target.id, (prof as any)?.phone || null);
   logger.info(`[agent-cash] ${req.user!.id} a activé ${target.id} comme agent cash (pdg=${actorIsPdg})`);
   res.json({ success: true, data: { ...(data as any), name: (data as any)?.name || target.name } });
 });
@@ -389,25 +468,14 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
   const { data: pending } = await supabaseAdmin.from('agent_commission_pending').select('*').eq('agent_id', agent.id).eq('status', 'pending');
   const { data: payouts } = await supabaseAdmin.from('agent_commission_payout_requests').select('*').eq('agent_id', agent.id).order('created_at', { ascending: false }).limit(20);
 
-  // Capacité de parrainage EFFECTIVE (miroir exact des gardes de activate_cash_agent) :
-  // interrupteur global + plafond de sous-agents actifs → le bouton frontend se grise seul.
+  // Autorité d'activation (R1) : cet agent est-il un agent de GESTION autorisé à activer
+  // des agents cash ? (parrainage supprimé — plus de « recruit »). Expose aussi le taux
+  // du retrait moi-même pour l'affichage des frais.
+  const canActivate = await canActivateCashAgents(req.user!.id);
   const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
-  const sponsorshipOn = (cfg as any)?.allow_agent_sponsorship !== false;
-  const maxSub = Number((cfg as any)?.max_sub_agents_per_sponsor ?? 0);
-  const { count: subCount } = await supabaseAdmin.from('agents_management')
-    .select('id', { count: 'exact', head: true })
-    .eq('parent_agent_id', agent.id).eq('cash_agent_enabled', true);
-  const subAgents = subCount || 0;
-  const remaining = Math.max(0, maxSub - subAgents);
-  let reason: string | null = null;
-  if (agent.cash_agent_suspended) reason = 'Compte cash suspendu.';
-  else if (!agent.cash_agent_enabled) reason = "Compte cash non activé.";
-  else if (!sponsorshipOn) reason = "Le parrainage d'agents est désactivé par la direction.";
-  else if (remaining <= 0) reason = `Limite de sous-agents atteinte (${maxSub}).`;
-  const canRecruit = !reason && !!agent.can_create_sub_agent;
-  const recruit = { can_recruit: canRecruit, reason, sub_agents: subAgents, max_sub_agents: maxSub, remaining, sponsorship_enabled: sponsorshipOn };
+  const self_withdrawal_fee_percent = Number((cfg as any)?.self_withdrawal_fee_percent ?? 0);
 
-  res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [], recruit } });
+  res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [], can_activate_cash_agents: canActivate, self_withdrawal_fee_percent } });
 });
 
 // ── SUPERVISION PDG ──────────────────────────────────────────────────────────
@@ -465,20 +533,46 @@ router.get('/pdg/agents', verifyJWT, async (req: AuthenticatedRequest, res: Resp
   res.json({ success: true, data: { agents: enriched, truncated: agents.length >= 200 } });
 });
 
+// Suspension : PDG OU agent de gestion avec permission (R2), trace de QUI suspend.
 router.post('/pdg/suspend/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const allowed = (await isPdg(req.user!.id)) || (await canActivateCashAgents(req.user!.id));
+  if (!allowed) { res.status(403).json({ success: false, error: 'Réservé au PDG et aux agents de gestion autorisés.' }); return; }
   const reason = String(req.body?.reason || '').trim();
   if (!reason) { res.status(400).json({ success: false, error: 'Motif obligatoire' }); return; }
   const { data, error } = await supabaseAdmin.rpc('agent_cash_set_suspended', { p_agent_id: req.params.agentId, p_suspended: true, p_reason: reason });
   if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  logger.info(`[agent-cash] ${req.user!.id} a suspendu l'agent ${req.params.agentId} (motif: ${reason})`);
   res.json({ success: true, data });
 });
 
 router.post('/pdg/unsuspend/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const allowed = (await isPdg(req.user!.id)) || (await canActivateCashAgents(req.user!.id));
+  if (!allowed) { res.status(403).json({ success: false, error: 'Réservé au PDG et aux agents de gestion autorisés.' }); return; }
   const { data, error } = await supabaseAdmin.rpc('agent_cash_set_suspended', { p_agent_id: req.params.agentId, p_suspended: false, p_reason: null });
   if (error) { res.status(400).json({ success: false, error: error.message }); return; }
   res.json({ success: true, data });
+});
+
+// ── Activateurs (PDG) : lister les agents de gestion + accorder/révoquer la permission ─
+router.get('/pdg/activators', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  // Agents de GESTION = fiches agents_management NON transformées en agent cash (cash_agent_enabled != true).
+  const { data } = await supabaseAdmin.from('agents_management')
+    .select('id, name, agent_code, phone, can_activate_cash_agents, is_active')
+    .neq('cash_agent_enabled', true)
+    .order('name', { ascending: true }).limit(500);
+  res.json({ success: true, data: { activators: data || [] } });
+});
+
+router.put('/pdg/activators/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const grant = req.body?.can_activate_cash_agents === true;
+  const { error } = await supabaseAdmin.from('agents_management')
+    .update({ can_activate_cash_agents: grant, updated_at: new Date().toISOString() })
+    .eq('id', req.params.agentId);
+  if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  logger.info(`[agent-cash] PDG ${req.user!.id} a ${grant ? 'accordé' : 'révoqué'} la permission d'activation à ${req.params.agentId}`);
+  res.json({ success: true, data: { can_activate_cash_agents: grant } });
 });
 
 router.post('/pdg/pending/:id/:action', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {

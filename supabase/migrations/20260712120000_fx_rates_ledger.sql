@@ -123,7 +123,7 @@ BEGIN
     IF v_prev IS NOT NULL AND v_prev > 0 THEN
       v_move := abs(p_rate - v_prev) / v_prev * 100;
       IF v_move > v_cfg.fx_max_daily_move_percent THEN
-        v_status := 'quarantine'; v_reason := format('variation %.2f%% > %s%% (source %s)', v_move, v_cfg.fx_max_daily_move_percent, p_source);
+        v_status := 'quarantine'; v_reason := format('variation %s%% > %s%% (source %s)', round(v_move,2), v_cfg.fx_max_daily_move_percent, p_source);
       END IF;
     END IF;
   END IF;
@@ -135,7 +135,7 @@ BEGIN
     IF v_median IS NOT NULL AND v_median > 0 THEN
       v_div := abs(p_rate - v_median) / v_median * 100;
       IF v_div > v_cfg.fx_max_source_divergence_percent THEN
-        v_status := 'verification'; v_reason := format('divergence %.2f%% vs médiane %s', v_div, round(v_median));
+        v_status := 'verification'; v_reason := format('divergence %s%% vs médiane %s', round(v_div,2), round(v_median));
       END IF;
     END IF;
   END IF;

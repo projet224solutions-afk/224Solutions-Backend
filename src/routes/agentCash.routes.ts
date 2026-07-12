@@ -231,27 +231,8 @@ router.post('/activate', verifyJWT, paymentRateLimit, async (req: AuthenticatedR
   res.json({ success: true, data });
 });
 
-// ── Retrait moi-même (R4) : wallet perso agent → float, PIN requis, frais self (défaut 0) ─
-router.post('/self-withdrawal', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const agent = await getAgentForUser(req.user!.id);
-  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
-  if (!agent.cash_agent_enabled || agent.cash_agent_suspended) { res.status(403).json({ success: false, error: 'Agent cash inactif ou suspendu.' }); return; }
-  const amount = Number(req.body?.amount);
-  const pin = String(req.body?.pin || '');
-  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
-  if (pin.length < 4) { res.status(400).json({ success: false, error: 'Code PIN requis' }); return; }
-  const pinRes = await verifyWalletPin(req.user!.id, pin);   // c'est SON wallet → SON PIN
-  if (!pinRes.valid) { res.status(403).json({ success: false, error: pinRes.error || 'Code PIN invalide' }); return; }
-  const { data, error } = await supabaseAdmin.rpc('agent_cash_self_withdrawal', {
-    p_agent_id: agent.id, p_amount: amount, p_idempotency_key: req.body?.idempotency_key || newKey(),
-  });
-  if (error) {
-    const m = (error.message || '').toUpperCase();
-    if (m.includes('SOLDE_PERSO_INSUFFISANT')) { res.status(409).json({ success: false, error: 'Solde de votre wallet perso insuffisant (montant + frais).' }); return; }
-    const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return;
-  }
-  res.json({ success: true, data });
-});
+// « Retrait moi-même » SUPPRIMÉ (agent cash v2) : le wallet EST le capital de l'agent.
+// Pour sortir son argent vers Orange Money / banque, l'agent utilise le Retrait STANDARD du wallet.
 
 // ── Préview de la cible (ID 224 ou téléphone) avant activation — R2 ───────────
 // Autorité (R1) : PDG OU agent de gestion avec permission can_activate_cash_agents.
@@ -520,7 +501,7 @@ router.post('/commission/withdraw', verifyJWT, paymentRateLimit, async (req: Aut
   res.json({ success: true, data });
 });
 
-// ── Espace agent : mes soldes + historique ledger ────────────────────────────
+// ── Espace agent (v2) : plancher sur le SOLDE WALLET + stats commissions (plus de float séparé) ──
 router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
@@ -528,14 +509,23 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
   const { data: pending } = await supabaseAdmin.from('agent_commission_pending').select('*').eq('agent_id', agent.id).eq('status', 'pending');
   const { data: payouts } = await supabaseAdmin.from('agent_commission_payout_requests').select('*').eq('agent_id', agent.id).order('created_at', { ascending: false }).limit(20);
 
-  // Autorité d'activation (R1) : cet agent est-il un agent de GESTION autorisé à activer
-  // des agents cash ? (parrainage supprimé — plus de « recruit »). Expose aussi le taux
-  // du retrait moi-même pour l'affichage des frais.
+  // v2 : le solde wallet de l'agent couvre-t-il le plancher opérationnel (dans SA devise) ?
+  const { data: walletOk } = await supabaseAdmin.rpc('agent_cash_wallet_ok', { p_agent_id: agent.id });
+  // Stats commissions (jour/mois/total) depuis le ledger (agent_commission_credit), dans la devise de l'agent.
+  const { data: commissionStats } = await supabaseAdmin.rpc('agent_cash_commission_stats', { p_agent_id: agent.id });
+
+  // Autorité d'activation (R1) : agent de GESTION autorisé à activer des agents cash ?
   const canActivate = await canActivateCashAgents(req.user!.id);
   const { data: cfg } = await supabaseAdmin.rpc('agent_cash_active_config');
-  const self_withdrawal_fee_percent = Number((cfg as any)?.self_withdrawal_fee_percent ?? 0);
 
-  res.json({ success: true, data: { agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [], can_activate_cash_agents: canActivate, self_withdrawal_fee_percent } });
+  res.json({ success: true, data: {
+    agent, ledger: ledger || [], pending: pending || [], payouts: payouts || [],
+    can_activate_cash_agents: canActivate,
+    wallet_balance_ok_for_cash: !!(walletOk as any)?.ok,
+    wallet_cash_status: walletOk || null,             // { ok, currency, balance, floor, min_gnf, reason? }
+    commission_stats: commissionStats || { today: 0, month: 0, total: 0 },
+    min_wallet_balance_for_cash_ops: Number((cfg as any)?.min_wallet_balance_for_cash_ops ?? 100000),
+  } });
 });
 
 // ── Chantier B : historique COMPLET des commissions (dépôts ET retraits), paginé ──

@@ -52,6 +52,8 @@ export const MONITOR_DOMAINS: DomainDef[] = [
   // agent_cash_reconciliation_check() renvoie déjà le format monitor ({ checks: [...] }) :
   // débits≠crédits, drift float, ET opérations sans commission (invariant « pas de commission → pas d'opération »).
   { key: 'agent_cash', module: 'agent_cash', label: 'Agent Cash (dépôts/retraits)', rpc: 'agent_cash_reconciliation_check' },
+  // FX : santé du ledger de taux (quarantaines non traitées, divergences, paires périmées, rejets).
+  { key: 'fx', module: 'fx', label: 'Taux de change (FX)', rpc: 'fx_monitor_report' },
   { key: 'frontend_security', module: 'frontend_security', label: 'Sécurité Frontend', fn: scanFrontendSecurity },
 ];
 
@@ -59,6 +61,10 @@ const SUGGESTED_FIX: Record<string, string> = {
   ledger_unbalanced: 'Opération agent cash dont débits ≠ crédits — incohérence comptable. Inspecter agent_cash_ledger par parent_tx_id ; ne pas corriger à la main sans audit.',
   float_drift: 'Le float d\'un agent ne correspond plus à la somme de ses legs float. Rapprocher agents_management.cash_float_balance et agent_cash_ledger.',
   missing_commission: 'Opération dépôt/retrait SANS commission tracée — viole l\'invariant PDG « pas de commission → pas d\'opération ». Bug critique : auditer la RPC agent_cash_*.',
+  fx_quarantine_stuck: 'Taux de change en quarantaine > 2h — valider/rejeter dans l\'écran Taux PDG (fx_validate_quarantined). Le taux précédent frais reste appliqué en attendant.',
+  fx_pair_stale: 'Paire sans taux actif frais < 24h — scraper en panne ou source indisponible. Les conversions cross-devises de cette paire sont bloquées (TAUX_INDISPONIBLE) jusqu\'à un taux frais.',
+  fx_verification_open: 'Taux en vérification (divergence vs médiane) — inspecter la source dans l\'écran Taux ; possible scraper qui déraille.',
+  fx_rejected_24h: 'Taux rejetés (hors bornes) sur 24h — page source cassée ou bornes trop serrées ; vérifier fx_pair_bounds.',
   // escrow
   non_converted_releases: 'Libération ayant contourné le RPC (Edge cassée). Vérifier que confirm-delivery/request-refund déployées sont supprimées.',
   net_mismatch: 'Ligne wallet_transactions violant net = montant − frais. Vérifier les inserts de libération/remboursement.',

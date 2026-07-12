@@ -15,6 +15,9 @@ jobs:
   deploy:
     name: Deploy over SSH
     runs-on: ubuntu-latest
+    # Anti-blocage : un run SSH figé mourrait sinon indéfiniment et bloquerait TOUS les
+    # déploiements suivants (concurrency group + cancel-in-progress:false = file d'attente).
+    timeout-minutes: 10
     steps:
       - name: Deploy to VPS
         env:

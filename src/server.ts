@@ -252,6 +252,25 @@ app.use('/health', healthRoutes);
 app.use('/healthz', healthRoutes);
 app.use('/healthz.json', healthRoutes);
 
+// Version (public) — diagnostic « qu'est-ce qui tourne RÉELLEMENT en prod ».
+// Expose le SHA du commit déployé + l'heure de boot : permet de vérifier après un deploy
+// que le code servi correspond bien à main (fin des « rien ne change »). Aucun secret.
+const BOOTED_AT = new Date().toISOString();
+app.get('/api/version', (_req, res) => {
+  res.json({
+    success: true,
+    data: {
+      commit: process.env.GIT_COMMIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_SHA
+        || process.env.COMMIT_SHA || process.env.SOURCE_VERSION || process.env.GIT_COMMIT || 'unknown',
+      branch: process.env.GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF || null,
+      builtAt: process.env.BUILD_TIME || process.env.BUILD_TIMESTAMP || null,
+      bootedAt: BOOTED_AT,
+      environment: process.env.NODE_ENV || 'development',
+      node: process.version,
+    },
+  });
+});
+
 // Migrations (admin, applies database changes)
 app.use('/api/migrations', migrationsRoutes);
 

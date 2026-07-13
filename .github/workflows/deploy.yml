@@ -32,6 +32,9 @@ jobs:
           AGORA_CUSTOMER_SECRET: ${{ secrets.AGORA_CUSTOMER_SECRET }}
           GCS_HMAC_ACCESS_KEY: ${{ secrets.GCS_HMAC_ACCESS_KEY }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
+          # Diagnostic /api/version : SHA + horodatage du commit réellement déployé (pas des secrets).
+          GIT_SHA: ${{ github.sha }}
+          GIT_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
@@ -67,6 +70,10 @@ jobs:
           if [ -n "${GCS_HMAC_SECRET}" ]; then sed -i '/^GCS_HMAC_SECRET=/d' .env; echo "GCS_HMAC_SECRET=${GCS_HMAC_SECRET}" >> .env; fi
           git fetch origin main
           git reset --hard origin/main
+          # Diagnostic : écrit le SHA/branche/horodatage du commit déployé dans .env → /api/version.
+          sed -i '/^GIT_COMMIT_SHA=/d' .env; echo "GIT_COMMIT_SHA=${GIT_SHA}" >> .env
+          sed -i '/^GIT_BRANCH=/d' .env; echo "GIT_BRANCH=main" >> .env
+          if [ -n "${GIT_BUILD_TIME}" ]; then sed -i '/^BUILD_TIME=/d' .env; echo "BUILD_TIME=${GIT_BUILD_TIME}" >> .env; fi
           npm install --no-audit --no-fund
           # Redemarrage : relit le .env via dotenv au boot. Mono-instance = l'API porte AUSSI les
           # jobs (RUN_BACKGROUND_JOBS) ; si un process worker PM2 dedie existe, il est relance aussi.

@@ -81,17 +81,55 @@ async function isPdg(userId: string): Promise<boolean> {
   return ['pdg', 'admin', 'ceo'].includes(((prof as any)?.role || '').toLowerCase());
 }
 
-// Résout le client par téléphone (STRICT) et renvoie son nom pour confirmation visuelle.
-async function resolveClient(phone: string): Promise<{ id: string; name: string } | { error: string }> {
-  const { data, error } = await supabaseAdmin.rpc('resolve_user_id_by_phone_strict', { p_phone: phone });
+// Résolution UNIVERSELLE et STRICTE d'un utilisateur par identifiant : téléphone (RPC stricte)
+// OU ID 224. Les DEUX systèmes d'ID affichés aux clients selon l'écran sont couverts :
+//   • profiles.public_id  (VARCHAR(8), ex. USR12345 / VND0001)
+//   • user_ids.custom_id  ('USR' + 7 chiffres, ex. USR1234567)
+// Les IDs sont stockés en MAJUSCULES → on uppercase l'entrée (donc insensible à la casse).
+// Anti-ambiguïté : si l'entrée matche des comptes DIFFÉRENTS (ou plusieurs dans une table),
+// on REFUSE — jamais de LIMIT 1 silencieux (même philosophie que la résolution téléphone stricte).
+async function resolveUserIdByIdentifier(identifier: string): Promise<{ userId: string } | { error: string }> {
+  const raw = String(identifier || '').trim();
+  if (!raw) return { error: 'ID 224 ou numéro de téléphone requis.' };
+
+  const looksPhone = /^\+?[\d\s-]{6,}$/.test(raw);
+  if (!looksPhone) {
+    const up = raw.toUpperCase();
+    const [pubRes, cusRes] = await Promise.all([
+      supabaseAdmin.from('profiles').select('id').eq('public_id', up).limit(2),
+      supabaseAdmin.from('user_ids').select('user_id').eq('custom_id', up).limit(2),
+    ]);
+    const pubRows = (pubRes.data as any[]) || [];
+    const cusRows = (cusRes.data as any[]) || [];
+    const AMBIGU = 'Cet identifiant correspond à plusieurs comptes — utilisez le numéro de téléphone.';
+    // Doublon interne à une table OU les 2 tables pointent des comptes différents → on ne devine pas.
+    if (pubRows.length > 1 || cusRows.length > 1) return { error: AMBIGU };
+    const pubId = pubRows[0]?.id ?? null;
+    const cusId = cusRows[0]?.user_id ?? null;
+    if (pubId && cusId && pubId !== cusId) return { error: AMBIGU };
+    const uid = pubId ?? cusId;
+    if (uid) return { userId: uid as string };
+    return { error: 'Aucun compte trouvé avec cet identifiant.' };
+  }
+
+  // Téléphone STRICT (comportement inchangé).
+  const { data, error } = await supabaseAdmin.rpc('resolve_user_id_by_phone_strict', { p_phone: raw });
   if (error) {
     if (/PHONE_AMBIGUOUS/i.test(error.message)) return { error: 'Numéro ambigu — demandez au client de contacter le support.' };
     return { error: 'Vérification du numéro impossible.' };
   }
   if (!data) return { error: 'Numéro introuvable ou ambigu — vérifiez le numéro ou contactez le support.' };
-  const { data: prof } = await supabaseAdmin.from('profiles').select('first_name, last_name').eq('id', data).maybeSingle();
+  return { userId: data as string };
+}
+
+// Résout le client (téléphone OU ID 224) et renvoie nom + téléphone (le téléphone sert aux SMS
+// OTP/preuve : quand l'agent saisit un ID, on ne connaît pas le numéro sans cette résolution).
+async function resolveClient(identifier: string): Promise<{ id: string; name: string; phone: string | null } | { error: string }> {
+  const r = await resolveUserIdByIdentifier(identifier);
+  if ('error' in r) return { error: r.error };
+  const { data: prof } = await supabaseAdmin.from('profiles').select('first_name, last_name, phone').eq('id', r.userId).maybeSingle();
   const name = `${(prof as any)?.first_name || ''} ${(prof as any)?.last_name || ''}`.trim() || 'Client 224';
-  return { id: data as string, name };
+  return { id: r.userId, name, phone: (prof as any)?.phone || null };
 }
 
 // Peut activer un agent cash = PDG (tranché ailleurs) OU agent de GESTION avec la permission.
@@ -114,25 +152,13 @@ function maskPhone(ph?: string | null): string | null {
 async function resolveTargetProfile(identifier: string): Promise<
   { id: string; name: string; role: string | null; avatar_url: string | null; phone_masked: string | null } | { error: string }
 > {
-  const raw = String(identifier || '').trim();
-  if (!raw) return { error: 'ID 224 ou numéro de téléphone requis.' };
-  let userId: string | null = null;
-  // Heuristique : un ID 224 (public_id) n'est pas un numéro → tente public_id si pas purement numérique/+.
-  const looksPhone = /^\+?[\d\s-]{6,}$/.test(raw);
-  if (!looksPhone) {
-    const { data } = await supabaseAdmin.from('profiles').select('id').eq('public_id', raw.toUpperCase()).maybeSingle();
-    if (data) userId = (data as any).id;
-  }
-  if (!userId) {
-    const r = await resolveClient(raw);
-    if ('error' in r) return { error: r.error };
-    userId = r.id;
-  }
+  const r = await resolveUserIdByIdentifier(identifier);
+  if ('error' in r) return { error: r.error };
   const { data: prof } = await supabaseAdmin.from('profiles')
-    .select('first_name, last_name, full_name, role, avatar_url, phone').eq('id', userId).maybeSingle();
+    .select('first_name, last_name, full_name, role, avatar_url, phone').eq('id', r.userId).maybeSingle();
   const p = (prof as any) || {};
   const name = (p.full_name || `${p.first_name || ''} ${p.last_name || ''}`).trim() || 'Utilisateur 224';
-  return { id: userId, name, role: p.role || null, avatar_url: p.avatar_url || null, phone_masked: maskPhone(p.phone) };
+  return { id: r.userId, name, role: p.role || null, avatar_url: p.avatar_url || null, phone_masked: maskPhone(p.phone) };
 }
 
 // Les 2 messages EXACTS d'activation (R2). Envoi push si token FCM, sinon repli SMS.
@@ -271,7 +297,7 @@ router.post('/activate-user', verifyJWT, authRateLimit, async (req: Authenticate
 router.post('/lookup-client', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
-  const r = await resolveClient(String(req.body?.phone || ''));
+  const r = await resolveClient(String(req.body?.identifier ?? req.body?.phone ?? ''));
   if ('error' in r) { res.status(409).json({ success: false, error: r.error }); return; }
   res.json({ success: true, data: { name: r.name } });
 });
@@ -282,7 +308,7 @@ router.post('/deposit', verifyJWT, paymentRateLimit, async (req: AuthenticatedRe
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
   const amount = Number(req.body?.amount);
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide (entier positif)' }); return; }
-  const client = await resolveClient(String(req.body?.phone || ''));
+  const client = await resolveClient(String(req.body?.identifier ?? req.body?.phone ?? ''));
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
 
   const { data, error } = await supabaseAdmin.rpc('agent_cash_deposit', {
@@ -299,16 +325,18 @@ router.post('/deposit', verifyJWT, paymentRateLimit, async (req: AuthenticatedRe
 router.post('/withdrawal/otp', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
-  const phone = String(req.body?.phone || '');
+  const identifier = String(req.body?.identifier ?? req.body?.phone ?? '');
   const amount = Number(req.body?.amount);
-  const client = await resolveClient(phone);
+  const client = await resolveClient(identifier);
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
+  // Le SMS OTP part vers le VRAI numéro du client (pas l'entrée : ça peut être un ID 224).
+  if (!client.phone) { res.status(409).json({ success: false, error: "Ce client n'a pas de numéro pour recevoir un code OTP." }); return; }
 
   // D3 : anti-gaspillage SMS (max N OTP par couple agent↔client par heure).
   const smsErr = await checkSmsLimit(agent.id, client.id);
   if (smsErr) { res.status(429).json({ success: false, error: smsErr }); return; }
 
-  const ok = await issueClientOtp(agent.id, client.id, phone, posInt(amount) ? amount : null);
+  const ok = await issueClientOtp(agent.id, client.id, client.phone, posInt(amount) ? amount : null);
   if (!ok) { res.status(500).json({ success: false, error: 'Envoi OTP impossible' }); return; }
   res.json({ success: true, data: { sent: true, client_name: client.name } });
 });
@@ -320,7 +348,7 @@ router.post('/withdrawal', verifyJWT, paymentRateLimit, async (req: Authenticate
   const amount = Number(req.body?.amount);
   const otp = String(req.body?.otp || '');
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide (entier positif)' }); return; }
-  const client = await resolveClient(String(req.body?.phone || ''));
+  const client = await resolveClient(String(req.body?.identifier ?? req.body?.phone ?? ''));
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
 
   // Vérif OTP : dernier OTP non consommé, non expiré, < 3 tentatives, hash concordant.
@@ -350,10 +378,10 @@ router.post('/withdrawal', verifyJWT, paymentRateLimit, async (req: Authenticate
 router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
-  const phone = String(req.body?.phone || '');
+  const identifier = String(req.body?.identifier ?? req.body?.phone ?? '');
   const amount = Number(req.body?.amount);
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide (entier positif)' }); return; }
-  const client = await resolveClient(phone);
+  const client = await resolveClient(identifier);
   if ('error' in client) { res.status(409).json({ success: false, error: client.error }); return; }
 
   // D3 : garde-fous anti-abus (pending simultanés / cooldown / débit horaire agent).
@@ -378,7 +406,7 @@ router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: Auth
       data: { type: 'agent_cash_withdrawal_request', request_id: (reqRow as any).id, amount, fees: fee },
     });
   } else {
-    await issueClientOtp(agent.id, client.id, phone, amount);   // fallback auto (téléphone simple)
+    await issueClientOtp(agent.id, client.id, client.phone || '', amount);   // fallback auto (vrai numéro du client)
   }
   res.json({ success: true, data: { request_id: (reqRow as any).id, channel, client_name: client.name, amount, fees: fee } });
 });

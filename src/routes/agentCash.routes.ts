@@ -589,9 +589,10 @@ router.get('/me/commissions', verifyJWT, async (req: AuthenticatedRequest, res: 
   const pageSize = 20;
   const from = (page - 1) * pageSize;
 
-  // Legs de commission (versées + pending) — une par opération.
+  // Legs de commission (versées + pending) — une par opération. `currency` = devise réelle du leg
+  // (celle du wallet de l'agent au moment du crédit) — JAMAIS supposée GNF.
   const { data: legs } = await supabaseAdmin.from('agent_cash_ledger')
-    .select('id, parent_tx_id, operation, amount, status, created_at')
+    .select('id, parent_tx_id, operation, amount, currency, status, created_at')
     .eq('agent_id', agent.id).eq('leg', 'agent_commission_credit')
     .order('created_at', { ascending: false })
     .range(from, from + pageSize);   // +1 ligne pour détecter has_more
@@ -599,13 +600,17 @@ router.get('/me/commissions', verifyJWT, async (req: AuthenticatedRequest, res: 
   const hasMore = rows.length > pageSize;
   const pageRows = rows.slice(0, pageSize);
 
-  // Montant de l'OPÉRATION source (agent_cash_operations.amount) par parent_tx_id.
+  // Montant de l'OPÉRATION source (agent_cash_operations.amount, devise CLIENT) par parent_tx_id.
   const parentIds = [...new Set(pageRows.map((r) => r.parent_tx_id).filter(Boolean))];
   const opAmount: Record<string, number> = {};
+  const opCurrency: Record<string, string> = {};   // devise CLIENT (leg client_debit/credit)
   if (parentIds.length) {
     const { data: ops } = await supabaseAdmin.from('agent_cash_operations')
       .select('parent_tx_id, amount').in('parent_tx_id', parentIds);
     (ops || []).forEach((o: any) => { opAmount[o.parent_tx_id] = Number(o.amount || 0); });
+    const { data: clientLegs } = await supabaseAdmin.from('agent_cash_ledger')
+      .select('parent_tx_id, currency').in('parent_tx_id', parentIds).in('leg', ['client_debit', 'client_credit']);
+    (clientLegs || []).forEach((l: any) => { opCurrency[l.parent_tx_id] = l.currency || 'GNF'; });
   }
 
   const items = pageRows.map((r) => ({
@@ -613,13 +618,21 @@ router.get('/me/commissions', verifyJWT, async (req: AuthenticatedRequest, res: 
     created_at: r.created_at,
     type: r.operation,                              // 'deposit' | 'withdrawal'
     operation_amount: opAmount[r.parent_tx_id] ?? 0,
+    operation_currency: opCurrency[r.parent_tx_id] || 'GNF',   // devise CLIENT de l'opération
     commission_amount: Number(r.amount || 0),
+    currency: r.currency || 'GNF',                  // devise réelle du leg (agent) = devise de la commission
     reference: r.parent_tx_id,
     status: r.status === 'pending' ? 'pending' : 'credited',
   }));
 
+  // Devise du wallet opérationnel de l'agent (GNF prioritaire — cf. _acash_agent_wallet) :
+  // c'est SA devise, celle des commissions et des stats. Jamais GNF supposé.
+  const { data: aw } = await supabaseAdmin.from('wallets').select('currency').eq('user_id', agent.user_id);
+  const walletCurs = (aw || []).map((w: any) => String(w.currency || 'GNF'));
+  const agentCurrency = walletCurs.includes('GNF') ? 'GNF' : (walletCurs[0] || 'GNF');
+
   const { data: stats } = await supabaseAdmin.rpc('agent_cash_commission_stats', { p_agent_id: agent.id });
-  res.json({ success: true, data: { stats: stats || { today: 0, month: 0, total: 0 }, items, page, has_more: hasMore } });
+  res.json({ success: true, data: { stats: stats || { today: 0, month: 0, total: 0 }, agent_currency: agentCurrency, items, page, has_more: hasMore } });
 });
 
 // ── SUPERVISION PDG ──────────────────────────────────────────────────────────

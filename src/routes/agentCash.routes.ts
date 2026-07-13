@@ -297,9 +297,10 @@ router.post('/activate-user', verifyJWT, authRateLimit, async (req: Authenticate
 router.post('/lookup-client', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);
   if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
-  const r = await resolveClient(String(req.body?.identifier ?? req.body?.phone ?? ''));
+  // Préview COMPLÈTE (nom + avatar + téléphone masqué + rôle) : l'agent voit QUI est le client.
+  const r = await resolveTargetProfile(String(req.body?.identifier ?? req.body?.phone ?? ''));
   if ('error' in r) { res.status(409).json({ success: false, error: r.error }); return; }
-  res.json({ success: true, data: { name: r.name } });
+  res.json({ success: true, data: { name: r.name, avatar_url: r.avatar_url, phone_masked: r.phone_masked, role: r.role } });
 });
 
 // ── Dépôt cash ───────────────────────────────────────────────────────────────
@@ -390,25 +391,44 @@ router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: Auth
 
   const key = req.body?.idempotency_key || newKey();
   const fee = await computeWithdrawalFee(amount);
-  const channel = (await userHasFcmToken(client.id)) ? 'push' : 'otp';   // bascule AUTO
+  // Avatar de l'agent (lecture seule du profil) → affiché côté client (« qui me demande de l'argent »).
+  const { data: agentProf } = await supabaseAdmin.from('profiles').select('avatar_url').eq('id', agent.user_id).maybeSingle();
+  const agentAvatar = (agentProf as any)?.avatar_url || null;
+  // Canal AUTO : push si token FCM ; sinon OTP si le client a un numéro ; sinon IN-APP seule.
+  const hasFcm = await userHasFcmToken(client.id);
+  const channel = hasFcm ? 'push' : (client.phone ? 'otp' : 'inapp');
 
   const { data: reqRow, error } = await supabaseAdmin.from('agent_cash_requests').insert({
     type: 'withdrawal', agent_id: agent.id, client_user_id: client.id, amount, fees: fee, channel,
     status: 'pending', idempotency_key: key, expires_at: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
   }).select('id').single();
   if (error) { res.status(500).json({ success: false, error: 'Demande impossible' }); return; }
+  const requestId = (reqRow as any).id;
 
+  // IN-APP = SOURCE DE VÉRITÉ : créée SYSTÉMATIQUEMENT, AVANT tout canal best-effort, quel que soit le canal.
+  await createNotification({
+    userId: client.id,
+    title: 'Confirmation de retrait',
+    message: `L'agent ${agent.name} demande un retrait de ${gnf(amount)} — Frais ${gnf(fee)} — Total débité ${gnf(amount + fee)}. Expire dans 3 minutes.`,
+    type: 'agent_cash_withdrawal_request',
+    metadata: { link: `/cash-confirm/${requestId}`, action_url: `/cash-confirm/${requestId}`, request_id: requestId, amount, fees: fee, agent_name: agent.name, agent_avatar_url: agentAvatar },
+  });
+
+  let clientNotice: string | undefined;
   if (channel === 'push') {
     void sendPushToUser(client.id, {
       title: 'Confirmation de retrait',
       message: `L'agent ${agent.name} demande un retrait de ${gnf(amount)} — Frais ${gnf(fee)} — Total débité ${gnf(amount + fee)}.`,
-      actionUrl: `/cash-confirm/${(reqRow as any).id}`,
-      data: { type: 'agent_cash_withdrawal_request', request_id: (reqRow as any).id, amount, fees: fee },
+      actionUrl: `/cash-confirm/${requestId}`,
+      data: { type: 'agent_cash_withdrawal_request', request_id: requestId, amount, fees: fee },
     });
+  } else if (channel === 'otp' && client.phone) {
+    await issueClientOtp(agent.id, client.id, client.phone, amount);   // OTP au VRAI numéro (JAMAIS vide)
   } else {
-    await issueClientOtp(agent.id, client.id, client.phone || '', amount);   // fallback auto (vrai numéro du client)
+    // inapp : ni push ni téléphone → l'in-app suffit ; l'agent invite le client à ouvrir son app.
+    clientNotice = "Ce client n'a ni notifications push ni numéro de téléphone — demandez-lui d'ouvrir son application 224Solutions (cloche ou wallet) pour confirmer.";
   }
-  res.json({ success: true, data: { request_id: (reqRow as any).id, channel, client_name: client.name, amount, fees: fee } });
+  res.json({ success: true, data: { request_id: requestId, channel, client_name: client.name, amount, fees: fee, agent_name: agent.name, agent_avatar_url: agentAvatar, ...(clientNotice ? { client_notice: clientNotice } : {}) } });
 });
 
 // ── FLUX 1 : le CLIENT confirme (PIN wallet) → exécute la RPC EXISTANTE ──
@@ -423,6 +443,7 @@ router.post('/withdrawal/confirm', verifyJWT, paymentRateLimit, async (req: Auth
   if (r.status !== 'pending') { res.status(409).json({ success: false, error: 'Demande déjà traitée ou expirée' }); return; }
   if (new Date(r.expires_at).getTime() < Date.now()) {
     await supabaseAdmin.from('agent_cash_requests').update({ status: 'expired' }).eq('id', requestId);
+    await createNotification({ userId: clientId, title: 'Retrait expiré', message: 'La demande de retrait a expiré (3 min).', type: 'agent_cash_withdrawal_result' });
     res.status(409).json({ success: false, error: 'Demande expirée' }); return;
   }
 
@@ -440,6 +461,7 @@ router.post('/withdrawal/confirm', verifyJWT, paymentRateLimit, async (req: Auth
   if (error) { const e = mapRpcError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
   await supabaseAdmin.from('agent_cash_requests').update({ status: 'executed', parent_tx_id: (data as any)?.parent_tx_id }).eq('id', requestId);
   void postTxSms(clientId, `224Solutions : retrait de ${gnf(r.amount)} confirme.`);
+  await createNotification({ userId: clientId, title: 'Retrait confirmé', message: `Votre retrait de ${gnf(r.amount)} a été confirmé.`, type: 'agent_cash_withdrawal_result' });
   res.json({ success: true, data });
 });
 
@@ -448,6 +470,7 @@ router.post('/withdrawal/reject', verifyJWT, async (req: AuthenticatedRequest, r
   const { error } = await supabaseAdmin.from('agent_cash_requests')
     .update({ status: 'rejected' }).eq('id', String(req.body?.request_id || '')).eq('client_user_id', req.user!.id).eq('status', 'pending');
   if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  await createNotification({ userId: req.user!.id, title: 'Retrait refusé', message: 'Vous avez refusé la demande de retrait.', type: 'agent_cash_withdrawal_result' });
   res.json({ success: true });
 });
 

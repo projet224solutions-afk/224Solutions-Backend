@@ -5,6 +5,7 @@
  * traite les jobs rendered_on='server'. Les jobs 'device' sont finalisés par le client (Chantier B).
  */
 import { Router, Response } from 'express';
+import crypto from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
@@ -18,6 +19,14 @@ const router = Router();
 async function getVendorForUser(userId: string): Promise<{ id: string } | null> {
   const { data } = await supabaseAdmin.from('vendors').select('id').eq('user_id', userId).maybeSingle();
   return (data as any) || null;
+}
+
+/** PDG/admin ? (biblio musicale + quotas). */
+async function isPdg(userId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin.from('pdg_management').select('id').eq('user_id', userId).eq('is_active', true).maybeSingle();
+  if (data) return true;
+  const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
+  return ['pdg', 'admin', 'ceo'].includes((((prof as any)?.role) || '').toLowerCase());
 }
 
 /** Mappe une erreur RPC create_clip_job → {code, message FR}. */
@@ -82,6 +91,83 @@ router.get('/mine', verifyJWT, async (req: AuthenticatedRequest, res: Response):
     .eq('vendor_id', vendor.id).order('created_at', { ascending: false }).limit(50);
   if (error) { res.status(500).json({ success: false, error: 'Liste indisponible' }); return; }
   res.json({ success: true, data: data || [] });
+});
+
+// ══════════ ADMIN PDG (Chantier D) : bibliothèque musicale + quotas ══════════
+
+// GET /api/clips/admin/config — lecture des quotas.
+router.get('/admin/config', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const { data } = await supabaseAdmin.from('clip_config').select('*').eq('id', true).maybeSingle();
+  res.json({ success: true, data });
+});
+
+// PATCH /api/clips/admin/config — met à jour les quotas.
+router.patch('/admin/config', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const b = req.body || {};
+  const upd: Record<string, any> = { updated_at: new Date().toISOString() };
+  if (b.max_clips_per_vendor_per_day != null) upd.max_clips_per_vendor_per_day = Math.max(1, parseInt(b.max_clips_per_vendor_per_day, 10) || 5);
+  if (b.max_clip_duration_s != null) upd.max_clip_duration_s = Math.min(900, Math.max(15, parseInt(b.max_clip_duration_s, 10) || 300));
+  if (b.clip_output_height != null && [480, 720, 1080].includes(Number(b.clip_output_height))) upd.clip_output_height = Number(b.clip_output_height);
+  const { error } = await supabaseAdmin.from('clip_config').update(upd).eq('id', true);
+  if (error) { res.status(500).json({ success: false, error: 'Mise à jour impossible' }); return; }
+  res.json({ success: true, data: { updated: true } });
+});
+
+// GET /api/clips/admin/music — TOUTES les pistes (actives + inactives).
+router.get('/admin/music', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const { data } = await supabaseAdmin.from('clip_music_tracks').select('*').order('created_at', { ascending: false });
+  res.json({ success: true, data: data || [] });
+});
+
+// POST /api/clips/admin/music/upload-url — URL signée PUT pour déposer un fichier musique dans GCS.
+router.post('/admin/music/upload-url', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const sa = loadServiceAccount(); const bucket = getBucketName();
+  if (!sa || !bucket) { res.status(503).json({ success: false, error: 'GCS_NOT_CONFIGURED' }); return; }
+  const ct = String(req.body?.content_type || 'audio/mpeg');
+  const ext = ct.includes('mp4') || ct.includes('m4a') ? 'm4a' : ct.includes('wav') ? 'wav' : 'mp3';
+  const objectPath = `clips-music/${crypto.randomUUID()}.${ext}`;
+  const putUrl = generateSignedUrl(sa, bucket, objectPath, { method: 'PUT', expiresInSeconds: 600 });
+  res.json({ success: true, data: { put_url: putUrl, content_type: ct, public_url: `https://${bucket}.storage.googleapis.com/${objectPath}` } });
+});
+
+// POST /api/clips/admin/music — crée une piste (après upload : url publique fournie).
+router.post('/admin/music', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const b = req.body || {};
+  if (!b.title || !b.url) { res.status(400).json({ success: false, error: 'Titre et URL requis' }); return; }
+  const mood = ['énergique', 'chill', 'afro', 'premium'].includes(b.mood) ? b.mood : 'premium';
+  const { data, error } = await supabaseAdmin.from('clip_music_tracks').insert({
+    title: String(b.title).slice(0, 120), mood, url: String(b.url),
+    duration_s: parseInt(b.duration_s, 10) || 0, license_note: b.license_note || null, is_active: b.is_active !== false,
+  }).select('id').maybeSingle();
+  if (error) { res.status(500).json({ success: false, error: 'Création impossible' }); return; }
+  res.json({ success: true, data });
+});
+
+// PATCH /api/clips/admin/music/:id — activer/désactiver / éditer.
+router.patch('/admin/music/:id', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const b = req.body || {};
+  const upd: Record<string, any> = {};
+  if (b.is_active != null) upd.is_active = !!b.is_active;
+  if (b.title) upd.title = String(b.title).slice(0, 120);
+  if (['énergique', 'chill', 'afro', 'premium'].includes(b.mood)) upd.mood = b.mood;
+  if (b.license_note !== undefined) upd.license_note = b.license_note;
+  const { error } = await supabaseAdmin.from('clip_music_tracks').update(upd).eq('id', req.params.id);
+  if (error) { res.status(500).json({ success: false, error: 'Mise à jour impossible' }); return; }
+  res.json({ success: true, data: { updated: true } });
+});
+
+// DELETE /api/clips/admin/music/:id
+router.delete('/admin/music/:id', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const { error } = await supabaseAdmin.from('clip_music_tracks').delete().eq('id', req.params.id);
+  if (error) { res.status(500).json({ success: false, error: 'Suppression impossible' }); return; }
+  res.json({ success: true, data: { deleted: true } });
 });
 
 // ── POST /api/clips : créer un job (validation + quota via RPC) ──

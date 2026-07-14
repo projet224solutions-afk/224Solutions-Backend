@@ -192,6 +192,49 @@ router.post('/', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res
   res.json({ success: true, data: { id: data } });
 });
 
+// ── POST /api/clips/device/init : job 'device' + URLs signées d'upload (rendu sur le téléphone) ──
+router.post('/device/init', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const vendor = await getVendorForUser(req.user!.id);
+  if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
+  const b = req.body || {};
+  const idem = String(req.headers['idempotency-key'] || b.idempotency_key || '') || null;
+  const { data: id, error } = await supabaseAdmin.rpc('create_clip_job', {
+    p_vendor_id: vendor.id, p_stream_id: b.stream_id, p_title: b.title ?? null,
+    p_segments: b.segments ?? [], p_overlay: b.overlay ?? {}, p_music_track_id: b.music_track_id ?? null,
+    p_cover_time_s: b.cover_time_s ?? null, p_rendered_on: 'device', p_idempotency_key: idem,
+  });
+  if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  const sa = loadServiceAccount(); const bucket = getBucketName();
+  if (!sa || !bucket) { res.status(503).json({ success: false, error: 'GCS_NOT_CONFIGURED' }); return; }
+  const base = `clips/${vendor.id}/${id}`;
+  const put = (p: string) => generateSignedUrl(sa, bucket, p, { method: 'PUT', expiresInSeconds: 900 });
+  res.json({ success: true, data: {
+    id,
+    put_landscape: put(`${base}/paysage.mp4`),
+    put_cover: put(`${base}/cover.jpg`),
+  } });
+});
+
+// ── POST /api/clips/device/:id/complete : le téléphone a rendu+uploadé → passe en 'ready' ──
+router.post('/device/:id/complete', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const vendor = await getVendorForUser(req.user!.id);
+  if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
+  const { data: clip } = await supabaseAdmin.from('live_clips').select('id, rendered_on').eq('id', req.params.id).eq('vendor_id', vendor.id).maybeSingle();
+  if (!clip) { res.status(404).json({ success: false, error: 'Clip introuvable' }); return; }
+  if ((clip as any).rendered_on !== 'device') { res.status(400).json({ success: false, error: 'Pas un clip appareil' }); return; }
+  const bucket = getBucketName();
+  const base = `clips/${vendor.id}/${req.params.id}`;
+  const land = `https://${bucket}.storage.googleapis.com/${base}/paysage.mp4`;
+  const cover = `https://${bucket}.storage.googleapis.com/${base}/cover.jpg`;
+  const { error } = await supabaseAdmin.from('live_clips').update({
+    status: 'ready', progress: 100,
+    output_url: land, output_vertical_url: land, thumbnail_url: req.body?.has_cover ? cover : null,
+    duration_s: Number(req.body?.duration_s) || null, size_bytes: Number(req.body?.size_bytes) || null, error: null,
+  }).eq('id', req.params.id).eq('vendor_id', vendor.id);
+  if (error) { res.status(500).json({ success: false, error: 'Finalisation impossible' }); return; }
+  res.json({ success: true, data: { ready: true } });
+});
+
 // ── GET /api/clips/:id : détail + progress ──
 router.get('/:id', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const vendor = await getVendorForUser(req.user!.id);

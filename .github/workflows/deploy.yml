@@ -75,11 +75,16 @@ jobs:
           sed -i '/^GIT_BRANCH=/d' .env; echo "GIT_BRANCH=main" >> .env
           if [ -n "${GIT_BUILD_TIME}" ]; then sed -i '/^BUILD_TIME=/d' .env; echo "BUILD_TIME=${GIT_BUILD_TIME}" >> .env; fi
           npm install --no-audit --no-fund
-          # Redemarrage : relit le .env via dotenv au boot. Mono-instance = l'API porte AUSSI les
-          # jobs (RUN_BACKGROUND_JOBS) ; si un process worker PM2 dedie existe, il est relance aussi.
-          pm2 restart 224-backend --update-env
+          # Redemarrage ROBUSTE (14 juil 2026) : un simple 'pm2 restart' NE RÉCUPÈRE PAS un
+          # process zombie/crash-loop (incident : 621 restarts, ancien code servi → prod bloquée).
+          # On recrée le process proprement via 'npm start' (npx tsx src/server.ts). Idempotent.
+          pm2 delete 224-backend >/dev/null 2>&1 || true
+          pm2 start npm --name 224-backend -- start
           pm2 describe 224-worker >/dev/null 2>&1 && pm2 restart 224-worker --update-env || true
           pm2 save
+          # Preuve immédiate : /api/version doit répondre le SHA fraîchement déployé.
+          sleep 8
+          curl -s -m 8 http://localhost:3001/api/version || echo "WARN: /api/version muet après deploy"
           echo DEPLOY_OK
           REMOTE
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" 'bash -s' < /tmp/remote_deploy.sh

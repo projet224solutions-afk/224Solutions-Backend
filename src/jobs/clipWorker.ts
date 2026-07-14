@@ -213,3 +213,29 @@ export async function runClipWatchdog(): Promise<void> {
   if (error) { logger.error(`[clips] watchdog: ${error.message}`); return; }
   if (data && Number(data) > 0) logger.warn(`[clips] watchdog: ${data} job(s) zombie → failed`);
 }
+
+/**
+ * A4 — miniatures des REPLAYS (fix de l'aperçu OG des lives). Couvre les nouveaux replays ET le
+ * backfill des anciens : frame à 25 % de la durée (ffmpeg en lecture HTTP directe du GCS public,
+ * pas de download complet) → JPEG → upload GCS → thumbnail_url. Traite un petit lot par tick.
+ */
+export async function processReplayThumbnails(): Promise<void> {
+  const { data } = await supabaseAdmin.from('live_streams')
+    .select('id, replay_url').not('replay_url', 'is', null).is('thumbnail_url', null).limit(5);
+  const rows = (data as any[]) || [];
+  if (!rows.length) return;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'replaythumb-'));
+  try {
+    for (const r of rows) {
+      try {
+        let t = 1;
+        try { const meta = await ffprobeJson(r.replay_url); const d = Number(meta?.format?.duration || 0); if (d > 0) t = d * 0.25; } catch { /* durée inconnue → 1 s */ }
+        const out = path.join(dir, `${r.id}.jpg`);
+        await ff(['-ss', String(t), '-i', r.replay_url, '-frames:v', '1', '-vf', 'scale=1280:-1', '-q:v', '4', out], 120000);
+        const url = await uploadGcs(out, `live-thumbnails/${r.id}.jpg`, 'image/jpeg');
+        await supabaseAdmin.from('live_streams').update({ thumbnail_url: url }).eq('id', r.id);
+        logger.info(`[replay-thumb] ${r.id} ok`);
+      } catch (e: any) { logger.error(`[replay-thumb] ${r.id}: ${String(e?.message || e).slice(0, 200)}`); }
+    }
+  } finally { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}

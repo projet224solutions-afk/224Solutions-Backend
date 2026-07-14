@@ -18,7 +18,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
-import { processQueuedClips, runClipWatchdog } from './clipWorker.js';
+import { processQueuedClips, runClipWatchdog, processReplayThumbnails } from './clipWorker.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
@@ -197,6 +197,7 @@ registerHandler('idempotency.cleanup', async () => {
 // 🎬 Studio Clips : worker ffmpeg (jobs serveur) + watchdog anti-zombie.
 registerHandler('clips.process', async () => { await processQueuedClips(); });
 registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
+registerHandler('replays.thumbnails', async () => { await processReplayThumbnails(); });
 
 // Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
 // supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
@@ -1279,6 +1280,8 @@ export const jobQueue = {
       // Studio Clips : traitement des jobs serveur (30 s, concurrence 1) + watchdog anti-zombie (5 min)
       recurringTimers.push(setInterval(() => this.enqueue('clips.process', {}).catch(() => {}), 30 * 1000));
       recurringTimers.push(setInterval(() => this.enqueue('clips.watchdog', {}).catch(() => {}), 5 * 60 * 1000));
+      // A4 : miniatures des replays (nouveaux + backfill) toutes les 2 min.
+      recurringTimers.push(setInterval(() => this.enqueue('replays.thumbnails', {}).catch(() => {}), 2 * 60 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;

@@ -18,6 +18,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { processQueuedClips, runClipWatchdog } from './clipWorker.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
@@ -192,6 +193,10 @@ registerHandler('idempotency.cleanup', async () => {
     .lt('expires_at', cutoff);
   logger.info(`Idempotency cleanup: deleted ${count || 0} expired keys`);
 });
+
+// 🎬 Studio Clips : worker ffmpeg (jobs serveur) + watchdog anti-zombie.
+registerHandler('clips.process', async () => { await processQueuedClips(); });
+registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
 
 // Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
 // supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
@@ -1271,6 +1276,9 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('stripe.reconcile-pending', {}).catch(() => {}), 10 * 60 * 1000));
       // Taxi : filet anti-attente infinie des courses sans chauffeur (toutes les 60 s)
       recurringTimers.push(setInterval(() => this.enqueue('taxi.reassign-stale-requests', {}).catch(() => {}), 60 * 1000));
+      // Studio Clips : traitement des jobs serveur (30 s, concurrence 1) + watchdog anti-zombie (5 min)
+      recurringTimers.push(setInterval(() => this.enqueue('clips.process', {}).catch(() => {}), 30 * 1000));
+      recurringTimers.push(setInterval(() => this.enqueue('clips.watchdog', {}).catch(() => {}), 5 * 60 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;

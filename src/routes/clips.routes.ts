@@ -11,7 +11,7 @@ import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { authRateLimit } from '../middlewares/routeRateLimiter.js';
-import { loadServiceAccount, getBucketName, generateSignedUrl } from '../services/gcs.service.js';
+import { CLIP_BUCKET } from '../jobs/clipWorker.js';
 
 const router = Router();
 
@@ -42,35 +42,21 @@ function mapClipError(msg: string): { code: number; error: string } {
   return { code: 500, error: "Création du clip impossible." };
 }
 
-/** Extrait le chemin objet GCS d'une URL publique (https://<bucket>.storage.googleapis.com/<path>). */
-function gcsObjectPath(url: string, bucket: string): string | null {
+/** Extrait le chemin objet Supabase d'une URL publique (.../object/public/<bucket>/<path>). */
+function storagePath(url: string): string | null {
   try {
-    const u = new URL(url);
-    if (!u.hostname.includes(`${bucket}.storage.googleapis.com`) && !u.pathname.startsWith(`/${bucket}/`)) {
-      // Autre forme : storage.googleapis.com/<bucket>/<path>
-      if (u.pathname.startsWith(`/${bucket}/`)) return decodeURIComponent(u.pathname.slice(bucket.length + 2));
-    }
-    if (u.hostname.startsWith(`${bucket}.`)) return decodeURIComponent(u.pathname.replace(/^\//, ''));
-    if (u.pathname.startsWith(`/${bucket}/`)) return decodeURIComponent(u.pathname.slice(bucket.length + 2));
-    return null;
+    const marker = `/object/public/${CLIP_BUCKET}/`;
+    const i = url.indexOf(marker);
+    return i >= 0 ? decodeURIComponent(url.slice(i + marker.length).split('?')[0]) : null;
   } catch { return null; }
 }
 
-/** Supprime best-effort les fichiers GCS d'un clip (via URL signée DELETE). */
+/** Supprime best-effort les fichiers Supabase Storage d'un clip. */
 async function deleteClipFiles(urls: (string | null | undefined)[]): Promise<void> {
-  const sa = loadServiceAccount();
-  const bucket = getBucketName();
-  if (!sa || !bucket) return;
-  for (const url of urls) {
-    if (!url) continue;
-    const path = gcsObjectPath(url, bucket);
-    if (!path) continue;
-    try {
-      const signed = generateSignedUrl(sa, bucket, path, { method: 'DELETE', expiresInSeconds: 120 });
-      const resp = await fetch(signed, { method: 'DELETE' });
-      if (!(resp.ok || resp.status === 404)) logger.error(`[clips] delete GCS ${path}: HTTP ${resp.status}`);
-    } catch (e: any) { logger.error(`[clips] delete GCS ${path}: ${e?.message}`); }
-  }
+  const paths = urls.map((u) => (u ? storagePath(u) : null)).filter(Boolean) as string[];
+  if (!paths.length) return;
+  const { error } = await supabaseAdmin.storage.from(CLIP_BUCKET).remove(paths);
+  if (error) logger.error(`[clips] delete storage: ${error.message}`);
 }
 
 // ── GET /api/clips/music : bibliothèque active (AVANT /:id) ──
@@ -125,13 +111,13 @@ router.get('/admin/music', verifyJWT, async (req: AuthenticatedRequest, res: Res
 // POST /api/clips/admin/music/upload-url — URL signée PUT pour déposer un fichier musique dans GCS.
 router.post('/admin/music/upload-url', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
-  const sa = loadServiceAccount(); const bucket = getBucketName();
-  if (!sa || !bucket) { res.status(503).json({ success: false, error: 'GCS_NOT_CONFIGURED' }); return; }
   const ct = String(req.body?.content_type || 'audio/mpeg');
   const ext = ct.includes('mp4') || ct.includes('m4a') ? 'm4a' : ct.includes('wav') ? 'wav' : 'mp3';
   const objectPath = `clips-music/${crypto.randomUUID()}.${ext}`;
-  const putUrl = generateSignedUrl(sa, bucket, objectPath, { method: 'PUT', expiresInSeconds: 600 });
-  res.json({ success: true, data: { put_url: putUrl, content_type: ct, public_url: `https://${bucket}.storage.googleapis.com/${objectPath}` } });
+  const { data: signed, error: sErr } = await supabaseAdmin.storage.from(CLIP_BUCKET).createSignedUploadUrl(objectPath);
+  if (sErr || !signed) { res.status(500).json({ success: false, error: 'URL indisponible' }); return; }
+  const publicUrl = supabaseAdmin.storage.from(CLIP_BUCKET).getPublicUrl(objectPath).data.publicUrl;
+  res.json({ success: true, data: { path: objectPath, token: signed.token, content_type: ct, public_url: publicUrl } });
 });
 
 // POST /api/clips/admin/music — crée une piste (après upload : url publique fournie).
@@ -204,14 +190,16 @@ router.post('/device/init', verifyJWT, authRateLimit, async (req: AuthenticatedR
     p_cover_time_s: b.cover_time_s ?? null, p_rendered_on: 'device', p_idempotency_key: idem,
   });
   if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
-  const sa = loadServiceAccount(); const bucket = getBucketName();
-  if (!sa || !bucket) { res.status(503).json({ success: false, error: 'GCS_NOT_CONFIGURED' }); return; }
   const base = `clips/${vendor.id}/${id}`;
-  const put = (p: string) => generateSignedUrl(sa, bucket, p, { method: 'PUT', expiresInSeconds: 900 });
+  const [land, cover] = await Promise.all([
+    supabaseAdmin.storage.from(CLIP_BUCKET).createSignedUploadUrl(`${base}/paysage.mp4`),
+    supabaseAdmin.storage.from(CLIP_BUCKET).createSignedUploadUrl(`${base}/cover.jpg`),
+  ]);
+  if (land.error || cover.error || !land.data || !cover.data) { res.status(500).json({ success: false, error: 'URLs indisponibles' }); return; }
   res.json({ success: true, data: {
     id,
-    put_landscape: put(`${base}/paysage.mp4`),
-    put_cover: put(`${base}/cover.jpg`),
+    landscape: { path: `${base}/paysage.mp4`, token: land.data.token },
+    cover: { path: `${base}/cover.jpg`, token: cover.data.token },
   } });
 });
 
@@ -222,10 +210,9 @@ router.post('/device/:id/complete', verifyJWT, async (req: AuthenticatedRequest,
   const { data: clip } = await supabaseAdmin.from('live_clips').select('id, rendered_on').eq('id', req.params.id).eq('vendor_id', vendor.id).maybeSingle();
   if (!clip) { res.status(404).json({ success: false, error: 'Clip introuvable' }); return; }
   if ((clip as any).rendered_on !== 'device') { res.status(400).json({ success: false, error: 'Pas un clip appareil' }); return; }
-  const bucket = getBucketName();
   const base = `clips/${vendor.id}/${req.params.id}`;
-  const land = `https://${bucket}.storage.googleapis.com/${base}/paysage.mp4`;
-  const cover = `https://${bucket}.storage.googleapis.com/${base}/cover.jpg`;
+  const land = supabaseAdmin.storage.from(CLIP_BUCKET).getPublicUrl(`${base}/paysage.mp4`).data.publicUrl;
+  const cover = supabaseAdmin.storage.from(CLIP_BUCKET).getPublicUrl(`${base}/cover.jpg`).data.publicUrl;
   const { error } = await supabaseAdmin.from('live_clips').update({
     status: 'ready', progress: 100,
     output_url: land, output_vertical_url: land, thumbnail_url: req.body?.has_cover ? cover : null,

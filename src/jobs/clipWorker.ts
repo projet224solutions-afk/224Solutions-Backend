@@ -13,9 +13,10 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { loadServiceAccount, getBucketName, generateSignedUrl } from '../services/gcs.service.js';
 
 const pexec = promisify(execFile);
+// Les clips vivent sur Supabase Storage (comme les replays/images) → public + CORS garantis.
+export const CLIP_BUCKET = 'communication-files';
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 const BLUE = '0x04439E';
 
@@ -46,16 +47,12 @@ async function download(url: string, dest: string): Promise<void> {
   await fs.writeFile(dest, buf);
 }
 
-/** Upload d'un fichier local vers GCS (URL signée PUT) → URL publique. */
-async function uploadGcs(localPath: string, objectPath: string, contentType: string): Promise<string> {
-  const sa = loadServiceAccount();
-  const bucket = getBucketName();
-  if (!sa || !bucket) throw new Error('GCS non configuré');
-  const signed = generateSignedUrl(sa, bucket, objectPath, { method: 'PUT', expiresInSeconds: 600 });
+/** Upload d'un fichier local vers Supabase Storage → URL publique. */
+async function uploadClipFile(localPath: string, objectPath: string, contentType: string): Promise<string> {
   const body = await fs.readFile(localPath);
-  const resp = await fetch(signed, { method: 'PUT', headers: { 'content-type': contentType }, body });
-  if (!resp.ok) throw new Error(`GCS upload ${resp.status}`);
-  return `https://${bucket}.storage.googleapis.com/${objectPath}`;
+  const { error } = await supabaseAdmin.storage.from(CLIP_BUCKET).upload(objectPath, body, { contentType, upsert: true });
+  if (error) throw new Error(`upload ${error.message}`);
+  return supabaseAdmin.storage.from(CLIP_BUCKET).getPublicUrl(objectPath).data.publicUrl;
 }
 
 interface ClipRow {
@@ -172,9 +169,9 @@ async function processClip(clip: ClipRow): Promise<void> {
 
     // 7) Upload des 3 fichiers.
     const base = `clips/${clip.vendor_id}/${clip.id}`;
-    const outputUrl = await uploadGcs(body, `${base}/paysage.mp4`, 'video/mp4');
-    const verticalUrl = await uploadGcs(vertical, `${base}/vertical.mp4`, 'video/mp4');
-    const thumbUrl = await uploadGcs(cover, `${base}/cover.jpg`, 'image/jpeg');
+    const outputUrl = await uploadClipFile(body, `${base}/paysage.mp4`, 'video/mp4');
+    const verticalUrl = await uploadClipFile(vertical, `${base}/vertical.mp4`, 'video/mp4');
+    const thumbUrl = await uploadClipFile(cover, `${base}/cover.jpg`, 'image/jpeg');
 
     const outMeta = await ffprobeJson(body);
     const stat = await fs.stat(body);
@@ -232,7 +229,7 @@ export async function processReplayThumbnails(): Promise<void> {
         try { const meta = await ffprobeJson(r.replay_url); const d = Number(meta?.format?.duration || 0); if (d > 0) t = d * 0.25; } catch { /* durée inconnue → 1 s */ }
         const out = path.join(dir, `${r.id}.jpg`);
         await ff(['-ss', String(t), '-i', r.replay_url, '-frames:v', '1', '-vf', 'scale=1280:-1', '-q:v', '4', out], 120000);
-        const url = await uploadGcs(out, `live-thumbnails/${r.id}.jpg`, 'image/jpeg');
+        const url = await uploadClipFile(out, `live-thumbnails/${r.id}.jpg`, 'image/jpeg');
         await supabaseAdmin.from('live_streams').update({ thumbnail_url: url }).eq('id', r.id);
         logger.info(`[replay-thumb] ${r.id} ok`);
       } catch (e: any) { logger.error(`[replay-thumb] ${r.id}: ${String(e?.message || e).slice(0, 200)}`); }

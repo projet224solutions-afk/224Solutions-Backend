@@ -22,7 +22,8 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { AFRICAN_BANK_SOURCE_URLS, isAfricanBankSourceUrl } from '../constants/africanBankSources.js';
-import { creditWallet, debitWallet, transferBetweenWallets } from '../services/wallet.service.js';
+import { creditWallet, debitWallet, transferBetweenWallets, selectSenderWallet, selectReceiverWallet } from '../services/wallet.service.js';
+import { isFxRateFresh } from '../services/fxFreshness.js';
 import { createNotification } from '../services/notification.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
 import { changeWalletPin, ensureWalletExistsForPin, getWalletPinPolicy, getWalletPinState, resetWalletPinWithPassword, setupWalletPin, verifyWalletPin } from '../services/walletPin.service.js';
@@ -251,6 +252,29 @@ async function getInternalFxRateFromTable(from: string, to: string): Promise<{ r
  * `system_settings.transfer_fee_percent` (en POURCENTAGE), puis 5%. AUCUN cache : la valeur est relue
  * à chaque preview/transfert → toute modif PDG s'applique IMMÉDIATEMENT.
  */
+/**
+ * GARDE DE FRAÎCHEUR DES TAUX FX (faille 3). Un transfert international ne s'exécute JAMAIS sur un
+ * taux périmé (données de collecte figées) : au-delà de `fx_rate_max_age_hours` (pdg_settings,
+ * repli 48 h — les taux BCRG sont rafraîchis pluri-quotidiennement), on REFUSE explicitement.
+ * Recommandation d'évolution : unifier à terme la conversion sur les RPC `fx_quote` / `fx_convert`.
+ */
+const DEFAULT_FX_MAX_AGE_HOURS = 48;
+async function getFxMaxAgeHours(): Promise<number> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings')
+      .select('setting_value')
+      .eq('setting_key', 'fx_rate_max_age_hours')
+      .maybeSingle();
+    const raw = (data?.setting_value as any)?.value ?? data?.setting_value;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {
+    // repli défaut ci-dessous
+  }
+  return DEFAULT_FX_MAX_AGE_HOURS;
+}
+
 const DEFAULT_FX_COMMISSION = 0.05;
 async function getFxCommissionRate(): Promise<number> {
   // 1) Source PDG officielle : margin_config.default_margin (PDGFinance — déjà une FRACTION).
@@ -736,44 +760,26 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
       return;
     }
 
-    const [{ data: senderWallet, error: senderWalletError }, { data: receiverWallet, error: receiverWalletError }] = await Promise.all([
-      supabaseAdmin
-        .from('wallets')
-        .select('id, balance, currency, user_id')
-        .eq('user_id', senderId)
-        .maybeSingle(),
-      supabaseAdmin
-        .from('wallets')
-        .select('id, balance, currency, user_id')
-        .eq('user_id', resolved.userId)
-        .maybeSingle(),
-    ]);
-
-    if (senderWalletError || !senderWallet) {
-      res.status(404).json({ success: false, error: 'Wallet expéditeur introuvable' });
+    // SÉLECTION CONSCIENTE DE LA DEVISE (faille 1) — le preview vise EXACTEMENT les mêmes wallets
+    // que l'exécution (mêmes helpers) : expéditeur = wallet primaire (GNF prioritaire), destinataire
+    // = wallet de la devise expéditeur si possible sinon primaire/création auto.
+    const senderSel = await selectSenderWallet(senderId);
+    if (senderSel.error || !senderSel.wallet) {
+      res.status(404).json({ success: false, error: senderSel.error || 'Wallet expéditeur introuvable' });
       return;
     }
+    const senderWallet = senderSel.wallet;
+    const senderCurrency = String(senderWallet.currency || 'GNF').toUpperCase();
 
-    let recipientWallet = receiverWallet;
-    if (receiverWalletError || !recipientWallet) {
-      const { data: createdWallet, error: createWalletError } = await supabaseAdmin
-        .from('wallets')
-        .insert({ user_id: resolved.userId })
-        .select('id, balance, currency, user_id')
-        .single();
-
-      if (createWalletError || !createdWallet) {
-        res.status(404).json({ success: false, error: 'Wallet destinataire introuvable' });
-        return;
-      }
-
-      recipientWallet = createdWallet as any;
+    const receiverSel = await selectReceiverWallet(resolved.userId, senderCurrency);
+    if (receiverSel.error || !receiverSel.wallet) {
+      res.status(404).json({ success: false, error: receiverSel.error || 'Wallet destinataire introuvable' });
+      return;
     }
-
-    const senderCurrency = String((senderWallet as any).currency || 'GNF').toUpperCase();
-    const receiverCurrency = String((recipientWallet as any).currency || senderCurrency).toUpperCase();
+    const recipientWallet = receiverSel.wallet;
+    const receiverCurrency = String(recipientWallet.currency || senderCurrency).toUpperCase();
     const isInternational = senderCurrency !== receiverCurrency;
-    const senderBalance = Number((senderWallet as any).balance || 0);
+    const senderBalance = Number(senderWallet.balance || 0);
 
     // COMMISSION FX : prélevée EN PLUS sur l'expéditeur uniquement pour les transferts
     // internationaux (cross-devise). Le destinataire reçoit au TAUX NET du jour.
@@ -800,6 +806,16 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
 
     if (isInternational) {
       const fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      // GARDE DE FRAÎCHEUR (faille 3) : un taux périmé ne doit pas servir de base à un aperçu chiffré.
+      const maxAge = await getFxMaxAgeHours();
+      if (!isFxRateFresh(fxResult.fetchedAt, maxAge)) {
+        res.status(503).json({
+          success: false,
+          error: 'Taux de change momentanément indisponible (données périmées). Réessayez plus tard.',
+          error_code: 'FX_RATE_STALE',
+        });
+        return;
+      }
       rateDisplayed = fxResult.rate; // TAUX NET du jour
       rateSource = fxResult.source;
       rateFetchedAt = fxResult.fetchedAt;
@@ -1349,52 +1365,46 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     }
 
     // Vérifier que le destinataire existe
-    let { data: recipient } = await supabaseAdmin
-      .from('wallets')
-      .select('user_id')
-      .eq('user_id', resolvedRecipientId)
-      .maybeSingle();
-
-    if (!recipient) {
-      // Auto-initialiser le wallet destinataire pour éviter les échecs sur comptes PDG/agent nouvellement créés
-      const { error: initError } = await supabaseAdmin
-        .from('wallets')
-        .insert({ user_id: resolvedRecipientId })
-        .select('user_id')
-        .single();
-
-      if (initError) {
-        res.status(404).json({ success: false, error: 'Wallet destinataire introuvable' });
-        return;
-      }
-
-      recipient = { user_id: resolvedRecipientId } as any;
+    // SÉLECTION CONSCIENTE DE LA DEVISE (faille 1) — les wallets EXACTS résolus ici sont passés au
+    // service (ids), qui débitera/créditera CES wallets précis. Le preview utilise les MÊMES helpers
+    // → il vise les mêmes wallets. selectReceiverWallet auto-crée le wallet destinataire si absent
+    // (même règle produit que le dépôt agent).
+    const senderSel = await selectSenderWallet(senderId);
+    if (senderSel.error || !senderSel.wallet) {
+      res.status(404).json({ success: false, error: senderSel.error || 'Wallet expéditeur introuvable' });
+      return;
     }
+    const senderWallet = senderSel.wallet;
+    const senderCurrency = String(senderWallet.currency || 'GNF').toUpperCase();
 
-    const [{ data: senderWallet }, { data: recipientWallet }] = await Promise.all([
-      supabaseAdmin
-        .from('wallets')
-        .select('currency')
-        .eq('user_id', senderId)
-        .maybeSingle(),
-      supabaseAdmin
-        .from('wallets')
-        .select('currency')
-        .eq('user_id', resolvedRecipientId)
-        .maybeSingle(),
-    ]);
-
-    const senderCurrency = String(senderWallet?.currency || 'GNF').toUpperCase();
-    const receiverCurrency = String(recipientWallet?.currency || senderCurrency).toUpperCase();
+    const receiverSel = await selectReceiverWallet(resolvedRecipientId, senderCurrency);
+    if (receiverSel.error || !receiverSel.wallet) {
+      res.status(404).json({ success: false, error: receiverSel.error || 'Wallet destinataire introuvable' });
+      return;
+    }
+    const recipientWallet = receiverSel.wallet;
+    const receiverCurrency = String(recipientWallet.currency || senderCurrency).toUpperCase();
     const isInternational = senderCurrency !== receiverCurrency;
     let rateUsed = 1;
     let rateSource = 'identity';
+    let rateFetchedAt: string | undefined;
     let amountToCredit = amount;
 
     if (isInternational) {
       const fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      // GARDE DE FRAÎCHEUR (faille 3) : jamais d'exécution sur un taux périmé (fail-closed).
+      const maxAge = await getFxMaxAgeHours();
+      if (!isFxRateFresh(fxResult.fetchedAt, maxAge)) {
+        res.status(503).json({
+          success: false,
+          error: 'Taux de change momentanément indisponible (données périmées). Réessayez plus tard.',
+          error_code: 'FX_RATE_STALE',
+        });
+        return;
+      }
       rateUsed = fxResult.rate; // TAUX NET du jour
       rateSource = fxResult.source;
+      rateFetchedAt = fxResult.fetchedAt;
 
       // GARDE ANTI-DÉRIVE DE TAUX : si le taux BCRG a bougé de plus de 2% depuis le preview
       // (expected_rate envoyé par le front), on REJETTE → l'utilisateur ne valide jamais un
@@ -1473,7 +1483,11 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         isInternational,
         rateUsed,
         rateSource,
+        rateFetchedAt,
         feeAmount,
+        // Wallets EXACTS (conscients de la devise) → le service opère sur CES lignes précises.
+        senderWalletId: senderWallet.id,
+        receiverWalletId: recipientWallet.id,
       },
     );
 

@@ -27,8 +27,90 @@ type TransferExecutionOptions = {
   isInternational?: boolean;
   rateUsed?: number;
   rateSource?: string;
+  rateFetchedAt?: string;
   feeAmount?: number;
+  // Wallets EXACTS résolus (conscients de la devise) par la route — le preview ET l'exécution
+  // visent ainsi les MÊMES wallets. À défaut, le service re-sélectionne par devise (helpers ci-dessous).
+  senderWalletId?: string;
+  receiverWalletId?: string;
 };
+
+export type WalletRow = { id: string; balance: number; currency: string; is_blocked?: boolean };
+
+const normCur = (c: unknown): string => String(c || '').toUpperCase();
+
+/**
+ * Règle produit multi-wallets (alignée sur l'agent-cash `_acash_agent_wallet`, « GNF prioritaire ») :
+ * pour un utilisateur à plusieurs wallets, le wallet « primaire » = le GNF s'il existe, sinon le plus
+ * petit id (déterministe/stable). JAMAIS un choix dépendant de l'ordre DB ou aléatoire.
+ */
+function pickPrimaryWallet(wallets: WalletRow[]): WalletRow {
+  const gnf = wallets.find((w) => normCur(w.currency) === 'GNF');
+  if (gnf) return gnf;
+  return [...wallets].sort((a, b) => String(a.id).localeCompare(String(b.id)))[0];
+}
+
+/**
+ * Sélectionne le wallet EXPÉDITEUR de façon CONSCIENTE DE LA DEVISE.
+ *  - `requestedCurrency` fourni → exige un wallet de CETTE devise, sinon erreur claire
+ *    (« Vous n'avez pas de wallet {devise} ») — JAMAIS un autre wallet silencieux.
+ *  - sinon → wallet primaire (GNF prioritaire), déterministe.
+ */
+export async function selectSenderWallet(
+  userId: string,
+  requestedCurrency?: string,
+): Promise<{ wallet?: WalletRow; error?: string; currency?: string }> {
+  const { data, error } = await supabaseAdmin
+    .from('wallets')
+    .select('id, balance, currency, is_blocked')
+    .eq('user_id', userId);
+  if (error) return { error: 'Wallet expéditeur introuvable' };
+  const wallets = (data || []) as WalletRow[];
+  if (!wallets.length) return { error: 'Wallet expéditeur introuvable' };
+  const req = normCur(requestedCurrency);
+  if (req) {
+    const match = wallets.find((w) => normCur(w.currency) === req);
+    if (!match) return { error: `Vous n'avez pas de wallet ${req}` };
+    return { wallet: match, currency: req };
+  }
+  const primary = pickPrimaryWallet(wallets);
+  return { wallet: primary, currency: normCur(primary.currency) };
+}
+
+/**
+ * Sélectionne le wallet DESTINATAIRE. Règle produit :
+ *  - préfère un wallet de la devise EXPÉDITEUR (transfert same-currency → zéro FX pour le receveur) ;
+ *  - sinon wallet primaire (GNF prioritaire) → transfert international avec conversion ;
+ *  - aucun wallet → création AUTO (même règle produit que le dépôt agent : on ne perd jamais un
+ *    transfert faute de wallet). Devise de création = défaut de la table (GNF, base plateforme) —
+ *    comportement historique conservé ; si l'expéditeur envoie une autre devise, le transfert devient
+ *    international (conversion au taux net).
+ */
+export async function selectReceiverWallet(
+  userId: string,
+  senderCurrency: string,
+): Promise<{ wallet?: WalletRow; error?: string }> {
+  const { data, error } = await supabaseAdmin
+    .from('wallets')
+    .select('id, balance, currency, is_blocked')
+    .eq('user_id', userId);
+  if (error) return { error: 'Wallet destinataire introuvable' };
+  const wallets = (data || []) as WalletRow[];
+  const sc = normCur(senderCurrency);
+  if (wallets.length) {
+    const sameCur = wallets.find((w) => normCur(w.currency) === sc);
+    if (sameCur) return { wallet: sameCur };
+    const gnf = wallets.find((w) => normCur(w.currency) === 'GNF');
+    return { wallet: gnf || pickPrimaryWallet(wallets) };
+  }
+  const { data: created, error: createErr } = await supabaseAdmin
+    .from('wallets')
+    .insert({ user_id: userId })
+    .select('id, balance, currency, is_blocked')
+    .single();
+  if (createErr || !created) return { error: 'Wallet destinataire introuvable' };
+  return { wallet: created as WalletRow };
+}
 
 function smartRoundTransferAmount(amount: number, currency: string): number {
   if (!Number.isFinite(amount)) return 0;
@@ -52,6 +134,7 @@ async function persistTransferHistory(params: {
   isInternational: boolean;
   rateUsed: number;
   rateSource: string;
+  rateFetchedAt?: string;
   feeAmount: number;
 }) {
   const {
@@ -69,6 +152,7 @@ async function persistTransferHistory(params: {
     isInternational,
     rateUsed,
     rateSource,
+    rateFetchedAt,
     feeAmount,
   } = params;
 
@@ -83,6 +167,8 @@ async function persistTransferHistory(params: {
     receiver_currency: receiverCurrency,
     rate_used: rateUsed,
     rate_source: rateSource,
+    // Traçabilité FX (faille 3) : source ET fraîcheur du taux au moment de l'exécution.
+    rate_fetched_at: rateFetchedAt || null,
     fee_amount: feeAmount,
   };
 
@@ -457,35 +543,58 @@ export async function transferBetweenWallets(
       return await fail('Transfert bloqué pour activité suspecte');
     }
 
-    // Résilient aux multi-wallets (drift devise) : sélection déterministe (1ʳᵉ ligne) au lieu de
-    // .single() qui LÈVE si plusieurs wallets existent (bloquait le transfert).
-    const { data: senderWallet, error: senderErr } = await supabaseAdmin
-      .from('wallets')
-      .select('id, balance, is_blocked, currency')
-      .eq('user_id', senderId)
-      .order('id', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    if (senderErr || !senderWallet) return await fail('Wallet expéditeur introuvable');
+    // ── SÉLECTION DES WALLETS — CONSCIENTE DE LA DEVISE (faille 1) ──
+    // Priorité : ids résolus par la route (preview & exécution visent les MÊMES wallets).
+    // À défaut (appel direct) : sélection par devise via les helpers (jamais un wallet silencieux
+    // d'une autre devise). On lit le wallet EXACT par son id pour un solde/devise frais et fiables.
+    let senderWallet: WalletRow | null = null;
+    if (options.senderWalletId) {
+      const { data } = await supabaseAdmin
+        .from('wallets')
+        .select('id, balance, currency, is_blocked')
+        .eq('id', options.senderWalletId)
+        .maybeSingle();
+      senderWallet = (data as WalletRow) || null;
+    } else {
+      const sel = await selectSenderWallet(senderId, options.senderCurrency);
+      if (sel.error || !sel.wallet) return await fail(sel.error || 'Wallet expéditeur introuvable');
+      senderWallet = sel.wallet;
+    }
+    if (!senderWallet) return await fail('Wallet expéditeur introuvable');
     if (senderWallet.is_blocked) return await fail('Wallet expéditeur bloqué');
+
+    let receiverWallet: WalletRow | null = null;
+    if (options.receiverWalletId) {
+      const { data } = await supabaseAdmin
+        .from('wallets')
+        .select('id, balance, currency, is_blocked')
+        .eq('id', options.receiverWalletId)
+        .maybeSingle();
+      receiverWallet = (data as WalletRow) || null;
+    } else {
+      const sel = await selectReceiverWallet(receiverId, options.senderCurrency || senderWallet.currency);
+      if (sel.error || !sel.wallet) return await fail(sel.error || 'Wallet destinataire introuvable');
+      receiverWallet = sel.wallet;
+    }
+    if (!receiverWallet) return await fail('Wallet destinataire introuvable');
+
+    // La devise AUTORITAIRE est celle du wallet RÉELLEMENT sélectionné. Garde anti-incohérence :
+    // si la route a calculé le FX pour une autre devise que le wallet visé → on refuse (jamais de
+    // mouvement d'argent sur une hypothèse de devise erronée).
+    const senderCurrency = normCur(senderWallet.currency);
+    const receiverCurrency = normCur(receiverWallet.currency);
+    if (options.senderCurrency && normCur(options.senderCurrency) !== senderCurrency) {
+      return await fail('Incohérence de devise expéditeur — relancez la prévisualisation.');
+    }
+    if (options.receiverCurrency && normCur(options.receiverCurrency) !== receiverCurrency) {
+      return await fail('Incohérence de devise destinataire — relancez la prévisualisation.');
+    }
     if (Number(senderWallet.balance) < amount) return await fail('Solde insuffisant');
 
-    const { data: receiverWallet, error: receiverErr } = await supabaseAdmin
-      .from('wallets')
-      .select('id, balance, currency')
-      .eq('user_id', receiverId)
-      .order('id', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    if (receiverErr || !receiverWallet) return await fail('Wallet destinataire introuvable');
-
-    const senderCurrency = String(options.senderCurrency || senderWallet.currency || 'GNF').toUpperCase();
-    const receiverCurrency = String(options.receiverCurrency || receiverWallet.currency || senderCurrency).toUpperCase();
     const isInternational = Boolean(options.isInternational || senderCurrency !== receiverCurrency);
     const rateUsed = Number(options.rateUsed ?? 1);
     const rateSource = String(options.rateSource || 'identity');
+    const rateFetchedAt = options.rateFetchedAt;
     const feeAmount = Number(options.feeAmount ?? 0);
     const amountToCredit = smartRoundTransferAmount(
       Number(options.amountToCredit ?? amount),
@@ -534,6 +643,7 @@ export async function transferBetweenWallets(
           isInternational,
           rateUsed,
           rateSource,
+          rateFetchedAt,
           feeAmount,
         });
         logger.info(`[Wallet] Transfer via RPC: sender=${senderId}, receiver=${receiverId}, debit=${amount}, credit=${amountToCredit}, ${senderCurrency}->${receiverCurrency}`);
@@ -569,7 +679,7 @@ export async function transferBetweenWallets(
           transactionId: txId, senderId, receiverId,
           senderWalletId: senderWallet.id, receiverWalletId: receiverWallet.id,
           amountSent: amount, amountReceived: amountToCredit, description, idempotencyKey,
-          senderCurrency, receiverCurrency, isInternational, rateUsed, rateSource, feeAmount,
+          senderCurrency, receiverCurrency, isInternational, rateUsed, rateSource, rateFetchedAt, feeAmount,
         });
         logger.info(`[Wallet] Transfer FX via RPC: sender=${senderId}, receiver=${receiverId}, debit=${amount}, credit=${amountToCredit}, ${senderCurrency}->${receiverCurrency}`);
         return { success: true, transactionId: txId };
@@ -580,36 +690,58 @@ export async function transferBetweenWallets(
       return await fail(friendlyTransferError(fxError.message));
     }
 
-    const newSenderBalance = Number(senderWallet.balance) - debitAmount;
-    const newReceiverBalance = Number(receiverWallet.balance) + amountToCredit;
+    // ── REPLI MANUEL (RPC same-currency indisponible pour cause d'INFRA, JAMAIS une règle métier) ──
+    // INTERDIT: écrire les wallets par user_id — TOUJOURS par id. Un utilisateur multi-wallets a
+    // plusieurs lignes : écrire par user_id débiterait/écraserait les AUTRES devises (faille 2).
+    // CAS (.eq('balance', before)) des DEUX côtés → toute course concurrente échoue proprement.
+    const newSenderBalance = smartRoundTransferAmount(Number(senderWallet.balance) - debitAmount, senderCurrency);
 
+    // Débit expéditeur : ciblé par id + CAS sur le solde lu. .single() → 0 ligne = course = échec net.
     const { data: debitResult, error: debitErr } = await supabaseAdmin
       .from('wallets')
       .update({ balance: newSenderBalance, updated_at: new Date().toISOString() })
-      .eq('user_id', senderId)
+      .eq('id', senderWallet.id)
       .eq('balance', senderWallet.balance)
-      .select('balance')
+      .select('id, balance')
       .single();
 
     if (debitErr || !debitResult) {
       return await fail('Solde modifié pendant la transaction. Réessayez.');
     }
 
-    const { error: creditErr } = await supabaseAdmin
-      .from('wallets')
-      .update({ balance: newReceiverBalance, updated_at: new Date().toISOString() })
-      .eq('user_id', receiverId);
+    // Crédit destinataire : on relit le solde JUSTE AVANT (le receiverWallet.balance peut dater),
+    // puis CAS PAR ID. Course concurrente (0 ligne mise à jour) → court retry avec solde rafraîchi.
+    let credited = false;
+    for (let attempt = 0; attempt < 3 && !credited; attempt += 1) {
+      const { data: freshRcv } = await supabaseAdmin
+        .from('wallets')
+        .select('balance')
+        .eq('id', receiverWallet.id)
+        .maybeSingle();
+      if (!freshRcv) break;
+      const before = Number((freshRcv as { balance: number }).balance);
+      const after = smartRoundTransferAmount(before + amountToCredit, receiverCurrency);
+      const { data: creditRows, error: creditErr } = await supabaseAdmin
+        .from('wallets')
+        .update({ balance: after, updated_at: new Date().toISOString() })
+        .eq('id', receiverWallet.id)
+        .eq('balance', before)
+        .select('id');
+      if (!creditErr && Array.isArray(creditRows) && creditRows.length === 1) { credited = true; break; }
+    }
 
-    if (creditErr) {
-      // Compensation VÉRIFIÉE : re-créditer l'expéditeur. Si même le revert échoue →
-      // incohérence critique (argent débité, non crédité, non rendu) → alerte + pas de rejeu aveugle.
-      const { error: revertErr } = await supabaseAdmin
+    if (!credited) {
+      // Crédit impossible → REVERT VÉRIFIÉ du débit, PAR ID + CAS (l'expéditeur n'a pas rebougé).
+      // Si même le revert échoue → incohérence critique (débité, non crédité, non rendu) → alerte.
+      const { data: revertRows, error: revertErr } = await supabaseAdmin
         .from('wallets')
         .update({ balance: senderWallet.balance, updated_at: new Date().toISOString() })
-        .eq('user_id', senderId);
-      if (revertErr) {
-        logger.error(`[Wallet] CRITIQUE: crédit ET revert échoués (${senderId}→${receiverId}, montant=${amount}). Intervention manuelle requise.`);
-        try { await supabaseAdmin.from('wallet_suspicious_activities').insert({ user_id: senderId, activity_type: 'transfer_revert_failed', severity: 'critical', details: { senderId, receiverId, amount, idempotencyKey } }); } catch { /* ignore */ }
+        .eq('id', senderWallet.id)
+        .eq('balance', newSenderBalance)
+        .select('id');
+      if (revertErr || !Array.isArray(revertRows) || revertRows.length !== 1) {
+        logger.error(`[Wallet] CRITIQUE: crédit ET revert échoués (${senderId}→${receiverId}, montant=${amount}, wallet=${senderWallet.id}). Intervention manuelle requise.`);
+        try { await supabaseAdmin.from('wallet_suspicious_activities').insert({ user_id: senderId, activity_type: 'transfer_revert_failed', severity: 'critical', details: { senderId, receiverId, amount, idempotencyKey, senderWalletId: senderWallet.id, receiverWalletId: receiverWallet.id } }); } catch { /* ignore */ }
         return { success: false, error: 'Erreur critique de transfert. Contactez le support.' };
       }
       return await fail('Échec du crédit destinataire — transaction annulée');
@@ -629,10 +761,11 @@ export async function transferBetweenWallets(
       isInternational,
       rateUsed,
       rateSource,
+      rateFetchedAt,
       feeAmount,
     });
     logger.info(`[Wallet] Transfer manual: sender=${senderId}, receiver=${receiverId}, debit=${amount}, credit=${amountToCredit}, ${senderCurrency}->${receiverCurrency}`);
-    return { success: true };
+    return { success: true, transactionId: undefined };
   } catch (err: any) {
     logger.error(`[Wallet] transferBetweenWallets error: ${err.message}`);
     await deleteIdempotencyKey(idempotencyKey);

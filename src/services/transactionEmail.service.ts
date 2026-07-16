@@ -64,10 +64,31 @@ function getDisplayName(profile: UserProfile | null, fallback = 'Utilisateur'): 
   return profile.full_name || firstLast || profile.custom_id || fallback;
 }
 
+// ── Observabilité des envois (fini les emails perdus en silence) ──────────────
+// Un échec Resend n'interrompt JAMAIS le flux appelant (l'email est un effet de
+// bord best-effort), mais il ne doit plus être invisible : on compte les échecs
+// et on retient le dernier, exposé via getEmailHealth() (santé/monitoring PDG).
+let emailFailures = 0;
+let emailSent = 0;
+let lastEmailError: { at: string; status: number | null; reason: string } | null = null;
+
+/** Snapshot de santé du mailer (aucun secret) — consommable par un endpoint de monitoring. */
+export function getEmailHealth(): {
+  configured: boolean;
+  sent: number;
+  failures: number;
+  lastError: { at: string; status: number | null; reason: string } | null;
+} {
+  return { configured: Boolean(env.RESEND_API_KEY), sent: emailSent, failures: emailFailures, lastError: lastEmailError };
+}
+
 export async function sendEmail(email: string, subject: string, html: string): Promise<boolean> {
   const apiKey = env.RESEND_API_KEY;
   if (!apiKey) {
-    logger.warn('[TransactionEmail] RESEND_API_KEY non configurée — email non envoyé');
+    emailFailures++;
+    lastEmailError = { at: new Date().toISOString(), status: null, reason: 'RESEND_API_KEY non configurée' };
+    // error (pas warn) : un mailer non configuré = des emails perdus en silence.
+    logger.error('[TransactionEmail] RESEND_API_KEY absente de l\'environnement — email NON envoyé (config manquante)');
     return false;
   }
   try {
@@ -85,13 +106,23 @@ export async function sendEmail(email: string, subject: string, html: string): P
       }),
     });
     if (!res.ok) {
-      const body = await res.text();
-      logger.warn(`[TransactionEmail] Resend error for ${email}: ${res.status} ${body}`);
+      const body = (await res.text()).slice(0, 500);
+      emailFailures++;
+      lastEmailError = { at: new Date().toISOString(), status: res.status, reason: body };
+      // 403 « domain is not verified » = cause de config actionnable → on la nomme.
+      const isUnverifiedDomain = res.status === 403 && /domain is not verified/i.test(body);
+      const hint = isUnverifiedDomain
+        ? ' → DOMAINE NON VÉRIFIÉ chez Resend : poser les DNS (DKIM/SPF/MX) de 224solution.net, cf. docs/EMAILS_RESEND_DIAGNOSTIC.md'
+        : '';
+      logger.error(`[TransactionEmail] Échec Resend (${res.status}) pour ${email} — total échecs=${emailFailures}: ${body}${hint}`);
       return false;
     }
+    emailSent++;
     return true;
   } catch (err: any) {
-    logger.warn(`[TransactionEmail] Send failed for ${email}: ${err?.message}`);
+    emailFailures++;
+    lastEmailError = { at: new Date().toISOString(), status: null, reason: err?.message || 'erreur réseau' };
+    logger.error(`[TransactionEmail] Échec réseau Resend pour ${email} — total échecs=${emailFailures}: ${err?.message}`);
     return false;
   }
 }

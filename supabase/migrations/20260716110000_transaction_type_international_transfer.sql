@@ -1,0 +1,27 @@
+-- ============================================================================
+-- FIX historique wallet des transferts P2P inter-devises.
+--
+-- CAUSE RACINE
+--   wallet.service.ts (persistTransferHistory) écrit la trace officielle
+--   wallet_transactions avec transaction_type = 'international_transfer' pour
+--   tout transfert FX — mais l'enum LIVE public.transaction_type ne contient
+--   PAS cette valeur (vérifié via OpenAPI PostgREST le 16/07/2026 :
+--   transfer, deposit, withdrawal, payment, refund, commission,
+--   mobile_money_in, mobile_money_out, card_payment, bank_transfer,
+--   transfer_in, transfer_out, escrow_release, escrow_commission,
+--   restaurant_payment). Résultat en prod : 10× « invalid input value for
+--   enum transaction_type: "international_transfer" » → AUCUNE ligne
+--   wallet_transactions pour les 36 transferts FX réels (l'argent a bien
+--   bougé via la RPC atomique ; seule la trace officielle manquait).
+--
+--   Le frontend attend déjà cette valeur
+--   (UniversalWalletTransactions.tsx:575 → isOutgoingType inclut
+--   'international_transfer').
+--
+-- CORRECTIF : ajouter la valeur à l'enum. Même précédent que transfer_in /
+-- transfer_out (20260318151242) et escrow_release (20260608100000).
+-- Idempotent (IF NOT EXISTS). NB : la nouvelle valeur n'est utilisable
+-- qu'après COMMIT — le backfill (20260716120000) est donc un fichier séparé.
+-- ============================================================================
+
+ALTER TYPE public.transaction_type ADD VALUE IF NOT EXISTS 'international_transfer';

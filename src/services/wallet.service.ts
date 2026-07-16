@@ -88,17 +88,30 @@ async function persistTransferHistory(params: {
 
   const transferType = isInternational ? 'international_transfer' : 'transfer';
 
+  // Trace OFFICIELLE wallet_transactions (règle maison : tout mouvement d'argent a sa ligne).
+  // Le schéma LIVE exige transaction_id (UNIQUE NOT NULL, ≤50) et net_amount = amount - fee :
+  // amount = total débité (principal + frais expéditeur), fee = frais, net_amount = principal.
+  // Upsert ignoreDuplicates sur transaction_id = idempotent en cas de rejeu.
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const fee2 = round2(Number.isFinite(feeAmount) ? feeAmount : 0);
+  const net2 = round2(amountSent);
   const walletTxPromise = supabaseAdmin
     .from('wallet_transactions')
-    .insert({
+    .upsert({
+      transaction_id: String(transactionId || idempotencyKey).slice(0, 50),
       sender_wallet_id: senderWalletId,
       receiver_wallet_id: receiverWalletId,
+      sender_user_id: senderId,
+      receiver_user_id: receiverId,
       transaction_type: transferType,
-      amount: amountSent,
+      amount: round2(net2 + fee2),
+      fee: fee2,
+      net_amount: net2,
+      currency: senderCurrency,
       status: 'completed',
       description,
       metadata,
-    });
+    }, { onConflict: 'transaction_id', ignoreDuplicates: true });
 
   const persistEnhancedHistory = async () => {
     const enhancedPayload = {
@@ -151,7 +164,8 @@ async function persistTransferHistory(params: {
   ]);
 
   if (walletTxResult?.error) {
-    logger.warn(`[Wallet] wallet_transactions history insert failed: ${walletTxResult.error.message}`);
+    // TRACE MANQUANTE sur un mouvement d'argent réel → erreur (jamais un simple warn).
+    logger.error(`[Wallet] TRACE MANQUANTE — wallet_transactions insert failed: ${walletTxResult.error.message}`);
   }
   if (enhancedTxResult?.error) {
     logger.warn(`[Wallet] enhanced_transactions history write failed: ${enhancedTxResult.error.message}`);

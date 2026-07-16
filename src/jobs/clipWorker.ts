@@ -197,7 +197,9 @@ export async function processQueuedClips(): Promise<void> {
   try {
     const { data, error } = await supabaseAdmin.rpc('claim_next_clip_job');
     if (error) { logger.error(`[clips] claim: ${error.message}`); return; }
-    if (!data) return; // rien en file
+    // RETURNS composite : file vide ⇒ PostgREST renvoie une ligne toute NULL (pas null) →
+    // sans ce garde, le worker traite un job fantôme id=null en boucle (erreur toutes les 30 s).
+    if (!data || !(data as ClipRow).id) return; // rien en file
     await processClip(data as ClipRow);
   } finally {
     running = false;

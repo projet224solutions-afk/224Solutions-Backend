@@ -402,7 +402,12 @@ router.post('/withdrawal/request', verifyJWT, paymentRateLimit, async (req: Auth
     type: 'withdrawal', agent_id: agent.id, client_user_id: client.id, amount, fees: fee, channel,
     status: 'pending', idempotency_key: key, expires_at: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
   }).select('id').single();
-  if (error) { res.status(500).json({ success: false, error: 'Demande impossible' }); return; }
+  if (error) {
+    // Toujours journaliser la cause DB réelle (ex. 23514 CHECK channel) — le 500 muet a coûté
+    // un diagnostic complet (16 tentatives PDG le 13/07 sans une ligne de log exploitable).
+    logger.error(`[agent-cash/withdrawal-request] insert agent_cash_requests échoué (channel=${channel}): ${error.message}`);
+    res.status(500).json({ success: false, error: 'Demande impossible' }); return;
+  }
   const requestId = (reqRow as any).id;
 
   // IN-APP = SOURCE DE VÉRITÉ : créée SYSTÉMATIQUEMENT, AVANT tout canal best-effort, quel que soit le canal.

@@ -953,7 +953,7 @@ router.post("/process-payment-link", async (req: Request, res: Response) => {
     const token = Buffer.from(`${Date.now()}:${amount}:${currency}`).toString("base64");
     const { data } = await supabase
       .from("payment_links")
-      .insert({ token, amount, currency, metadata, status: "active" })
+      .insert({ token, amount, currency, metadata, status: "pending" }) // CHECK payment_links = pending/success/failed/expired/cancelled ('active' rejeté 23514)
       .select()
       .single();
     return res.json({ success: true, payment_link: data });

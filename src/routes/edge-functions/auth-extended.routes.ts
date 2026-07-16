@@ -213,7 +213,7 @@ router.post("/delete-pdg-agent", ...manageAgents, async (req: Request, res: Resp
   try {
     const { agent_id } = req.body || {};
     if (!agent_id) return res.status(400).json({ success: false, error: "agent_id requis" });
-    await supabase.from("profiles").update({ status: "deleted" }).eq("user_id", agent_id);
+    // profiles.status = présence (online/busy/offline, CHECK) — l'update 'deleted' était rejeté 23514 ; deleteUser suffit.
     const { error } = await supabase.auth.admin.deleteUser(agent_id);
     if (error) throw error;
     return res.json({ success: true, deleted_agent_id: agent_id });
@@ -224,7 +224,8 @@ router.post("/pdg-delete-vendor", ...manageVendors, async (req: Request, res: Re
   try {
     const { vendor_id } = req.body || {};
     if (!vendor_id) return res.status(400).json({ success: false, error: "vendor_id requis" });
-    await supabase.from("vendors").update({ status: "deleted" }).eq("id", vendor_id);
+    // vendors n'a pas de colonne status (le live expose is_active) — l'ancien update 'deleted' échouait en silence.
+    await supabase.from("vendors").update({ is_active: false }).eq("id", vendor_id);
     return res.json({ success: true, deleted_vendor_id: vendor_id });
   } catch (err: any) { return res.status(500).json({ success: false, error: err.message }); }
 });
@@ -254,7 +255,7 @@ router.post("/restore-user", ...manageUsers, async (req: Request, res: Response)
     const { user_id } = req.body || {};
     if (!user_id) return res.status(400).json({ success: false, error: "user_id requis" });
     await supabase.auth.admin.updateUserById(user_id, { ban_duration: "none" });
-    await supabase.from("profiles").update({ status: "active" }).eq("user_id", user_id);
+    // profiles.status = présence (online/busy/offline, CHECK) — l'update 'active' était rejeté 23514 ; le dé-ban suffit.
     return res.json({ success: true, user_id, restored: true });
   } catch (err: any) { return res.status(500).json({ success: false, error: err.message }); }
 });

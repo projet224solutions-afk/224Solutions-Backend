@@ -234,7 +234,7 @@ router.post("/sub/create", validateBearerToken, async (req: any, res: any) => {
         email,
         parent_agent_id,
         vendor_id: parentAgent.vendor_id,
-        type_agent: "sub_agent",
+        type_agent: "sous_agent", // CHECK agents_management = principal/sous_agent/agent_regional/agent_local ('sub_agent' rejeté 23514)
         is_active: true,
       })
       .select()

@@ -194,6 +194,14 @@ registerHandler('idempotency.cleanup', async () => {
   logger.info(`Idempotency cleanup: deleted ${count || 0} expired keys`);
 });
 
+// Purge des OTP expirés depuis > 1 h — auth_otp_codes (inscription/reset/login téléphone
+// + MFA agent/bureau). RPC SECURITY DEFINER réservée service_role (migration 20260716210000).
+registerHandler('auth-otp.cleanup', async () => {
+  const { error } = await supabaseAdmin.rpc('clean_expired_otp_codes' as any);
+  if (error) { logger.error(`[auth-otp.cleanup] ${error.message}`); return; }
+  logger.info('Auth OTP cleanup: codes expirés (> 1 h) purgés');
+});
+
 // 🎬 Studio Clips : worker ffmpeg (jobs serveur) + watchdog anti-zombie.
 registerHandler('clips.process', async () => { await processQueuedClips(); });
 registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
@@ -1237,6 +1245,8 @@ export const jobQueue = {
       this.enqueue('fx.bcrg-live-check', {}).catch(() => {});
 
       recurringTimers.push(setInterval(() => this.enqueue('idempotency.cleanup', {}).catch(() => {}), everyHour));
+      // Purge horaire des OTP expirés (auth_otp_codes — flux téléphone + MFA agent/bureau)
+      recurringTimers.push(setInterval(() => this.enqueue('auth-otp.cleanup', {}).catch(() => {}), everyHour));
       recurringTimers.push(setInterval(() => this.enqueue('orders.stuck-alert', {}).catch(() => {}), everyHour));
       recurringTimers.push(setInterval(() => this.enqueue('payment-links.cleanup-expired', {}).catch(() => {}), everyHour));
       recurringTimers.push(setInterval(() => this.enqueue('group-buys.finalize-expired', {}).catch(() => {}), everyHour));
@@ -1296,6 +1306,8 @@ export const jobQueue = {
     try {
       // Every hour: cleanup + stuck orders
       await queue.add('idempotency.cleanup', {}, { repeat: { every: 3600000 } });
+      // Purge horaire des OTP expirés (auth_otp_codes — flux téléphone + MFA agent/bureau)
+      await queue.add('auth-otp.cleanup', {}, { repeat: { every: 3600000 } });
       await queue.add('orders.stuck-alert', {}, { repeat: { every: 3600000 } });
       await queue.add('payment-links.cleanup-expired', {}, { repeat: { every: 3600000 } });
       await queue.add('group-buys.finalize-expired', {}, { repeat: { every: 3600000 } });

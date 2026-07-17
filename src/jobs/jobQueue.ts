@@ -212,6 +212,13 @@ registerHandler('replays.thumbnails', async () => { await processReplayThumbnail
 registerHandler('replays.transcode', async () => { await processReplayTranscodes(); });
 registerHandler('replays.clip-reminders', async () => { await processClipReminders(); });
 registerHandler('replays.retention', async () => { await processReplayRetention(); });
+// 💸 Affiliation : rattrapage quotidien des versements différés (seuil atteint depuis).
+registerHandler('affiliate.payouts-retry', async () => {
+  const { data, error } = await supabaseAdmin.rpc('process_affiliate_payouts_all' as never);
+  if (error) { logger.error(`[affiliate.payouts-retry] ${error.message}`); return; }
+  const r = data as { affiliates_scanned?: number; commissions_paid?: number } | null;
+  if (r?.commissions_paid) logger.info(`[affiliate.payouts-retry] ${r.commissions_paid} commission(s) versée(s) (${r.affiliates_scanned} affiliés scannés)`);
+});
 
 // Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
 // supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
@@ -1372,6 +1379,8 @@ export const jobQueue = {
       // P2 : rappel J+1 « créez votre clip » (6 h) + rétention/purge des replays bruts (24 h).
       recurringTimers.push(setInterval(() => this.enqueue('replays.clip-reminders', {}).catch(() => {}), 6 * 3600 * 1000));
       recurringTimers.push(setInterval(() => this.enqueue('replays.retention', {}).catch(() => {}), 24 * 3600 * 1000));
+      // 💸 Affiliation : rattrapage quotidien des versements différés.
+      recurringTimers.push(setInterval(() => this.enqueue('affiliate.payouts-retry', {}).catch(() => {}), 24 * 3600 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;
@@ -1436,6 +1445,7 @@ export const jobQueue = {
       await queue.add('replays.transcode', {}, { repeat: { every: 2 * 60 * 1000 } });
       await queue.add('replays.clip-reminders', {}, { repeat: { every: 6 * 3600 * 1000 } });
       await queue.add('replays.retention', {}, { repeat: { every: 24 * 3600 * 1000 } });
+      await queue.add('affiliate.payouts-retry', {}, { repeat: { every: 24 * 3600 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');
     } catch (err: any) {

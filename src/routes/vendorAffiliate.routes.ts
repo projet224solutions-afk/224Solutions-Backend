@@ -15,6 +15,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { verifyJWT, optionalJWT } from '../middlewares/auth.middleware.js';
+import { requirePermissionOrRole } from '../middlewares/permissions.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
@@ -344,6 +345,44 @@ router.get('/vendor-stats', verifyJWT, async (req: AuthenticatedRequest, res: Re
     logger.error(`[affiliate/vendor-stats] ${e?.message}`);
     res.status(500).json({ success: false, error: 'Erreur interne' });
   }
+});
+
+// ── 👑 ADMIN PDG : config du programme + rattrapage des versements ─────────
+const pdgOnly = requirePermissionOrRole({
+  permissionKey: 'manage_commissions',
+  allowedRoles: ['admin', 'pdg', 'ceo'],
+});
+
+/** GET /api/affiliate-program/admin/config — seuil de versement + plafond pending. */
+router.get('/admin/config', verifyJWT, pdgOnly, async (_req: Request, res: Response): Promise<void> => {
+  const { data } = await supabaseAdmin.from('affiliate_config').select('*').eq('id', true).maybeSingle();
+  res.json({ success: true, data });
+});
+
+/** PATCH /api/affiliate-program/admin/config — mise à jour bornée. */
+router.patch('/admin/config', verifyJWT, pdgOnly, async (req: Request, res: Response): Promise<void> => {
+  const b = req.body || {};
+  const upd: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (b.min_payout_amount != null) {
+    const v = Number(b.min_payout_amount);
+    if (!Number.isFinite(v) || v < 0 || v > 100000000) { res.status(400).json({ success: false, error: 'Seuil invalide (0 à 100M GNF)' }); return; }
+    upd.min_payout_amount = v;
+  }
+  if (b.max_pending_per_affiliate != null) {
+    const v = Number(b.max_pending_per_affiliate);
+    if (!Number.isFinite(v) || v < 0 || v > 1000000000) { res.status(400).json({ success: false, error: 'Plafond invalide (0 à 1Md GNF)' }); return; }
+    upd.max_pending_per_affiliate = v;
+  }
+  const { error } = await supabaseAdmin.from('affiliate_config').update(upd as never).eq('id', true);
+  if (error) { res.status(500).json({ success: false, error: 'Mise à jour impossible' }); return; }
+  res.json({ success: true, data: { updated: true } });
+});
+
+/** POST /api/affiliate-program/admin/payouts-retry — rejoue les versements différés (aussi en job quotidien). */
+router.post('/admin/payouts-retry', verifyJWT, pdgOnly, async (_req: Request, res: Response): Promise<void> => {
+  const { data, error } = await supabaseAdmin.rpc('process_affiliate_payouts_all' as never);
+  if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+  res.json({ success: true, data });
 });
 
 /** POST /api/affiliate/track-click — enregistre l'attribution (acheteur connecté requis). */

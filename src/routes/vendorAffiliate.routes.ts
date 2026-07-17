@@ -32,6 +32,39 @@ async function resolveAffiliateUserId(ref: string): Promise<string | null> {
 }
 
 /**
+ * 🔀 Produit affiliable POLYMORPHE : digital_products d'abord, sinon products
+ * (physique). Même invariant financier des deux côtés.
+ */
+async function resolveAffiliableProduct(productId: string): Promise<{
+  kind: 'digital' | 'physical'; enabled: boolean; rate: number; vendor_id: string;
+} | null> {
+  const { data: dp } = await supabaseAdmin.from('digital_products')
+    .select('affiliate_enabled, affiliate_commission_rate, vendor_id').eq('id', productId).maybeSingle();
+  if (dp) {
+    return { kind: 'digital', enabled: !!dp.affiliate_enabled, rate: Number(dp.affiliate_commission_rate) || 0, vendor_id: dp.vendor_id };
+  }
+  const { data: pp } = await (supabaseAdmin.from('products') as any)
+    .select('affiliate_enabled, affiliate_commission_rate, vendor_id').eq('id', productId).maybeSingle();
+  if (pp) {
+    return { kind: 'physical', enabled: !!pp.affiliate_enabled, rate: Number(pp.affiliate_commission_rate) || 0, vendor_id: pp.vendor_id };
+  }
+  return null;
+}
+
+/** Titres de produits (les deux tables) pour l'affichage des stats. */
+async function productTitles(ids: string[]): Promise<Map<string, string>> {
+  if (!ids.length) return new Map();
+  const [d, p] = await Promise.all([
+    supabaseAdmin.from('digital_products').select('id, title').in('id', ids),
+    supabaseAdmin.from('products').select('id, name').in('id', ids),
+  ]);
+  const m = new Map<string, string>();
+  for (const r of (d.data || []) as any[]) m.set(r.id, r.title);
+  for (const r of (p.data || []) as any[]) if (!m.has(r.id)) m.set(r.id, r.name);
+  return m;
+}
+
+/**
  * À la création d'une commande NUMÉRIQUE : si le produit numérique est affilié ET qu'une
  * attribution valide existe (clic < 30j pour cet acheteur), crée une commission `pending`.
  * (L'affiliation ne concerne QUE les produits numériques — voir digital_products.affiliate_*.)
@@ -46,81 +79,110 @@ export async function recordAffiliateConversions(orderId: string, buyerUserId: s
     if (!order?.vendor_id) return;
 
     const meta = (order.metadata && typeof order.metadata === 'object' ? order.metadata : {}) as any;
-    if (meta.item_type !== 'digital_product') return; // affiliation = produits numériques uniquement
-    const productId = meta.digital_product_id;
-    if (!productId) return;
-
-    const { data: product } = await supabaseAdmin
-      .from('digital_products')
-      .select('affiliate_enabled, affiliate_commission_rate, vendor_id')
-      .eq('id', productId).maybeSingle();
-    if (!product?.affiliate_enabled || !(Number(product.affiliate_commission_rate) > 0)) return;
-
     const { data: vendor } = await supabaseAdmin.from('vendors').select('user_id').eq('id', order.vendor_id).maybeSingle();
     const vendorUserId = vendor?.user_id || null;
+    const currency = meta.currency || 'GNF';
 
-    // Attribution last-click valide pour cet acheteur + produit (fenêtre 30j).
-    const { data: click } = await supabaseAdmin
-      .from('affiliate_clicks')
-      .select('affiliate_user_id')
-      .eq('buyer_user_id', buyerUserId)
-      .eq('product_id', productId)
-      .gt('expires_at', new Date().toISOString())
-      .order('clicked_at', { ascending: false })
-      .limit(1).maybeSingle();
-    const affiliateUserId = click?.affiliate_user_id;
-    if (!affiliateUserId) return;
-    if (affiliateUserId === buyerUserId || affiliateUserId === vendorUserId) return; // anti-auto
-
-    // 🛡️ BLOC 3 — plafond de commissions EN ATTENTE par affilié (config PDG) :
-    // au-delà, pas de nouvelle commission (silencieux + alerte sécurité).
-    const { data: cfg } = await supabaseAdmin.from('affiliate_config')
-      .select('max_pending_per_affiliate').eq('id', true).maybeSingle();
-    const maxPending = Number((cfg as any)?.max_pending_per_affiliate || 0);
-    if (maxPending > 0) {
-      const { data: pendings } = await supabaseAdmin.from('affiliate_commissions')
-        .select('commission_amount').eq('affiliate_user_id', affiliateUserId).eq('status', 'pending');
-      const pendingSum = (pendings || []).reduce((s: number, r: any) => s + Number(r.commission_amount || 0), 0);
-      if (pendingSum >= maxPending) {
-        logger.warn(`[affiliate] plafond pending atteint pour ${affiliateUserId} (${pendingSum} ≥ ${maxPending}) — commission non créée`);
-        void Promise.resolve(supabaseAdmin.from('financial_security_alerts').insert({
-          alert_type: 'AFFILIATE_PENDING_CAP', severity: 'medium',
-          details: { affiliate_user_id: affiliateUserId, pending_sum: pendingSum, cap: maxPending, order_id: orderId },
-        })).catch(() => {});
-        return;
-      }
+    if (meta.item_type === 'digital_product') {
+      const productId = meta.digital_product_id;
+      if (!productId) return;
+      const { data: product } = await supabaseAdmin
+        .from('digital_products')
+        .select('affiliate_enabled, affiliate_commission_rate')
+        .eq('id', productId).maybeSingle();
+      if (!product?.affiliate_enabled || !(Number(product.affiliate_commission_rate) > 0)) return;
+      const saleAmount = Number(order.total_amount)
+        || (Number(meta.unit_price) || 0) * (Number(meta.quantity) || 1);
+      await createCommissionIfAttributed({
+        orderId, buyerUserId, productId, kind: 'digital', vendorId: order.vendor_id,
+        vendorUserId, saleAmount, baseRate: Number(product.affiliate_commission_rate) || 0, currency,
+      });
+      return;
     }
 
-    const saleAmount = Number(order.total_amount)
-      || (Number(meta.unit_price) || 0) * (Number(meta.quantity) || 1);
-
-    // 🪜 BLOC 5 — paliers de commission (optionnel vendeur) : le taux monte avec
-    // les ventes du MOIS de cet affilié sur CE produit (palier le plus haut atteint).
-    let rate = Number(product.affiliate_commission_rate) || 0;
-    const { data: tiers } = await supabaseAdmin.from('affiliate_commission_tiers')
-      .select('min_monthly_sales, rate').eq('product_id', productId)
-      .order('min_monthly_sales', { ascending: false });
-    if (tiers && tiers.length) {
-      const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-      const { count: monthlySales } = await supabaseAdmin.from('affiliate_commissions')
-        .select('id', { count: 'exact', head: true })
-        .eq('affiliate_user_id', affiliateUserId).eq('product_id', productId)
-        .neq('status', 'cancelled').gte('created_at', monthStart.toISOString());
-      const tier = (tiers as any[]).find(t => Number(t.min_monthly_sales) <= (monthlySales || 0));
-      if (tier && Number(tier.rate) > 0) rate = Number(tier.rate);
+    // 🛒 PHYSIQUE : commission PAR LIGNE de commande dont le produit est
+    // affiliable ET attribué (clic < 30 j de cet acheteur) — même invariant.
+    const { data: items } = await supabaseAdmin.from('order_items')
+      .select('product_id, quantity, unit_price, total_price')
+      .eq('order_id', orderId).limit(100);
+    for (const it of ((items || []) as any[])) {
+      if (!it.product_id) continue;
+      const { data: pp } = await (supabaseAdmin.from('products') as any)
+        .select('affiliate_enabled, affiliate_commission_rate')
+        .eq('id', it.product_id).maybeSingle();
+      if (!pp?.affiliate_enabled || !(Number(pp.affiliate_commission_rate) > 0)) continue;
+      const saleAmount = Number(it.total_price)
+        || (Number(it.unit_price) || 0) * (Number(it.quantity) || 1);
+      await createCommissionIfAttributed({
+        orderId, buyerUserId, productId: it.product_id, kind: 'physical', vendorId: order.vendor_id,
+        vendorUserId, saleAmount, baseRate: Number(pp.affiliate_commission_rate) || 0, currency,
+      });
     }
-
-    const commission = Math.round(saleAmount * (rate / 100));
-    if (commission <= 0) return;
-
-    await supabaseAdmin.from('affiliate_commissions').insert({
-      order_id: orderId, product_id: productId, affiliate_user_id: affiliateUserId,
-      vendor_id: order.vendor_id, sale_amount: saleAmount, commission_rate: rate,
-      commission_amount: commission, currency: meta.currency || 'GNF', status: 'pending',
-    }).then(() => {}, () => {}); // ON CONFLICT (unique) → ignore
   } catch (e: any) {
     logger.warn(`[affiliate] recordConversions ${orderId}: ${e?.message}`);
   }
+}
+
+/** Cœur commun digital/physique : attribution → anti-auto → plafond → paliers → commission pending. */
+async function createCommissionIfAttributed(p: {
+  orderId: string; buyerUserId: string; productId: string; kind: 'digital' | 'physical';
+  vendorId: string; vendorUserId: string | null; saleAmount: number; baseRate: number; currency: string;
+}): Promise<void> {
+  // Attribution last-click valide pour cet acheteur + produit (fenêtre 30j).
+  const { data: click } = await supabaseAdmin
+    .from('affiliate_clicks')
+    .select('affiliate_user_id')
+    .eq('buyer_user_id', p.buyerUserId)
+    .eq('product_id', p.productId)
+    .gt('expires_at', new Date().toISOString())
+    .order('clicked_at', { ascending: false })
+    .limit(1).maybeSingle();
+  const affiliateUserId = click?.affiliate_user_id;
+  if (!affiliateUserId) return;
+  if (affiliateUserId === p.buyerUserId || affiliateUserId === p.vendorUserId) return; // anti-auto
+
+  // 🛡️ BLOC 3 — plafond de commissions EN ATTENTE par affilié (config PDG).
+  const { data: cfg } = await supabaseAdmin.from('affiliate_config')
+    .select('max_pending_per_affiliate').eq('id', true).maybeSingle();
+  const maxPending = Number((cfg as any)?.max_pending_per_affiliate || 0);
+  if (maxPending > 0) {
+    const { data: pendings } = await supabaseAdmin.from('affiliate_commissions')
+      .select('commission_amount').eq('affiliate_user_id', affiliateUserId).eq('status', 'pending');
+    const pendingSum = (pendings || []).reduce((s: number, r: any) => s + Number(r.commission_amount || 0), 0);
+    if (pendingSum >= maxPending) {
+      logger.warn(`[affiliate] plafond pending atteint pour ${affiliateUserId} (${pendingSum} ≥ ${maxPending}) — commission non créée`);
+      void Promise.resolve(supabaseAdmin.from('financial_security_alerts').insert({
+        alert_type: 'AFFILIATE_PENDING_CAP', severity: 'medium',
+        details: { affiliate_user_id: affiliateUserId, pending_sum: pendingSum, cap: maxPending, order_id: p.orderId },
+      })).catch(() => {});
+      return;
+    }
+  }
+
+  // 🪜 BLOC 5 — paliers : le taux monte avec les ventes du MOIS sur CE produit.
+  let rate = p.baseRate;
+  const { data: tiers } = await supabaseAdmin.from('affiliate_commission_tiers')
+    .select('min_monthly_sales, rate').eq('product_id', p.productId)
+    .order('min_monthly_sales', { ascending: false });
+  if (tiers && tiers.length) {
+    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
+    const { count: monthlySales } = await supabaseAdmin.from('affiliate_commissions')
+      .select('id', { count: 'exact', head: true })
+      .eq('affiliate_user_id', affiliateUserId).eq('product_id', p.productId)
+      .neq('status', 'cancelled').gte('created_at', monthStart.toISOString());
+    const tier = (tiers as any[]).find(t => Number(t.min_monthly_sales) <= (monthlySales || 0));
+    if (tier && Number(tier.rate) > 0) rate = Number(tier.rate);
+  }
+
+  const commission = Math.round(p.saleAmount * (rate / 100));
+  if (commission <= 0) return;
+
+  await supabaseAdmin.from('affiliate_commissions').insert({
+    order_id: p.orderId, product_id: p.productId, affiliate_user_id: affiliateUserId,
+    vendor_id: p.vendorId, sale_amount: p.saleAmount, commission_rate: rate,
+    commission_amount: commission, currency: p.currency, status: 'pending',
+    product_kind: p.kind,
+  } as any).then(() => {}, () => {}); // ON CONFLICT (unique) → ignore
 }
 
 /** À la libération escrow : confirme + paie les commissions (RPC atomique). Best-effort. */
@@ -189,20 +251,30 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
  */
 router.get('/marketplace', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    let q = supabaseAdmin.from('digital_products')
+    const category = String(req.query.category || '').trim();
+    const minRate = Number(req.query.min_rate || 0);
+
+    // 🔀 Marketplace unifiée : produits DIGITAUX publiés + PHYSIQUES actifs.
+    let qd = supabaseAdmin.from('digital_products')
       .select('id, title, price, currency, images, category, short_description, affiliate_commission_rate, vendor_id')
       .eq('affiliate_enabled', true).eq('status', 'published');
-    const category = String(req.query.category || '').trim();
-    if (category) q = q.eq('category', category);
-    const minRate = Number(req.query.min_rate || 0);
-    if (minRate > 0) q = q.gte('affiliate_commission_rate', minRate);
-    q = String(req.query.sort) === 'price'
-      ? q.order('price', { ascending: false })
-      : q.order('affiliate_commission_rate', { ascending: false });
-    const { data: products, error } = await q.limit(100);
-    if (error) throw error;
+    if (category) qd = qd.eq('category', category);
+    if (minRate > 0) qd = qd.gte('affiliate_commission_rate', minRate);
+    let qp = (supabaseAdmin.from('products') as any)
+      .select('id, name, price, images, affiliate_commission_rate, vendor_id')
+      .eq('affiliate_enabled', true).eq('is_active', true);
+    if (minRate > 0) qp = qp.gte('affiliate_commission_rate', minRate);
+    const [dRes, pRes] = await Promise.all([qd.limit(100), qp.limit(100)]);
+    if (dRes.error) throw dRes.error;
 
-    const rows = (products || []) as any[];
+    const rows = [
+      ...((dRes.data || []) as any[]).map((r: any) => ({ ...r, kind: 'digital' })),
+      ...((pRes.data || []) as any[]).map((r: any) => ({
+        ...r, kind: 'physical', title: r.name, currency: 'GNF', category: null, short_description: null,
+      })),
+    ].sort((a, b) => (String(req.query.sort) === 'price'
+      ? Number(b.price) - Number(a.price)
+      : Number(b.affiliate_commission_rate) - Number(a.affiliate_commission_rate)));
     const ids = rows.map(p => p.id);
     const vendorIds = [...new Set(rows.map(p => p.vendor_id).filter(Boolean))];
     const [tiersRes, vendorsRes] = await Promise.all([
@@ -223,6 +295,8 @@ router.get('/marketplace', verifyJWT, async (req: AuthenticatedRequest, res: Res
       image: (p.images && p.images[0]) || null, category: p.category || null,
       short_description: p.short_description || null,
       vendor_name: vName.get(p.vendor_id) || null,
+      kind: p.kind,
+      link_path: p.kind === 'physical' ? `/product/${p.id}` : `/digital-product/${p.id}`,
       commission_rate: Number(p.affiliate_commission_rate) || 0,
       estimated_gain: Math.round((Number(p.price) || 0) * ((Number(p.affiliate_commission_rate) || 0) / 100)),
       tiers: tiersByProduct.get(p.id) || [],
@@ -265,11 +339,7 @@ router.get('/my-stats', verifyJWT, async (req: AuthenticatedRequest, res: Respon
       b.conversions++; if (cm.status === 'confirmed') b.earned += Number(cm.commission_amount || 0);
       byProduct.set(cm.product_id, b);
     }
-    const pIds = [...byProduct.keys()];
-    const { data: pNames } = pIds.length
-      ? await supabaseAdmin.from('digital_products').select('id, title').in('id', pIds)
-      : { data: [] as any[] };
-    const nameMap = new Map(((pNames || []) as any[]).map(p => [p.id, p.title]));
+    const nameMap = await productTitles([...byProduct.keys()]);
 
     const day = (d: string) => d.slice(0, 10);
     const series: Record<string, { clicks: number; earned: number }> = {};
@@ -393,9 +463,8 @@ router.post('/track-click', verifyJWT, async (req: AuthenticatedRequest, res: Re
     const buyerUserId = req.user!.id;
     const { product_id, ref } = parsed.data;
 
-    const { data: product } = await supabaseAdmin
-      .from('digital_products').select('id, affiliate_enabled, vendor_id').eq('id', product_id).maybeSingle();
-    if (!product?.affiliate_enabled) { res.json({ success: true, attributed: false }); return; }
+    const product = await resolveAffiliableProduct(product_id);
+    if (!product?.enabled) { res.json({ success: true, attributed: false }); return; }
 
     const affiliateUserId = await resolveAffiliateUserId(ref);
     if (!affiliateUserId || affiliateUserId === buyerUserId) { res.json({ success: true, attributed: false }); return; }
@@ -416,10 +485,9 @@ router.post('/track-click', verifyJWT, async (req: AuthenticatedRequest, res: Re
 /** GET /api/affiliate/product/:id — programme du produit + lien de l'utilisateur courant. */
 router.get('/product/:id', optionalJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { data: product } = await supabaseAdmin
-      .from('digital_products').select('id, affiliate_enabled, affiliate_commission_rate, vendor_id')
-      .eq('id', req.params.id).maybeSingle();
-    if (!product) { res.status(404).json({ success: false, error: 'Produit introuvable' }); return; }
+    const resolved = await resolveAffiliableProduct(req.params.id);
+    if (!resolved) { res.status(404).json({ success: false, error: 'Produit introuvable' }); return; }
+    const product = { affiliate_enabled: resolved.enabled, affiliate_commission_rate: resolved.rate, vendor_id: resolved.vendor_id };
 
     let ref: string | null = null;
     let isOwner = false;
@@ -435,6 +503,7 @@ router.get('/product/:id', optionalJWT, async (req: AuthenticatedRequest, res: R
     res.json({
       success: true,
       enabled: !!product.affiliate_enabled,
+      kind: resolved.kind,
       commission_rate: Number(product.affiliate_commission_rate) || 0,
       ref: isOwner ? null : ref, // le vendeur ne s'affilie pas à lui-même
       // 🛡️ BLOC 0 : obtenir un lien exige l'activation du programme (consentement).
@@ -493,15 +562,12 @@ router.get('/vendor', verifyJWT, async (req: AuthenticatedRequest, res: Response
     // Enrichissement : nom produit numérique + identifiant public de l'affilié (lisible).
     const productIds = [...new Set(comms.map(c => c.product_id).filter(Boolean))];
     const affiliateIds = [...new Set(comms.map(c => c.affiliate_user_id).filter(Boolean))];
-    const [prodNames, affNames] = await Promise.all([
-      productIds.length
-        ? supabaseAdmin.from('digital_products').select('id, title').in('id', productIds)
-        : Promise.resolve({ data: [] as any[] }),
+    const [pMap, affNames] = await Promise.all([
+      productTitles(productIds as string[]),
       affiliateIds.length
         ? supabaseAdmin.from('profiles').select('id, public_id, full_name').in('id', affiliateIds)
         : Promise.resolve({ data: [] as any[] }),
     ]);
-    const pMap = new Map((prodNames.data || []).map((p: any) => [p.id, p.title]));
     const aMap = new Map((affNames.data || []).map((a: any) => [a.id, a.public_id || a.full_name]));
     const enriched = comms.map(c => ({
       ...c,

@@ -231,9 +231,11 @@ async function getOrCreateCustomerId(userId: string) {
 }
 
 async function canUserManageBuyerOrder(orderId: string, userId: string, customerId?: string | null) {
+  // select('*') : inclut order_type/metadata sans casser si une colonne récente
+  // n'est pas encore migrée (garde B2B en aval).
   const orderLookup = await supabaseAdmin
     .from('orders')
-    .select('id, status, customer_id, vendor_id, metadata')
+    .select('*')
     .eq('id', orderId)
     .single();
 
@@ -1091,6 +1093,17 @@ router.post('/:orderId([0-9a-fA-F-]{36})/cancel', verifyJWT, orderManageRateLimi
       return;
     }
 
+    // Commande B2B : annulation UNIQUEMENT via /api/b2b (sinon l'achat miroir
+    // stock_purchases resterait désynchronisé et la réservation bloquée).
+    if ((order as any).order_type === 'b2b_purchase') {
+      res.status(409).json({
+        success: false,
+        error: 'Commande B2B : annulez-la depuis la fiche achat (module Fournisseurs)',
+        error_code: 'B2B_ORDER_USE_B2B_API',
+      });
+      return;
+    }
+
     if (order.status !== 'pending') {
       res.status(400).json({
         success: false,
@@ -1758,15 +1771,29 @@ router.patch('/:orderId([0-9a-fA-F-]{36})/status', verifyJWT, orderManageRateLim
       return;
     }
 
+    // select('*') : résilient si la colonne order_type n'est pas encore migrée
+    // (un select explicite d'une colonne absente ferait échouer TOUT le endpoint).
     const { data: order } = await supabaseAdmin
       .from('orders')
-      .select('id, status, vendor_id, customer_id, order_number')
+      .select('*')
       .eq('id', orderId)
       .eq('vendor_id', vendor.id)
       .single();
 
     if (!order) {
       res.status(404).json({ success: false, error: 'Commande non trouvée' });
+      return;
+    }
+
+    // Les commandes B2B ont leur propre machine à états ATOMIQUE (/api/b2b :
+    // réservation à la confirmation, sortie du réservé à l'expédition, escrow à
+    // la réception). Ce endpoint générique les court-circuiterait → refus.
+    if ((order as any).order_type === 'b2b_purchase') {
+      res.status(409).json({
+        success: false,
+        error: 'Commande B2B : gérez-la depuis Fournisseurs → Espace B2B (confirmer / ajuster / expédier)',
+        error_code: 'B2B_ORDER_USE_B2B_API',
+      });
       return;
     }
 

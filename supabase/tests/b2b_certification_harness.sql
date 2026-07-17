@@ -44,10 +44,17 @@ BEGIN
   IF v_buyer_user IS NULL OR v_supplier_user IS NULL THEN
     RAISE EXCEPTION 'Comptes de test introuvables — renseigner c_buyer_email / c_supplier_email';
   END IF;
-  SELECT id INTO v_buyer_vendor FROM vendors WHERE user_id = v_buyer_user;
-  SELECT id INTO v_supplier_vendor FROM vendors WHERE user_id = v_supplier_user;
-  IF v_buyer_vendor IS NULL OR v_supplier_vendor IS NULL THEN
-    RAISE EXCEPTION 'Les deux comptes doivent être des VENDEURS (lignes vendors manquantes)';
+  -- Boutiques de certification créées AU BESOIN, dans la transaction (rollback
+  -- final → zéro trace) : les comptes cert n'ont pas besoin d'être vendeurs.
+  SELECT id INTO v_buyer_vendor FROM vendors WHERE user_id = v_buyer_user LIMIT 1;
+  IF v_buyer_vendor IS NULL THEN
+    INSERT INTO vendors (user_id, business_name) VALUES (v_buyer_user, 'CERT Acheteur A')
+    RETURNING id INTO v_buyer_vendor;
+  END IF;
+  SELECT id INTO v_supplier_vendor FROM vendors WHERE user_id = v_supplier_user LIMIT 1;
+  IF v_supplier_vendor IS NULL THEN
+    INSERT INTO vendors (user_id, business_name) VALUES (v_supplier_user, 'CERT Fournisseur B')
+    RETURNING id INTO v_supplier_vendor;
   END IF;
   SELECT id INTO v_customer_id FROM customers WHERE user_id = v_buyer_user;
   IF v_customer_id IS NULL THEN
@@ -243,7 +250,8 @@ BEGIN
     jsonb_build_array(jsonb_build_object('item_id', v_item1, 'received_qty', 2, 'buyer_product_id', v_bp)));
   IF (v_res->>'debt_id') IS NULL THEN RAISE EXCEPTION 'T3: dette non créée'; END IF;
   SELECT * INTO v_debt FROM supplier_debts WHERE id = (v_res->>'debt_id')::uuid;
-  IF v_debt.total_amount <> 5000 OR v_debt.due_date <> CURRENT_DATE + 3 THEN
+  -- 2 × P1 à 2600 (prix catalogue — l'ajustement de T2 ne touchait QUE la commande T2)
+  IF v_debt.total_amount <> 5200 OR v_debt.due_date <> CURRENT_DATE + 3 THEN
     RAISE EXCEPTION 'T3: dette incorrecte (total=% échéance=%)', v_debt.total_amount, v_debt.due_date;
   END IF;
   -- Rappel J-3 : la requête EXACTE du job backend (supplier-debts.reminders) la voit.
@@ -261,7 +269,7 @@ BEGIN
   IF v_supplier_bal <> v_supplier_bal0 + 2000 THEN
     RAISE EXCEPTION 'T3: fournisseur lié non crédité du règlement';
   END IF;
-  RAISE NOTICE '✅ T3 crédit : dette 5000 GNF (échéance J+3, palier J-3 détecté par le job) ; tranche 2000 → wallet fournisseur crédité';
+  RAISE NOTICE '✅ T3 crédit : dette 5200 GNF (échéance J+3, palier J-3 détecté par le job) ; tranche 2000 → wallet fournisseur crédité';
 
   -- ══ TEST 4 — ACHAT EXTERNE MANUEL (flux actuel + PMP) ════════════════════
   INSERT INTO products (vendor_id, name, price, stock_quantity, cost_price, is_active)
@@ -307,10 +315,13 @@ BEGIN
   IF v_cnt <> 0 THEN
     RAISE EXCEPTION 'T5: le fournisseur B voit % achat(s) de l''acheteur A (fuite RLS)', v_cnt;
   END IF;
+  -- B voit les dettes de A UNIQUEMENT quand il en est le CRÉANCIER (fiche liée)
+  -- — c'est la policy supplier_debts_creditor (Espace Grossiste). Aucune autre.
   SELECT count(*) INTO v_cnt FROM supplier_debts sd
-  WHERE sd.vendor_id IN (SELECT id FROM vendors WHERE user_id = v_a);
+  WHERE sd.vendor_id IN (SELECT id FROM vendors WHERE user_id = v_a)
+    AND sd.supplier_id NOT IN (SELECT public.b2b_creditor_supplier_rows(v_b));
   IF v_cnt <> 0 THEN
-    RAISE EXCEPTION 'T5: le fournisseur B voit % dette(s) de A (fuite RLS)', v_cnt;
+    RAISE EXCEPTION 'T5: le fournisseur B voit % dette(s) de A dont il n''est PAS créancier (fuite RLS)', v_cnt;
   END IF;
 
   -- Simuler l'ACHETEUR A : il voit ses achats, et les demandes où il est partie.

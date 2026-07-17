@@ -38,8 +38,17 @@ BEGIN
   IF v_buyer_user IS NULL OR v_supplier_user IS NULL THEN
     RAISE EXCEPTION 'Comptes de test introuvables — renseigner les emails en tête de script';
   END IF;
-  SELECT id INTO v_buyer_vendor FROM vendors WHERE user_id = v_buyer_user;
-  SELECT id INTO v_supplier_vendor FROM vendors WHERE user_id = v_supplier_user;
+  -- Boutiques de certification créées AU BESOIN (transaction rollbackée).
+  SELECT id INTO v_buyer_vendor FROM vendors WHERE user_id = v_buyer_user LIMIT 1;
+  IF v_buyer_vendor IS NULL THEN
+    INSERT INTO vendors (user_id, business_name) VALUES (v_buyer_user, 'CERT Acheteur A')
+    RETURNING id INTO v_buyer_vendor;
+  END IF;
+  SELECT id INTO v_supplier_vendor FROM vendors WHERE user_id = v_supplier_user LIMIT 1;
+  IF v_supplier_vendor IS NULL THEN
+    INSERT INTO vendors (user_id, business_name) VALUES (v_supplier_user, 'CERT Fournisseur B')
+    RETURNING id INTO v_supplier_vendor;
+  END IF;
   SELECT user_id INTO v_pdg_user FROM pdg_management WHERE is_active = true LIMIT 1;
   SELECT id INTO v_customer_id FROM customers WHERE user_id = v_buyer_user;
   IF v_customer_id IS NULL THEN
@@ -172,6 +181,9 @@ BEGIN
   v_link3 := (v_res->>'link_id')::uuid;
   PERFORM 1 FROM products WHERE id = v_p2 AND stock_quantity = v_stock - 3 AND reserved_quantity = v_reserved + 3;
   IF NOT FOUND THEN RAISE EXCEPTION 'T3: réservation à la création absente'; END IF;
+  -- NB : le trigger check_payment_link_expiry bascule status='expired' dès cet
+  -- UPDATE (trouvaille de certification) — le watchdog doit donc AUSSI rattraper
+  -- les réservations orphelines des liens déjà expirés (20260717220000).
   UPDATE payment_links SET expires_at = now() - interval '1 hour' WHERE id = v_link3;
   v_res := expire_b2b_stock_links();
   IF (v_res->>'released')::int < 1 THEN
@@ -205,8 +217,13 @@ BEGIN
   RAISE NOTICE '✅ T4 crédit : dette 5200 GNF échéance J+7 — même enregistrement = dette (acheteur) ET créance (fournisseur lié)';
 
   -- ══ T5 — TIERS NON CIBLÉ → REFUS PROPRE ══
-  INSERT INTO vendors (user_id, business_name) VALUES (v_supplier_user, 'CERT-TIERS')
-  RETURNING id INTO v_third_vendor;
+  -- N'importe quel vendeur existant ≠ acheteur/fournisseur sert de cible tierce
+  -- (vendors.user_id est UNIQUE — pas de création possible sur les comptes cert).
+  SELECT id INTO v_third_vendor FROM vendors
+  WHERE id NOT IN (v_buyer_vendor, v_supplier_vendor) LIMIT 1;
+  IF v_third_vendor IS NULL THEN
+    RAISE EXCEPTION 'T5: aucun vendeur tiers disponible en base';
+  END IF;
   v_res := create_b2b_stock_link(v_supplier_vendor,
     jsonb_build_array(jsonb_build_object('product_id', v_p1, 'quantity', 1, 'unit_price', 2600)),
     'CERT tiers', v_third_vendor, 72, true, NULL, false, NULL, 'GNF', NULL);

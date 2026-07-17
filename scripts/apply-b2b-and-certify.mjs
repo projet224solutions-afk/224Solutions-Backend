@@ -30,6 +30,7 @@ const FILES = [
   // Espace Grossiste 224 (côté fournisseur : cockpit + liens de vente)
   '20260717200000_b2b_wholesale_foundation.sql',
   '20260717210000_b2b_stock_sale_links.sql',
+  '20260717220000_b2b_link_expiry_hardening.sql',
 ];
 
 const connectionString = process.env.DATABASE_URL;

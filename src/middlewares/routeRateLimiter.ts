@@ -170,6 +170,15 @@ export const authRateLimit = routeRateLimit({
   maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true, failClosed: true,
 });
 
+/** Studio Clips : anti-rafale par UTILISATEUR, fail-open (repli mémoire).
+ *  Le quota/jour et l'idempotence vivent DANS la RPC create_clip_job — un
+ *  fail-closed ici rendait la création de clips 429 permanente dès que Redis
+ *  est absent (cause prouvée du « zéro clip jamais créé » en prod). Et le
+ *  préfixe partagé 'auth' faisait consommer le budget des routes d'auth. */
+export const clipCreateRateLimit = routeRateLimit({
+  maxRequests: 10, windowSeconds: 60, keyPrefix: 'clips-create', perUser: true, perIp: false, failClosed: false,
+});
+
 /** Create order: 20 req / min per user (un checkout génère plusieurs POST légitimes :
  *  paiement mobile money retenté, cross-currency re-soumis, double-clic). 5/min bloquait
  *  des clients honnêtes. Combiné à idempotencyGuard AVANT ce middleware → seules les

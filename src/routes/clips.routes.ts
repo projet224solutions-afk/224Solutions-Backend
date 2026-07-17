@@ -10,7 +10,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
-import { authRateLimit } from '../middlewares/routeRateLimiter.js';
+import { clipCreateRateLimit } from '../middlewares/routeRateLimiter.js';
 import { CLIP_BUCKET } from '../jobs/clipWorker.js';
 
 const router = Router();
@@ -157,7 +157,7 @@ router.delete('/admin/music/:id', verifyJWT, async (req: AuthenticatedRequest, r
 });
 
 // ── POST /api/clips : créer un job (validation + quota via RPC) ──
-router.post('/', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/', verifyJWT, clipCreateRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const vendor = await getVendorForUser(req.user!.id);
   if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
 
@@ -179,7 +179,7 @@ router.post('/', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res
 });
 
 // ── POST /api/clips/device/init : job 'device' + URLs signées d'upload (rendu sur le téléphone) ──
-router.post('/device/init', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.post('/device/init', verifyJWT, clipCreateRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const vendor = await getVendorForUser(req.user!.id);
   if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
   const b = req.body || {};

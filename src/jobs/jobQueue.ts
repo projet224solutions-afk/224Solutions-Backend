@@ -18,7 +18,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
-import { processQueuedClips, runClipWatchdog, processReplayThumbnails } from './clipWorker.js';
+import { processQueuedClips, runClipWatchdog, processReplayThumbnails, processReplayTranscodes } from './clipWorker.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
@@ -206,6 +206,7 @@ registerHandler('auth-otp.cleanup', async () => {
 registerHandler('clips.process', async () => { await processQueuedClips(); });
 registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
 registerHandler('replays.thumbnails', async () => { await processReplayThumbnails(); });
+registerHandler('replays.transcode', async () => { await processReplayTranscodes(); });
 
 // Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
 // supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
@@ -1361,6 +1362,8 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('clips.watchdog', {}).catch(() => {}), 5 * 60 * 1000));
       // A4 : miniatures des replays (nouveaux + backfill) toutes les 2 min.
       recurringTimers.push(setInterval(() => this.enqueue('replays.thumbnails', {}).catch(() => {}), 2 * 60 * 1000));
+      // P1 Studio : transcodage webm→mp4 des replays (nouveaux + backfill) toutes les 2 min.
+      recurringTimers.push(setInterval(() => this.enqueue('replays.transcode', {}).catch(() => {}), 2 * 60 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;
@@ -1418,6 +1421,11 @@ export const jobQueue = {
       await queue.add('orders.cancel-abandoned-card', {}, { repeat: { every: 15 * 60 * 1000 } });
       await queue.add('stripe.reconcile-pending', {}, { repeat: { every: 10 * 60 * 1000 } });
       await queue.add('taxi.reassign-stale-requests', {}, { repeat: { every: 60 * 1000 } });
+      // Studio Clips (manquaient dans la voie BullMQ — seul le repli in-process les planifiait)
+      await queue.add('clips.process', {}, { repeat: { every: 30 * 1000 } });
+      await queue.add('clips.watchdog', {}, { repeat: { every: 5 * 60 * 1000 } });
+      await queue.add('replays.thumbnails', {}, { repeat: { every: 2 * 60 * 1000 } });
+      await queue.add('replays.transcode', {}, { repeat: { every: 2 * 60 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');
     } catch (err: any) {

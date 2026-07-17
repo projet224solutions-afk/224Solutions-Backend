@@ -214,6 +214,41 @@ export async function runClipWatchdog(): Promise<void> {
 }
 
 /**
+ * 🔧 P1 Studio — TRANSCODAGE des replays webm → mp4 H.264/AAC (+faststart).
+ * Cause racine du « lecteur noir » du Studio : MediaRecorder produit du .webm,
+ * (1) illisible sur iPhone/Safari (le <video> reste noir, durée jamais connue,
+ * montage mort en cascade) et (2) souvent SANS métadonnée de durée même sur
+ * Chrome. Couvre les NOUVEAUX replays ET le backfill des existants.
+ * 1 replay par tick (CPU EC2), 3 tentatives max par process (anti-boucle).
+ */
+const transcodeFailures = new Map<string, number>();
+export async function processReplayTranscodes(): Promise<void> {
+  const { data } = await supabaseAdmin.from('live_streams')
+    .select('id, replay_url').like('replay_url', '%.webm').limit(5);
+  const rows = ((data as any[]) || []).filter((r) => (transcodeFailures.get(r.id) || 0) < 3);
+  const r = rows[0];
+  if (!r) return;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'replaymp4-'));
+  try {
+    const src = path.join(dir, 'src.webm');
+    await download(r.replay_url, src);
+    const out = path.join(dir, 'replay.mp4');
+    await ff(['-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-movflags', '+faststart', out], 20 * 60 * 1000);
+    const meta = await ffprobeJson(out);
+    if (!Number(meta?.format?.duration)) throw new Error('sortie sans durée');
+    const url = await uploadClipFile(out, `live-replays-mp4/${r.id}.mp4`, 'video/mp4');
+    await supabaseAdmin.from('live_streams').update({ replay_url: url }).eq('id', r.id);
+    logger.info(`[replay-mp4] ${r.id} transcodé (${Math.round(Number(meta.format.duration))}s)`);
+  } catch (e: any) {
+    transcodeFailures.set(r.id, (transcodeFailures.get(r.id) || 0) + 1);
+    logger.error(`[replay-mp4] ${r.id}: ${String(e?.message || e).slice(0, 200)}`);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * A4 — miniatures des REPLAYS (fix de l'aperçu OG des lives). Couvre les nouveaux replays ET le
  * backfill des anciens : frame à 25 % de la durée (ffmpeg en lecture HTTP directe du GCS public,
  * pas de download complet) → JPEG → upload GCS → thumbnail_url. Traite un petit lot par tick.

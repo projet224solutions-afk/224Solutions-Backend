@@ -814,6 +814,56 @@ registerHandler('subscriptions.expiry-reminders', async () => {
   logger.info(`Subscription expiry reminders sent: ${sent}`);
 });
 
+// Rappels DETTES FOURNISSEUR (Approvisionnement 224) : J-3, JOUR J, J+1 (retard).
+// Cadence 24h + filtres d'égalité de date ⇒ ~1 envoi par palier, sans table d'état.
+// Bascule aussi automatiquement les dettes échues en 'overdue' (aucun mécanisme ne
+// le faisait — le statut existait sans jamais être écrit).
+registerHandler('supplier-debts.reminders', async () => {
+  const dayStr = (offsetDays: number) =>
+    new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+  const today = dayStr(0);
+
+  // 1) Échues → 'overdue' (une fois par jour).
+  const { data: flipped } = await supabaseAdmin
+    .from('supplier_debts')
+    .update({ status: 'overdue', updated_at: new Date().toISOString() })
+    .eq('status', 'in_progress')
+    .lt('due_date', today)
+    .select('id');
+
+  // 2) Rappels J-3 / J / J+1 aux vendeurs débiteurs.
+  const buckets = [
+    { label: 'J-3', due: dayStr(3), title: 'Dette fournisseur — échéance dans 3 jours' },
+    { label: 'J', due: today, title: 'Dette fournisseur — échéance AUJOURD\'HUI' },
+    { label: 'J+1', due: dayStr(-1), title: 'Dette fournisseur EN RETARD' },
+  ];
+  let sent = 0;
+  for (const b of buckets) {
+    const { data: debts } = await supabaseAdmin
+      .from('supplier_debts')
+      .select('id, vendor_id, remaining_amount, currency, due_date, vendor_suppliers(name)')
+      .in('status', ['in_progress', 'overdue'])
+      .eq('due_date', b.due)
+      .gt('remaining_amount', 0);
+    for (const d of (debts as any[]) || []) {
+      const { data: vendor } = await supabaseAdmin
+        .from('vendors').select('user_id').eq('id', d.vendor_id).maybeSingle();
+      if (!vendor?.user_id) continue;
+      const supplierName = d.vendor_suppliers?.name || 'votre fournisseur';
+      const amount = `${Number(d.remaining_amount).toLocaleString('fr-FR')} ${d.currency || 'GNF'}`;
+      const ok = await createNotification({
+        userId: vendor.user_id,
+        title: b.title,
+        message: `Restant dû à ${supplierName} : ${amount}. Réglez depuis l'onglet Dettes.`,
+        type: 'supplier_debt_reminder',
+        metadata: { link: '/vendeur/suppliers?tab=debts', debt_id: d.id, reminder: b.label },
+      });
+      if (ok) sent++;
+    }
+  }
+  logger.info(`Supplier debt reminders sent: ${sent} (overdue flipped: ${flipped?.length || 0})`);
+});
+
 // Rappels BEAUTÉ : J-1 (la veille) et H-2 (dans ~2h) pour les RDV confirmés.
 registerHandler('beauty.reminders', async () => {
   let sent = 0;
@@ -1273,6 +1323,8 @@ export const jobQueue = {
 
       recurringTimers.push(setInterval(() => this.enqueue('recommendations.recalculate', {}).catch(() => {}), every24Hours));
       recurringTimers.push(setInterval(() => this.enqueue('subscriptions.expiry-reminders', {}).catch(() => {}), every24Hours));
+      // Dettes fournisseur : rappels J-3 / J / J+1 + bascule 'overdue' (quotidien)
+      recurringTimers.push(setInterval(() => this.enqueue('supplier-debts.reminders', {}).catch(() => {}), every24Hours));
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       recurringTimers.push(setInterval(() => this.enqueue('delivery-proof.cleanup', {}).catch(() => {}), every24Hours));
       // Live shopping : purge quotidienne des replays expirés (> 30 j) — objet GCS + replay_url=null
@@ -1336,6 +1388,8 @@ export const jobQueue = {
       // Daily: recommendations + rappels d'expiration d'abonnement
       await queue.add('recommendations.recalculate', {}, { repeat: { every: 24 * 3600000 } });
       await queue.add('subscriptions.expiry-reminders', {}, { repeat: { every: 24 * 3600000 } });
+      // Dettes fournisseur : rappels J-3 / J / J+1 + bascule 'overdue' (quotidien)
+      await queue.add('supplier-debts.reminders', {}, { repeat: { every: 24 * 3600000 } });
       // Purge quotidienne des preuves de livraison 7 j après confirmation de réception (RGPD)
       await queue.add('delivery-proof.cleanup', {}, { repeat: { every: 24 * 3600000 } });
       // Live shopping : purge quotidienne des replays expirés (> 30 j)

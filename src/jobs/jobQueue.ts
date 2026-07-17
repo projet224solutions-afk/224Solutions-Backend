@@ -1085,6 +1085,23 @@ registerHandler('recommendations.recalculate', async () => {
 
 registerHandler('payment-links.cleanup-expired', async () => {
   const now = new Date().toISOString();
+
+  // 1) Liens B2B adossés au stock : expiration + LIBÉRATION de la réservation,
+  //    atomiques (RPC) — AVANT le nettoyage générique pour ne jamais expirer un
+  //    lien réservé sans rendre son stock.
+  try {
+    const { data: b2b, error: b2bErr } = await supabaseAdmin.rpc('expire_b2b_stock_links' as any, {});
+    if (b2bErr) {
+      // RPC absente tant que la migration 20260717210000 n'est pas appliquée → non bloquant.
+      logger.warn(`B2B stock links expiry skipped: ${b2bErr.message}`);
+    } else if ((b2b as any)?.expired > 0) {
+      logger.info(`B2B stock links expired: ${(b2b as any).expired} (réservations libérées: ${(b2b as any).released})`);
+    }
+  } catch (e: any) {
+    logger.warn(`B2B stock links expiry error: ${e?.message}`);
+  }
+
+  // 2) Nettoyage générique (liens classiques, sans réservation).
   const { data: expired, error } = await supabaseAdmin
     .from('payment_links')
     .update({ status: 'expired' })

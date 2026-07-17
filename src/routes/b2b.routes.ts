@@ -810,4 +810,415 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
   }
 });
 
+// ═══════════════════ ESPACE GROSSISTE — LIENS DE VENTE ═══════════════════════
+
+const CreateStockLinkSchema = z.object({
+  items: z.array(z.object({
+    product_id: z.string().uuid(),
+    quantity: z.number().int().min(1).max(1_000_000),
+    unit_price: z.number().min(0),
+  })).min(1).max(100),
+  title: z.string().min(1).max(120),
+  target_vendor_id: z.string().uuid().nullish(),
+  expires_hours: z.number().int().min(1).max(24 * 90).nullish(),
+  single_use: z.boolean().nullish(),
+  max_uses: z.number().int().min(1).max(10_000).nullish(),
+  allow_credit: z.boolean().nullish(),
+  credit_due_days: z.number().int().min(0).max(365).nullish(),
+  notes: z.string().max(1000).nullish(),
+});
+
+/**
+ * POST /api/b2b/links — créer un lien de vente adossé au stock.
+ * Usage unique + destinataire ciblé → RÉSERVATION immédiate du stock.
+ */
+router.post('/links', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const parsed = CreateStockLinkSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return fail(res, 400, parsed.error.issues[0]?.message || 'Données invalides', 'INVALID_PARAMS');
+    }
+    const input = parsed.data;
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+
+    const singleUse = input.single_use !== false;
+    const { data, error } = await supabaseAdmin.rpc('create_b2b_stock_link' as any, {
+      p_supplier_vendor_id: vendorId,
+      p_items: input.items,
+      p_title: input.title,
+      p_target_vendor_id: input.target_vendor_id || null,
+      p_expires_hours: input.expires_hours ?? 72,
+      p_single_use: singleUse,
+      p_max_uses: singleUse ? null : (input.max_uses ?? 1),
+      p_allow_credit: input.allow_credit ?? false,
+      p_credit_due_days: input.credit_due_days ?? null,
+      p_currency: 'GNF',
+      p_notes: input.notes || null,
+    });
+    if (error) {
+      logger.error(`[b2b/links create] RPC: ${error.message}`);
+      return fail(res, 500, 'Erreur lors de la création du lien');
+    }
+    const result = data as any;
+    if (!result?.success) {
+      const code = String(result?.error || 'UNKNOWN');
+      const messages: Record<string, string> = {
+        STOCK_INSUFFICIENT: `Stock insuffisant${result?.product_name ? ` : ${result.product_name} (${result.available} disponible)` : ''}`,
+        PRODUCT_NOT_FOUND: 'Un produit sélectionné est introuvable ou inactif',
+        MAX_USES_REQUIRED: 'Un plafond total est requis pour un lien multi-usage',
+        CREDIT_DUE_REQUIRED: 'Une échéance est requise quand le crédit est autorisé',
+        SELF_TARGET: 'Vous ne pouvez pas cibler votre propre boutique',
+        TARGET_NOT_FOUND: 'Boutique destinataire introuvable',
+        TITLE_REQUIRED: 'Un titre est requis',
+        INVALID_LINE: 'Ligne produit invalide',
+        EMPTY_ITEMS: 'Aucun produit sélectionné',
+        INVALID_TOTAL: 'Le total du lien doit être positif',
+      };
+      return fail(res, 409, messages[code] || 'Création du lien refusée', code);
+    }
+
+    // Notification in-app au client ciblé (jamais bloquant).
+    if (input.target_vendor_id) {
+      const { data: target } = await supabaseAdmin
+        .from('vendors').select('user_id, business_name').eq('id', input.target_vendor_id).maybeSingle();
+      const { data: me } = await supabaseAdmin
+        .from('vendors').select('business_name').eq('id', vendorId).maybeSingle();
+      if (target?.user_id) {
+        await createNotification({
+          userId: target.user_id,
+          title: 'Nouvelle offre fournisseur',
+          message: `${me?.business_name || 'Un fournisseur'} vous a envoyé une offre : ${input.title}.`,
+          type: 'b2b_stock_link',
+          metadata: { link: `/pay/${result.token}`, payment_link_id: result.link_id },
+        });
+      }
+    }
+
+    return ok(res, {
+      link_id: result.link_id,
+      payment_id: result.payment_id,
+      token: result.token,
+      total: result.total,
+      reserved: result.reserved,
+      url_path: `/pay/${result.token}`,
+    });
+  } catch (error: any) {
+    logger.error(`[b2b/links create] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors de la création du lien');
+  }
+});
+
+/** GET /api/b2b/links — mes liens de vente (fournisseur), avec restes. */
+router.get('/links', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+
+    const { data, error } = await supabaseAdmin
+      .from('payment_links')
+      .select('id, payment_id, token, title, status, montant, total, devise, expires_at, created_at, paid_at, is_single_use, max_uses, use_count, target_vendor_id, allow_credit, credit_due_days, stock_reserved, gross_amount, metadata')
+      .eq('vendeur_id', vendorId)
+      .eq('link_type', 'b2b_stock')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+
+    const rows = (data || []) as any[];
+    const targetIds = Array.from(new Set(rows.map(r => r.target_vendor_id).filter(Boolean)));
+    let names = new Map<string, string>();
+    if (targetIds.length) {
+      const { data: vendors } = await supabaseAdmin
+        .from('vendors').select('id, business_name').in('id', targetIds);
+      names = new Map((vendors || []).map(v => [v.id, v.business_name]));
+    }
+    return ok(res, rows.map(r => ({
+      ...r,
+      target_business_name: r.target_vendor_id ? names.get(r.target_vendor_id) || null : null,
+      remaining_uses: r.is_single_use
+        ? (r.use_count > 0 ? 0 : 1)
+        : r.max_uses != null ? Math.max(0, r.max_uses - (r.use_count || 0)) : null,
+    })));
+  } catch (error: any) {
+    logger.error(`[b2b/links list] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors du chargement des liens');
+  }
+});
+
+/** POST /api/b2b/links/:id/cancel — annule + libère la réservation. */
+router.post('/links/:id([0-9a-fA-F-]{36})/cancel', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+    const { data, error } = await supabaseAdmin.rpc('cancel_b2b_stock_link' as any, {
+      p_link_id: req.params.id, p_supplier_vendor_id: vendorId,
+    });
+    if (error) {
+      logger.error(`[b2b/links cancel] RPC: ${error.message}`);
+      return fail(res, 500, 'Erreur lors de l\'annulation du lien');
+    }
+    const result = data as any;
+    if (!result?.success) return fail(res, 404, 'Lien introuvable', String(result?.error || 'LINK_NOT_FOUND'));
+    return ok(res, { released: !!result.released, already: !!result.already });
+  } catch (error: any) {
+    logger.error(`[b2b/links cancel] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors de l\'annulation du lien');
+  }
+});
+
+/**
+ * POST /api/b2b/links/:id/accept — le client-vendeur PAIE (wallet) ou ACCEPTE
+ * À CRÉDIT. Crée la commande B2B DÉJÀ CONFIRMÉE (même moteur que le compagnon).
+ * Frais acheteur = règle PDG B2B (purchase_fee_percent), fournisseur payé plein prix.
+ */
+router.post('/links/:id([0-9a-fA-F-]{36})/accept', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const mode = req.body?.mode === 'credit' ? 'credit' : 'wallet';
+    const ctx = await resolveVendorContext(req.user!.id);
+    if (!ctx.vendorId) {
+      return fail(res, 403, 'Un compte vendeur 224Solutions est requis pour accepter cette offre', 'VENDOR_REQUIRED');
+    }
+    const customerId = await getOrCreateCustomerId(req.user!.id);
+
+    // Frais acheteur (uniquement paiement wallet) sur le total du lien.
+    let buyerFee = 0;
+    if (mode === 'wallet') {
+      const { data: link } = await supabaseAdmin
+        .from('payment_links').select('total, montant, devise').eq('id', req.params.id).maybeSingle();
+      const total = Number((link as any)?.total ?? (link as any)?.montant ?? 0);
+      const feePercent = await getBuyerFeePercent();
+      buyerFee = roundMoney(total * (feePercent / 100), String((link as any)?.devise || 'GNF'));
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('accept_b2b_stock_link' as any, {
+      p_link_id: req.params.id,
+      p_buyer_user_id: req.user!.id,
+      p_buyer_vendor_id: ctx.vendorId,
+      p_customer_id: customerId,
+      p_mode: mode,
+      p_buyer_fee: buyerFee,
+    });
+    if (error) {
+      const m = String(error.message || '');
+      logger.warn(`[b2b/links accept] RPC: ${m}`);
+      const friendly = /INSUFFICIENT_FUNDS/.test(m) ? 'Solde wallet insuffisant'
+        : /WALLET_BLOCKED/.test(m) ? 'Wallet bloqué'
+        : /SELLER_WALLET_NOT_FOUND/.test(m) ? 'Le fournisseur n\'a pas de wallet'
+        : /BUYER_WALLET_NOT_FOUND/.test(m) ? 'Wallet introuvable'
+        : 'Erreur lors de l\'acceptation';
+      return fail(res, /INSUFFICIENT_FUNDS/.test(m) ? 402 : 500, friendly);
+    }
+    const result = data as any;
+    if (!result?.success) {
+      const code = String(result?.error || 'UNKNOWN');
+      const messages: Record<string, string> = {
+        LINK_NOT_FOUND: 'Offre introuvable',
+        LINK_NOT_PAYABLE: 'Cette offre n\'est plus disponible',
+        LINK_EXPIRED: 'Cette offre a expiré',
+        LINK_ALREADY_USED: 'Cette offre a déjà été utilisée',
+        LINK_EXHAUSTED: 'Le plafond d\'utilisations de cette offre est atteint',
+        NOT_TARGET: 'Cette offre est réservée à un autre destinataire',
+        CREDIT_NOT_ALLOWED: 'Le paiement à crédit n\'est pas autorisé sur cette offre',
+        OWN_LINK: 'Vous ne pouvez pas accepter votre propre offre',
+        STOCK_INSUFFICIENT: `Stock fournisseur insuffisant${result?.product_name ? ` : ${result.product_name}` : ''}`,
+        BUYER_VENDOR_INVALID: 'Compte vendeur invalide',
+      };
+      const status = code === 'NOT_TARGET' ? 403 : code === 'LINK_EXPIRED' ? 410 : 409;
+      return fail(res, status, messages[code] || 'Acceptation refusée', code);
+    }
+
+    await createNotification({
+      userId: result.supplier_user_id,
+      title: mode === 'wallet' ? 'Offre payée' : 'Offre acceptée à crédit',
+      message: `${result.buyer_business_name || 'Un client'} a ${mode === 'wallet' ? 'payé' : 'accepté à crédit'} votre offre ${result.link_payment_id} — commande ${result.order_number} confirmée, il ne reste qu'à expédier.`,
+      type: 'b2b_link_accepted_order',
+      metadata: { link: '/vendeur/suppliers?tab=b2b', order_id: result.order_id },
+    });
+
+    return ok(res, {
+      order_id: result.order_id,
+      purchase_id: result.purchase_id,
+      order_number: result.order_number,
+      total: result.total,
+      currency: result.currency,
+      mode,
+      debt_id: result.debt_id ?? null,
+      buyer_fee: buyerFee,
+    });
+  } catch (error: any) {
+    logger.error(`[b2b/links accept] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors de l\'acceptation');
+  }
+});
+
+// ═══════════════════ ESPACE GROSSISTE — COCKPIT ══════════════════════════════
+
+/** GET /api/b2b/clients — mes clients-vendeurs liés (annuaire + stats). */
+router.get('/clients', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+
+    // Fiches où JE suis le fournisseur lié → le propriétaire de la fiche est mon client.
+    const { data: fiches, error } = await supabaseAdmin
+      .from('vendor_suppliers')
+      .select('id, vendor_id, created_at')
+      .eq('linked_vendor_id', vendorId)
+      .eq('link_status', 'linked');
+    if (error) throw error;
+
+    const clientIds = Array.from(new Set((fiches || []).map((f: any) => f.vendor_id)));
+    if (clientIds.length === 0) return ok(res, []);
+
+    const [{ data: vendors }, { data: orders }, { data: debts }] = await Promise.all([
+      supabaseAdmin.from('vendors').select('id, business_name, logo_url, public_id').in('id', clientIds),
+      (supabaseAdmin.from('orders') as any)
+        .select('id, total_amount, status, metadata, created_at')
+        .eq('vendor_id', vendorId).eq('order_type', 'b2b_purchase').limit(2000),
+      supabaseAdmin
+        .from('supplier_debts')
+        .select('vendor_id, remaining_amount, status, supplier_id, vendor_suppliers!inner(linked_vendor_id)')
+        .eq('vendor_suppliers.linked_vendor_id', vendorId)
+        .in('status', ['in_progress', 'overdue']),
+    ]);
+
+    const vMap = new Map((vendors || []).map((v: any) => [v.id, v]));
+    const stats = new Map<string, { orders: number; ca: number; last: string | null }>();
+    for (const o of (orders || []) as any[]) {
+      const buyer = o.metadata?.buyer_vendor_id;
+      if (!buyer || !clientIds.includes(buyer)) continue;
+      const s = stats.get(buyer) || { orders: 0, ca: 0, last: null };
+      s.orders += 1;
+      if (['delivered', 'completed'].includes(o.status)) s.ca += Number(o.total_amount || 0);
+      if (!s.last || o.created_at > s.last) s.last = o.created_at;
+      stats.set(buyer, s);
+    }
+    const debtMap = new Map<string, number>();
+    for (const d of (debts || []) as any[]) {
+      debtMap.set(d.vendor_id, (debtMap.get(d.vendor_id) || 0) + Number(d.remaining_amount || 0));
+    }
+
+    return ok(res, (fiches || []).map((f: any) => ({
+      supplier_row_id: f.id,
+      client_vendor_id: f.vendor_id,
+      business_name: vMap.get(f.vendor_id)?.business_name || null,
+      logo_url: vMap.get(f.vendor_id)?.logo_url || null,
+      public_id: vMap.get(f.vendor_id)?.public_id || null,
+      linked_since: f.created_at,
+      orders_count: stats.get(f.vendor_id)?.orders || 0,
+      ca_total: stats.get(f.vendor_id)?.ca || 0,
+      last_order_at: stats.get(f.vendor_id)?.last || null,
+      outstanding_credit: debtMap.get(f.vendor_id) || 0,
+    })).sort((a, b) => b.ca_total - a.ca_total));
+  } catch (error: any) {
+    logger.error(`[b2b/clients] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors du chargement des clients');
+  }
+});
+
+/** GET /api/b2b/receivables — mes CRÉANCES (dettes clients vues du créancier). */
+router.get('/receivables', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+
+    const { data, error } = await supabaseAdmin
+      .from('supplier_debts')
+      .select('id, vendor_id, purchase_id, total_amount, paid_amount, remaining_amount, minimum_installment, due_date, currency, status, created_at, vendor_suppliers!inner(linked_vendor_id)')
+      .eq('vendor_suppliers.linked_vendor_id', vendorId)
+      .order('due_date', { ascending: true, nullsFirst: false })
+      .limit(500);
+    if (error) throw error;
+
+    const rows = (data || []) as any[];
+    const debtorIds = Array.from(new Set(rows.map(r => r.vendor_id)));
+    let names = new Map<string, string>();
+    if (debtorIds.length) {
+      const { data: vendors } = await supabaseAdmin
+        .from('vendors').select('id, business_name').in('id', debtorIds);
+      names = new Map((vendors || []).map((v: any) => [v.id, v.business_name]));
+    }
+    return ok(res, rows.map(r => ({
+      id: r.id,
+      debtor_vendor_id: r.vendor_id,
+      debtor_business_name: names.get(r.vendor_id) || null,
+      purchase_id: r.purchase_id,
+      total_amount: r.total_amount,
+      paid_amount: r.paid_amount,
+      remaining_amount: r.remaining_amount,
+      due_date: r.due_date,
+      currency: r.currency,
+      status: r.status,
+      created_at: r.created_at,
+    })));
+  } catch (error: any) {
+    logger.error(`[b2b/receivables] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors du chargement des créances');
+  }
+});
+
+/** GET /api/b2b/kpis?days=30 — cockpit fournisseur : CA B2B, états, créances, top clients. */
+router.get('/kpis', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const vendorId = await requireSupplierContext(req, res);
+    if (!vendorId) return;
+    const days = Math.min(Math.max(parseInt(String(req.query.days)) || 30, 1), 365);
+    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+
+    const [{ data: orders }, { data: debts }] = await Promise.all([
+      (supabaseAdmin.from('orders') as any)
+        .select('id, total_amount, status, metadata, created_at')
+        .eq('vendor_id', vendorId).eq('order_type', 'b2b_purchase')
+        .gte('created_at', since).limit(5000),
+      supabaseAdmin
+        .from('supplier_debts')
+        .select('remaining_amount, due_date, status, vendor_suppliers!inner(linked_vendor_id)')
+        .eq('vendor_suppliers.linked_vendor_id', vendorId)
+        .in('status', ['in_progress', 'overdue']),
+    ]);
+
+    const rows = (orders || []) as any[];
+    const byState: Record<string, number> = {};
+    let ca = 0;
+    const perClient = new Map<string, { name: string; ca: number; orders: number }>();
+    for (const o of rows) {
+      byState[o.status] = (byState[o.status] || 0) + 1;
+      const isDone = ['delivered', 'completed'].includes(o.status);
+      if (isDone) ca += Number(o.total_amount || 0);
+      const buyer = o.metadata?.buyer_vendor_id;
+      if (buyer) {
+        const c = perClient.get(buyer) || { name: o.metadata?.buyer_business_name || '', ca: 0, orders: 0 };
+        c.orders += 1;
+        if (isDone) c.ca += Number(o.total_amount || 0);
+        perClient.set(buyer, c);
+      }
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    let receivablesTotal = 0;
+    let receivablesOverdue = 0;
+    for (const d of (debts || []) as any[]) {
+      receivablesTotal += Number(d.remaining_amount || 0);
+      if (d.status === 'overdue' || (d.due_date && d.due_date < today)) {
+        receivablesOverdue += Number(d.remaining_amount || 0);
+      }
+    }
+
+    return ok(res, {
+      period_days: days,
+      ca_b2b: ca,
+      orders_total: rows.length,
+      orders_by_state: byState,
+      receivables_total: receivablesTotal,
+      receivables_overdue: receivablesOverdue,
+      top_clients: Array.from(perClient.entries())
+        .map(([vendor_id, c]) => ({ vendor_id, business_name: c.name, ca: c.ca, orders: c.orders }))
+        .sort((a, b) => b.ca - a.ca)
+        .slice(0, 5),
+    });
+  } catch (error: any) {
+    logger.error(`[b2b/kpis] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors du chargement des indicateurs');
+  }
+});
+
 export default router;

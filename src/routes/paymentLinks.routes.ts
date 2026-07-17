@@ -285,6 +285,14 @@ router.post('/resolve', async (req: Request, res: Response) => {
         remise: link.remise,
         typeRemise: link.type_remise,
         items: (rawLink.metadata && (rawLink.metadata as any).items) || [],
+        // Lien de vente B2B adossé au stock (colonnes absentes tant que la
+        // migration 20260717210000 n'est pas appliquée → undefined, sans effet).
+        useCount: link.use_count ?? 0,
+        maxUses: (rawLink as any).max_uses ?? null,
+        targetVendorId: (rawLink as any).target_vendor_id ?? null,
+        allowCredit: (rawLink as any).allow_credit ?? false,
+        creditDueDays: (rawLink as any).credit_due_days ?? null,
+        stockReserved: (rawLink as any).stock_reserved ?? false,
       },
       owner: ownerInfo,
       product: productInfo,
@@ -351,6 +359,18 @@ router.post('/process', paymentRateLimit, optionalJWT, async (req: Authenticated
 
     if (link.is_single_use && link.use_count > 0) {
       res.status(400).json({ success: false, error: 'Ce lien a déjà été utilisé' });
+      return;
+    }
+
+    // Lien de vente B2B adossé au stock : règlement UNIQUEMENT via le parcours
+    // dédié (/api/b2b/links/:id/accept — réservation + commande B2B confirmée +
+    // frais acheteur PDG). Le chemin générique le court-circuiterait.
+    if (link.link_type === 'b2b_stock') {
+      res.status(409).json({
+        success: false,
+        error: 'Cette offre B2B se règle depuis la page de l\'offre avec un compte vendeur 224Solutions.',
+        error_code: 'B2B_LINK_USE_B2B_API',
+      });
       return;
     }
 

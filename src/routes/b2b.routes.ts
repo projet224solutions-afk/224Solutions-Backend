@@ -961,8 +961,28 @@ router.get('/links', verifyJWT, async (req: AuthenticatedRequest, res: Response)
         .from('vendors').select('id, business_name').in('id', targetIds);
       names = new Map((vendors || []).map(v => [v.id, v.business_name]));
     }
+
+    // 🖼️ Vignettes produits des cartes de liens : metadata.items ne stocke pas
+    // d'image → jointure produits en UNE requête (jamais de N+1), image
+    // principale injectée dans la réponse (la base n'est pas modifiée).
+    const productIds = Array.from(new Set(rows.flatMap(r =>
+      ((r.metadata?.items || []) as Array<{ product_id?: string }>).map(it => it.product_id).filter(Boolean))));
+    let images = new Map<string, string | null>();
+    if (productIds.length) {
+      const { data: prods } = await supabaseAdmin
+        .from('products').select('id, images').in('id', productIds as string[]);
+      images = new Map((prods || []).map((p: any) => [p.id, (p.images && p.images[0]) || null]));
+    }
+
     return ok(res, rows.map(r => ({
       ...r,
+      metadata: r.metadata ? {
+        ...r.metadata,
+        items: ((r.metadata.items || []) as any[]).map(it => ({
+          ...it,
+          image: it.image || (it.product_id ? images.get(it.product_id) || null : null),
+        })),
+      } : r.metadata,
       target_business_name: r.target_vendor_id ? names.get(r.target_vendor_id) || null : null,
       remaining_uses: r.is_single_use
         ? (r.use_count > 0 ? 0 : 1)

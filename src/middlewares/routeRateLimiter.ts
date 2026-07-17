@@ -33,6 +33,46 @@ interface RateLimitConfig {
 // In-memory fallback store (basic, no persistence)
 const memoryStore = new Map<string, { count: number; resetAt: number }>();
 
+// 🚨 Redis indisponible : le PDG doit le SAVOIR (system_alerts), pas le découvrir.
+// Une alerte par heure et par process, jamais bloquant pour la requête.
+let lastRedisDownAlertAt = 0;
+async function alertRedisUnavailableOnce(routeKey: string): Promise<void> {
+  const now = Date.now();
+  if (now - lastRedisDownAlertAt < 3600_000) return;
+  lastRedisDownAlertAt = now;
+  logger.error(`Rate limiter : Redis indisponible — repli MÉMOIRE par instance (route: ${routeKey})`);
+  try {
+    const { supabaseAdmin } = await import('../config/supabase.js');
+    await supabaseAdmin.from('system_alerts').insert({
+      title: 'Rate limiter : Redis indisponible',
+      message: `Les limiteurs stricts tournent en repli MÉMOIRE par instance (quota exact en mono-instance ; jusqu'à N× le quota en multi-instance). Action : configurer REDIS_URL (+ NODE_ENV=production) sur le VPS. Première route touchée : ${routeKey}`,
+      severity: 'high',
+      module: 'rate_limiter',
+      status: 'active',
+      metadata: { route: routeKey },
+    } as never);
+  } catch { /* l'alerte ne casse jamais la requête */ }
+}
+
+/** État du limiteur (dashboard PDG) : Redis joignable ? entrées mémoire actives ? */
+export async function rateLimiterState(): Promise<{ redis_available: boolean; mode: string; memory_entries: number }> {
+  const { redisRateLimit } = await import('../config/redis.js');
+  const probe = await redisRateLimit.check('health-probe', 1000000, 1);
+  const up = probe.resetAt !== 0;
+  return {
+    redis_available: up,
+    mode: up ? 'redis' : 'memoire_par_instance',
+    memory_entries: memoryStore.size,
+  };
+}
+
+/** Réarmement manuel (PDG) : vide le store mémoire (débloque un quota local). */
+export function resetMemoryRateLimiter(): number {
+  const n = memoryStore.size;
+  memoryStore.clear();
+  return n;
+}
+
 function memoryRateLimit(key: string, max: number, windowMs: number): { allowed: boolean; remaining: number } {
   const now = Date.now();
   const entry = memoryStore.get(key);
@@ -84,24 +124,37 @@ export function routeRateLimit(config: RateLimitConfig) {
       // ✅ Routes sensibles : fail-closed — on refuse plutôt que de laisser
       // passer N× le quota entre instances quand Redis est down.
       if (failClosed) {
-        logger.error(`Rate limit FAIL-CLOSED (Redis down) sur route sensible: ${key}`);
-        if (logBreach) {
-          await auditTrail.log({
-            actorId: (req as any).user?.id || req.ip || 'unknown',
-            actorType: 'user',
-            action: 'rate_limit.fail_closed',
-            resourceType: 'endpoint',
-            resourceId: req.originalUrl,
-            ip: req.ip,
-            riskLevel: 'high',
-            metadata: { keyPrefix, reason: 'redis_unavailable' },
+        // 🔧 CAUSE RACINE du « Service temporairement indisponible » PERMANENT
+        // sur les routes ARGENT (retrait cash, dépôt, wallet-pay) : Redis absent
+        // → l'ancien refus AVEUGLE bloquait 100 % des requêtes sans erreur
+        // d'origine. Remplacé par le REPLI MÉMOIRE : le quota reste garanti PAR
+        // INSTANCE (exact en mono-instance — la prod actuelle ; jusqu'à N× le
+        // quota en multi-instance, compromis documenté), la disponibilité est
+        // totale, et l'indisponibilité de Redis est ALERTÉE (system_alerts + log).
+        await alertRedisUnavailableOnce(key);
+        const strictMem = memoryRateLimit(key, maxRequests, windowSeconds * 1000);
+        if (!strictMem.allowed) {
+          if (logBreach) {
+            await auditTrail.log({
+              actorId: (req as any).user?.id || req.ip || 'unknown',
+              actorType: 'user',
+              action: 'rate_limit.exceeded',
+              resourceType: 'endpoint',
+              resourceId: req.originalUrl,
+              ip: req.ip,
+              riskLevel: 'high',
+              metadata: { keyPrefix, reason: 'redis_unavailable_memory_fallback' },
+            });
+          }
+          res.status(429).json({
+            success: false,
+            error: 'Trop de requêtes. Veuillez réessayer dans un moment.',
+            error_code: 'RATE_LIMITED',
+            retryAfter: windowSeconds,
           });
+          return;
         }
-        res.status(429).json({
-          success: false,
-          error: 'Service temporairement indisponible. Veuillez réessayer dans un moment.',
-          retryAfter: windowSeconds,
-        });
+        next();
         return;
       }
 
@@ -124,6 +177,7 @@ export function routeRateLimit(config: RateLimitConfig) {
         res.status(429).json({
           success: false,
           error: 'Trop de requêtes. Veuillez réessayer dans un moment.',
+          error_code: 'RATE_LIMITED',
           retryAfter: windowSeconds,
         });
         return;
@@ -154,6 +208,7 @@ export function routeRateLimit(config: RateLimitConfig) {
       res.status(429).json({
         success: false,
         error: 'Trop de requêtes. Veuillez réessayer dans un moment.',
+        error_code: 'RATE_LIMITED',
         retryAfter: windowSeconds,
       });
       return;

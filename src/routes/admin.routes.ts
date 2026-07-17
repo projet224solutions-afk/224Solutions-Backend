@@ -739,6 +739,28 @@ router.post('/ids/normalize', verifyJWT, requireRole(PDG_ROLES), async (req: Aut
  * rapport d'anomalies, synchronise les alertes (system_alerts) et renvoie { domains, alerts }.
  * Réservé PDG/admin.
  */
+
+// ── 🚦 Rate limiter (routes argent) : état + réarmement manuel (PDG) ────────
+// L'indisponibilité Redis est alertée dans system_alerts (visible au centre
+// d'alertes PDG existant) ; ici : lecture d'état et purge du store mémoire.
+router.get('/rate-limiter/state', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { rateLimiterState } = await import('../middlewares/routeRateLimiter.js');
+    res.json({ success: true, data: await rateLimiterState() });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e?.message || 'État indisponible' });
+  }
+});
+
+router.post('/rate-limiter/reset', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { resetMemoryRateLimiter } = await import('../middlewares/routeRateLimiter.js');
+    res.json({ success: true, data: { cleared_entries: resetMemoryRateLimiter() } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e?.message || 'Réarmement impossible' });
+  }
+});
+
 router.get('/platform-monitor', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
   try {
     // skipFnDomains : on évite le scan RÉSEAU sécurité-frontend dans la requête (timeout serverless →

@@ -170,6 +170,14 @@ export const authRateLimit = routeRateLimit({
   maxRequests: 10, windowSeconds: 900, keyPrefix: 'auth', perUser: false, perIp: true, failClosed: true,
 });
 
+/** Sondes d'auth NON sensibles (check-phone, email de secours) : anti-rafale
+ *  par IP, fail-open (repli mémoire). authRateLimit fail-closed rendait la
+ *  pré-vérification du numéro 429 permanente quand Redis est absent — or le
+ *  filet réel est l'index UNIQUE en base + le flux OTP, pas ce limiteur. */
+export const authSoftRateLimit = routeRateLimit({
+  maxRequests: 30, windowSeconds: 900, keyPrefix: 'auth-soft', perUser: false, perIp: true, failClosed: false,
+});
+
 /** Studio Clips : anti-rafale par UTILISATEUR, fail-open (repli mémoire).
  *  Le quota/jour et l'idempotence vivent DANS la RPC create_clip_job — un
  *  fail-closed ici rendait la création de clips 429 permanente dès que Redis

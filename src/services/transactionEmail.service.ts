@@ -83,6 +83,14 @@ export function getEmailHealth(): {
 }
 
 export async function sendEmail(email: string, subject: string, html: string): Promise<boolean> {
+  // 📱 Comptes « téléphone seul » : l'email est une adresse TECHNIQUE interne
+  // (p{numero}@phone.…) — aucune boîte derrière. On saute l'envoi (succès
+  // logique, jamais une erreur) ; l'utilisateur est notifié in-app par les
+  // flux existants (table notifications).
+  if (/@phone\.224solutions?\.net$/i.test(email.trim())) {
+    logger.info(`[TransactionEmail] adresse technique téléphone (${email.replace(/^.{4}/, '####')}) — envoi sauté, notification in-app fait foi`);
+    return true;
+  }
   const apiKey = env.RESEND_API_KEY;
   if (!apiKey) {
     emailFailures++;

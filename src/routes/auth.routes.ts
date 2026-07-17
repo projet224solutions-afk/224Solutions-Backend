@@ -21,7 +21,7 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
 import { getClientIp } from '../middlewares/ipBlocklist.js';
-import { authRateLimit } from '../middlewares/routeRateLimiter.js';
+import { authSoftRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
@@ -176,13 +176,58 @@ router.post('/finalize-phone-signup', verifyJWT, async (req: AuthenticatedReques
 });
 
 /**
+ * POST /auth/attach-backup-email  { email }
+ * 📧 « Email de secours » d'un compte TÉLÉPHONE : rattache un vrai email au
+ * compte courant (l'email technique p{numero}@phone.… n'est jamais montré).
+ * N'exige PAS le mot de passe (le JWT prouve la session) et n'y touche pas.
+ * Idempotent : re-poser le même email = succès.
+ */
+const AttachBackupEmailSchema = z.object({ email: z.string().email('Email invalide') });
+router.post('/attach-backup-email', verifyJWT, authSoftRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const parsed = AttachBackupEmailSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, error: parsed.error.issues[0]?.message || 'Données invalides' });
+      return;
+    }
+    const normalizedEmail = parsed.data.email.trim().toLowerCase();
+    // Jamais une adresse technique comme email de secours.
+    if (/@phone\.224solutions?\.net$/i.test(normalizedEmail)) {
+      res.status(400).json({ success: false, error: 'Utilisez une adresse email personnelle.' });
+      return;
+    }
+    const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+      email: normalizedEmail,
+      email_confirm: true,
+    });
+    if (updErr) {
+      const msg = (updErr.message || '').toLowerCase();
+      if (msg.includes('already') || msg.includes('registered') || msg.includes('exists') || msg.includes('duplicate')) {
+        res.status(409).json({ success: false, error: 'Cet email est déjà utilisé par un autre compte.', error_code: 'EMAIL_TAKEN' });
+        return;
+      }
+      logger.error(`[auth/backup-email] ${userId}: ${updErr.message}`);
+      res.status(500).json({ success: false, error: "Impossible d'ajouter cet email" });
+      return;
+    }
+    const { error: profErr } = await supabaseAdmin.from('profiles').update({ email: normalizedEmail }).eq('id', userId);
+    if (profErr) logger.warn(`[auth/backup-email] profil: ${profErr.message}`);
+    res.json({ success: true, data: { email: normalizedEmail } });
+  } catch (err: any) {
+    logger.error(`[auth/backup-email] ${err?.message}`);
+    res.status(500).json({ success: false, error: "Erreur lors de l'ajout de l'email" });
+  }
+});
+
+/**
  * POST /auth/check-phone  { phone }
  * Unicité « 1 numéro = 1 compte » : vérifie qu'un numéro n'est PAS déjà lié à un compte
  * AVANT l'inscription. Public + rate-limité (anti-énumération ; l'existence est déjà
  * révélée par le flux OTP existant). Forme canonique = 9 derniers chiffres (RPC déterministe).
  * → 409 { action:'account_recovery' } si pris : le front propose la récupération OTP SMS.
  */
-router.post('/check-phone', authRateLimit, async (req: Request, res: Response): Promise<void> => {
+router.post('/check-phone', authSoftRateLimit, async (req: Request, res: Response): Promise<void> => {
   try {
     const phone = String(req.body?.phone ?? '').trim();
     const digits = phone.replace(/[^0-9]/g, '');

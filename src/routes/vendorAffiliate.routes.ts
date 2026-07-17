@@ -190,7 +190,7 @@ router.get('/marketplace', verifyJWT, async (req: AuthenticatedRequest, res: Res
   try {
     let q = supabaseAdmin.from('digital_products')
       .select('id, title, price, currency, images, category, short_description, affiliate_commission_rate, vendor_id')
-      .eq('affiliate_enabled', true).eq('is_active', true);
+      .eq('affiliate_enabled', true).eq('status', 'published');
     const category = String(req.query.category || '').trim();
     if (category) q = q.eq('category', category);
     const minRate = Number(req.query.min_rate || 0);

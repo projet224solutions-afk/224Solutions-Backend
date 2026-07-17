@@ -45,7 +45,7 @@ BEGIN
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM public.digital_products
-    WHERE id = p_product_id AND affiliate_enabled = true AND is_active = true
+    WHERE id = p_product_id AND affiliate_enabled = true AND status = 'published'
   ) THEN
     RETURN jsonb_build_object('success', true, 'counted', false);
   END IF;

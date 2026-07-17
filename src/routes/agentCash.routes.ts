@@ -319,6 +319,34 @@ router.post('/deposit', verifyJWT, paymentRateLimit, async (req: AuthenticatedRe
   // Notice de dépôt : push simple SANS PIN (recevoir = zéro risque) + SMS de confirmation (preuve).
   void sendPushToUser(client.id, { title: 'Dépôt reçu', message: `${agent.name} vous a déposé ${gnf(amount)}.`, data: { type: 'agent_cash_deposit', amount } });
   void postTxSms(client.id, `224Solutions : depot de ${gnf(amount)} recu via l'agent ${agent.name}.`);
+  // 🔔 In-app SYSTÉMATIQUE (le retrait notifiait, le dépôt était MUET dans la
+  // cloche : push non accordé + SMS en échec = client aveugle). APRÈS l'atomicité,
+  // fire-and-forget : un échec de notification ne fait JAMAIS échouer le dépôt.
+  void (async () => {
+    try {
+      const d = (data ?? {}) as { client_credited?: number; client_currency?: string; agent_commission?: number; commission_paid?: boolean };
+      const { data: w } = await supabaseAdmin.from('wallets')
+        .select('balance').eq('user_id', client.id)
+        .eq('currency', d.client_currency || 'GNF').maybeSingle();
+      const solde = w ? ` Nouveau solde : ${gnf(Number((w as { balance: number }).balance))}.` : '';
+      await createNotification({
+        userId: client.id,
+        title: '💰 Dépôt reçu',
+        message: `${gnf(Number(d.client_credited ?? amount))} reçus via l'agent ${agent.name}.${solde}`,
+        type: 'agent_cash_deposit',
+        metadata: { link: '/wallet', amount: Number(d.client_credited ?? amount), agent_id: agent.id },
+      });
+      await createNotification({
+        userId: req.user!.id,
+        title: 'Dépôt effectué',
+        message: `Dépôt de ${gnf(amount)} pour ${client.name || 'le client'} — commission ${gnf(Number(d.agent_commission || 0))}${d.commission_paid ? ' créditée' : ''}.`,
+        type: 'agent_cash_deposit_done',
+        metadata: { link: '/agent', amount },
+      });
+    } catch (e: unknown) {
+      logger.warn(`[agent-cash/deposit] notifications ignorées: ${(e as Error)?.message}`);
+    }
+  })();
   res.json({ success: true, data: { ...(data as any), client_name: client.name } });
 });
 

@@ -283,7 +283,7 @@ router.post('/display-names', verifyJWT, async (req: AuthenticatedRequest, res: 
  * Résout un identifiant EXACT vers un user_id (pas de ILIKE, pas de liste).
  * Ordre : UUID → user_ids.custom_id → profiles.public_id/custom_id → email exact → téléphone exact.
  */
-async function resolveExactUserId(identifier: string): Promise<string | null> {
+export async function resolveExactUserId(identifier: string): Promise<string | null> {
   const raw = String(identifier || '').trim();
   if (!raw) return null;
 

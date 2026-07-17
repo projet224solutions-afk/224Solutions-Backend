@@ -17,6 +17,7 @@ import { issueLiveToken, currentLiveProvider } from '../services/liveToken.servi
 import { startLiveRecording, stopLiveRecording } from '../services/agoraRecording.service.js';
 import { uuidToNumericUid } from '../services/agoraToken.js';
 import { getBucketName, loadServiceAccount, generateSignedUrl } from '../services/gcs.service.js';
+import { REPLAY_BUCKET, privateReplayPath, privateReplayUrl } from '../jobs/clipWorker.js';
 
 const router = Router();
 
@@ -42,6 +43,8 @@ function isAllowedThumbnailUrl(raw: string): boolean {
   try {
     const sb = process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL) : null;
     if (sb && u.hostname === sb.hostname && u.pathname.startsWith('/storage/v1/object/public/')) return true;
+    // 🔒 P2 : forme canonique des replays PRIVÉS (bucket live-replays, non fetchable sans jeton).
+    if (sb && u.hostname === sb.hostname && u.pathname.startsWith(`/storage/v1/object/authenticated/${REPLAY_BUCKET}/`)) return true;
   } catch { /* URL SUPABASE_URL invalide → on ignore */ }
   return false;
 }
@@ -231,6 +234,64 @@ router.post('/streams/:id/replay-ready', verifyJWT, async (req: AuthenticatedReq
     return ok(res, { streamId, replayUrl: replay_url });
   } catch (e: any) {
     logger.error(`[live/replay-ready] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// ── 🔒 P2 Studio : replays bruts PRIVÉS (bucket live-replays, jamais publics) ──
+
+// POST /streams/:id/replay-upload-url (host) — URL signée d'upload vers le
+// bucket PRIVÉ. Le client uploade puis appelle replay-ready avec final_url.
+router.post('/streams/:id/replay-upload-url', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'Identifiant de live invalide', 'INVALID_STREAM_ID');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+
+    const objectPath = `raw/${streamId}/${Date.now()}.webm`;
+    const { data: signed, error } = await supabaseAdmin.storage.from(REPLAY_BUCKET).createSignedUploadUrl(objectPath);
+    if (error || !signed) return fail(res, 500, "URL d'upload indisponible");
+    return ok(res, {
+      bucket: REPLAY_BUCKET,
+      path: objectPath,
+      token: signed.token,
+      final_url: privateReplayUrl(objectPath),
+    });
+  } catch (e: any) {
+    logger.error(`[live/replay-upload-url] ${e?.message}`);
+    return fail(res, 500, 'Erreur serveur');
+  }
+});
+
+// GET /streams/:id/replay-access (host) — URL SIGNÉE courte de lecture du
+// replay brut, servie à SON vendeur seulement (Studio, panneau Mes lives).
+router.get('/streams/:id/replay-access', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const streamId = req.params.id;
+    if (!UUID_RE.test(streamId)) return fail(res, 400, 'Identifiant de live invalide', 'INVALID_STREAM_ID');
+    const { data: stream } = await supabaseAdmin
+      .from('live_streams').select('vendor_user_id, replay_url').eq('id', streamId).maybeSingle();
+    if (!stream) return fail(res, 404, 'Live introuvable');
+    if ((stream as any).vendor_user_id !== userId) return fail(res, 403, 'Réservé au vendeur hôte');
+    const replayUrl = (stream as any).replay_url as string | null;
+    if (!replayUrl) return fail(res, 404, 'Replay indisponible', 'REPLAY_UNAVAILABLE');
+
+    const privatePath = privateReplayPath(replayUrl);
+    if (privatePath) {
+      const { data: signed, error } = await supabaseAdmin.storage.from(REPLAY_BUCKET)
+        .createSignedUrl(privatePath, 3600);
+      if (error || !signed?.signedUrl) return fail(res, 500, 'URL signée indisponible');
+      return ok(res, { url: signed.signedUrl, expires_in: 3600 });
+    }
+    // Héritage (public Supabase/GCS pas encore migré) : l'URL directe reste lisible.
+    return ok(res, { url: replayUrl, expires_in: null });
+  } catch (e: any) {
+    logger.error(`[live/replay-access] ${e?.message}`);
     return fail(res, 500, 'Erreur serveur');
   }
 });

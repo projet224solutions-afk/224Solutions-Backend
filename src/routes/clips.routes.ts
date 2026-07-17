@@ -29,16 +29,16 @@ async function isPdg(userId: string): Promise<boolean> {
   return ['pdg', 'admin', 'ceo'].includes((((prof as any)?.role) || '').toLowerCase());
 }
 
-/** Mappe une erreur RPC create_clip_job → {code, message FR}. */
-function mapClipError(msg: string): { code: number; error: string } {
+/** Mappe une erreur RPC create_clip_job → {code, message FR, error_code}. */
+function mapClipError(msg: string): { code: number; error: string; error_code?: string } {
   const m = String(msg || '');
-  if (m.includes('STREAM_INTROUVABLE')) return { code: 404, error: "Ce live/replay est introuvable ou ne vous appartient pas." };
-  if (m.includes('REPLAY_INDISPONIBLE')) return { code: 409, error: "Le replay de ce live n'est pas encore disponible." };
-  if (m.includes('SEGMENTS_CHEVAUCHENT')) return { code: 400, error: "Les segments sélectionnés se chevauchent." };
-  if (m.includes('SEGMENT_INVALIDE') || m.includes('SEGMENTS_INVALIDES')) return { code: 400, error: "Sélection de segments invalide (1 à 3 plages, début < fin)." };
-  if (m.includes('DUREE_DEPASSEE')) return { code: 400, error: "La durée totale dépasse la limite (5 minutes)." };
-  if (m.includes('QUOTA_ATTEINT')) return { code: 429, error: "Quota de clips du jour atteint. Réessayez demain." };
-  if (m.includes('RENDERED_ON_INVALIDE')) return { code: 400, error: "Mode de rendu invalide." };
+  if (m.includes('STREAM_INTROUVABLE')) return { code: 404, error: "Ce live/replay est introuvable ou ne vous appartient pas.", error_code: 'STREAM_NOT_FOUND' };
+  if (m.includes('REPLAY_INDISPONIBLE')) return { code: 409, error: "Le replay de ce live n'est pas encore disponible.", error_code: 'REPLAY_UNAVAILABLE' };
+  if (m.includes('SEGMENTS_CHEVAUCHENT')) return { code: 400, error: "Les segments sélectionnés se chevauchent.", error_code: 'SEGMENTS_OVERLAP' };
+  if (m.includes('SEGMENT_INVALIDE') || m.includes('SEGMENTS_INVALIDES')) return { code: 400, error: "Sélection de segments invalide (1 à 3 plages, début < fin).", error_code: 'SEGMENTS_INVALID' };
+  if (m.includes('DUREE_DEPASSEE')) return { code: 400, error: "La durée totale dépasse la limite (5 minutes).", error_code: 'DURATION_LIMIT' };
+  if (m.includes('QUOTA_ATTEINT')) return { code: 429, error: "Quota de clips du jour atteint. Réessayez demain.", error_code: 'QUOTA_REACHED' };
+  if (m.includes('RENDERED_ON_INVALIDE')) return { code: 400, error: "Mode de rendu invalide.", error_code: 'RENDERED_ON_INVALID' };
   return { code: 500, error: "Création du clip impossible." };
 }
 
@@ -73,7 +73,7 @@ router.get('/mine', verifyJWT, async (req: AuthenticatedRequest, res: Response):
   const vendor = await getVendorForUser(req.user!.id);
   if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
   const { data, error } = await supabaseAdmin.from('live_clips')
-    .select('id, stream_id, title, status, rendered_on, progress, segments, overlay, music_track_id, output_url, output_vertical_url, thumbnail_url, duration_s, size_bytes, error, created_at')
+    .select('id, stream_id, title, status, rendered_on, progress, segments, overlay, music_track_id, output_url, output_vertical_url, thumbnail_url, duration_s, size_bytes, error, created_at, is_published')
     .eq('vendor_id', vendor.id).order('created_at', { ascending: false }).limit(50);
   if (error) { res.status(500).json({ success: false, error: 'Liste indisponible' }); return; }
   res.json({ success: true, data: data || [] });
@@ -174,8 +174,22 @@ router.post('/', verifyJWT, clipCreateRateLimit, async (req: AuthenticatedReques
     p_rendered_on: b.rendered_on === 'device' ? 'device' : 'server',
     p_idempotency_key: idem,
   });
-  if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error, error_code: e.error_code }); return; }
+  // 🌍 La PUBLICATION est un choix du vendeur — défaut ON (spec PDG), opt-out via publish:false.
+  await supabaseAdmin.from('live_clips').update({ is_published: b.publish !== false } as any).eq('id', data as any);
   res.json({ success: true, data: { id: data } });
+});
+
+// ── POST /api/clips/:id/publish : publier / repasser en privé (le vendeur garde la main) ──
+router.post('/:id/publish', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const vendor = await getVendorForUser(req.user!.id);
+  if (!vendor) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
+  const published = req.body?.published !== false;
+  const { data, error } = await supabaseAdmin.from('live_clips')
+    .update({ is_published: published } as any)
+    .eq('id', req.params.id).eq('vendor_id', vendor.id).select('id').maybeSingle();
+  if (error || !data) { res.status(404).json({ success: false, error: 'Clip introuvable' }); return; }
+  res.json({ success: true, data: { id: req.params.id, is_published: published } });
 });
 
 // ── POST /api/clips/device/init : job 'device' + URLs signées d'upload (rendu sur le téléphone) ──
@@ -189,7 +203,8 @@ router.post('/device/init', verifyJWT, clipCreateRateLimit, async (req: Authenti
     p_segments: b.segments ?? [], p_overlay: b.overlay ?? {}, p_music_track_id: b.music_track_id ?? null,
     p_cover_time_s: b.cover_time_s ?? null, p_rendered_on: 'device', p_idempotency_key: idem,
   });
-  if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  if (error) { const e = mapClipError(error.message); res.status(e.code).json({ success: false, error: e.error, error_code: e.error_code }); return; }
+  await supabaseAdmin.from('live_clips').update({ is_published: b.publish !== false } as any).eq('id', id as any);
   const base = `clips/${vendor.id}/${id}`;
   const [land, cover] = await Promise.all([
     supabaseAdmin.storage.from(CLIP_BUCKET).createSignedUploadUrl(`${base}/paysage.mp4`),

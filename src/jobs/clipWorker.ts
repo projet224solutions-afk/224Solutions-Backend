@@ -17,6 +17,23 @@ import { logger } from '../config/logger.js';
 const pexec = promisify(execFile);
 // Les clips vivent sur Supabase Storage (comme les replays/images) → public + CORS garantis.
 export const CLIP_BUCKET = 'communication-files';
+// 🔒 Les replays BRUTS vivent dans un bucket PRIVÉ (règle PDG : jamais publics).
+// URL canonique stockée en base : https://<proj>/storage/v1/object/authenticated/live-replays/<path>
+// (400/403 sans jeton — seule une URL signée courte, servie au vendeur, permet la lecture).
+export const REPLAY_BUCKET = 'live-replays';
+const PRIVATE_REPLAY_MARKER = `/storage/v1/object/authenticated/${REPLAY_BUCKET}/`;
+
+/** Chemin objet d'une URL de replay privé (null si ce n'en est pas une). */
+export function privateReplayPath(url: string): string | null {
+  const i = String(url || '').indexOf(PRIVATE_REPLAY_MARKER);
+  return i >= 0 ? decodeURIComponent(url.slice(i + PRIVATE_REPLAY_MARKER.length).split('?')[0]) : null;
+}
+
+/** URL canonique (non fetchable publiquement) d'un objet replay privé. */
+export function privateReplayUrl(objectPath: string): string {
+  const base = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  return `${base}/storage/v1/object/authenticated/${REPLAY_BUCKET}/${objectPath}`;
+}
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 const BLUE = '0x04439E';
 
@@ -39,8 +56,15 @@ async function setProgress(id: string, p: number, extra: Record<string, any> = {
   await supabaseAdmin.from('live_clips').update({ progress: p, ...extra }).eq('id', id);
 }
 
-/** Télécharge une URL publique vers un fichier local. */
+/** Télécharge une URL (publique OU replay privé via service) vers un fichier local. */
 async function download(url: string, dest: string): Promise<void> {
+  const privatePath = privateReplayPath(url);
+  if (privatePath) {
+    const { data, error } = await supabaseAdmin.storage.from(REPLAY_BUCKET).download(privatePath);
+    if (error || !data) throw new Error(`download privé ${error?.message || 'vide'}`);
+    await fs.writeFile(dest, Buffer.from(await data.arrayBuffer()));
+    return;
+  }
   const r = await fetch(url);
   if (!r.ok) throw new Error(`download ${r.status}`);
   const buf = Buffer.from(await r.arrayBuffer());
@@ -174,11 +198,17 @@ async function processClip(clip: ClipRow): Promise<void> {
     const thumbUrl = await uploadClipFile(cover, `${base}/cover.jpg`, 'image/jpeg');
 
     const outMeta = await ffprobeJson(body);
+    const outDur = Number(outMeta?.format?.duration || 0);
+    // 🔒 Verrou 5:00 sur la SORTIE RÉELLE (ffprobe) — la validation création ne
+    // suffit pas (règle inviolable) : > max + 2 s de tolérance → failed, jamais publié.
+    const { data: cfg } = await supabaseAdmin.from('clip_config').select('max_clip_duration_s').eq('id', true).maybeSingle();
+    const maxS = Number((cfg as any)?.max_clip_duration_s || 300);
+    if (outDur > maxS + 2) throw new Error(`DUREE_SORTIE_DEPASSEE (${Math.round(outDur)}s > ${maxS}s)`);
     const stat = await fs.stat(body);
     await supabaseAdmin.from('live_clips').update({
       status: 'ready', progress: 100,
       output_url: outputUrl, output_vertical_url: verticalUrl, thumbnail_url: thumbUrl,
-      duration_s: Number(outMeta?.format?.duration || 0), size_bytes: stat.size, error: null,
+      duration_s: outDur, size_bytes: stat.size, error: null,
     }).eq('id', clip.id);
     logger.info(`[clips] ${clip.id} ready (${Math.round(stat.size / 1e6)}MB)`);
   } catch (e: any) {
@@ -237,9 +267,14 @@ export async function processReplayTranscodes(): Promise<void> {
       '-c:a', 'aac', '-movflags', '+faststart', out], 20 * 60 * 1000);
     const meta = await ffprobeJson(out);
     if (!Number(meta?.format?.duration)) throw new Error('sortie sans durée');
-    const url = await uploadClipFile(out, `live-replays-mp4/${r.id}.mp4`, 'video/mp4');
-    await supabaseAdmin.from('live_streams').update({ replay_url: url }).eq('id', r.id);
-    logger.info(`[replay-mp4] ${r.id} transcodé (${Math.round(Number(meta.format.duration))}s)`);
+    // 🔒 Le mp4 transcodé va dans le bucket PRIVÉ (les replays bruts ne sont jamais publics).
+    const objectPath = `raw/${r.id}.mp4`;
+    const bodyBuf = await fs.readFile(out);
+    const { error: upErr } = await supabaseAdmin.storage.from(REPLAY_BUCKET)
+      .upload(objectPath, bodyBuf, { contentType: 'video/mp4', upsert: true });
+    if (upErr) throw new Error(`upload privé ${upErr.message}`);
+    await supabaseAdmin.from('live_streams').update({ replay_url: privateReplayUrl(objectPath) }).eq('id', r.id);
+    logger.info(`[replay-mp4] ${r.id} transcodé privé (${Math.round(Number(meta.format.duration))}s)`);
   } catch (e: any) {
     transcodeFailures.set(r.id, (transcodeFailures.get(r.id) || 0) + 1);
     logger.error(`[replay-mp4] ${r.id}: ${String(e?.message || e).slice(0, 200)}`);
@@ -262,14 +297,117 @@ export async function processReplayThumbnails(): Promise<void> {
   try {
     for (const r of rows) {
       try {
+        // Replays privés : ffmpeg ne peut plus lire l'URL en HTTP → download service d'abord.
+        let input = r.replay_url as string;
+        if (privateReplayPath(input)) {
+          input = path.join(dir, `${r.id}-src`);
+          await download(r.replay_url, input);
+        }
         let t = 1;
-        try { const meta = await ffprobeJson(r.replay_url); const d = Number(meta?.format?.duration || 0); if (d > 0) t = d * 0.25; } catch { /* durée inconnue → 1 s */ }
+        try { const meta = await ffprobeJson(input); const d = Number(meta?.format?.duration || 0); if (d > 0) t = d * 0.25; } catch { /* durée inconnue → 1 s */ }
         const out = path.join(dir, `${r.id}.jpg`);
-        await ff(['-ss', String(t), '-i', r.replay_url, '-frames:v', '1', '-vf', 'scale=1280:-1', '-q:v', '4', out], 120000);
+        await ff(['-ss', String(t), '-i', input, '-frames:v', '1', '-vf', 'scale=1280:-1', '-q:v', '4', out], 120000);
         const url = await uploadClipFile(out, `live-thumbnails/${r.id}.jpg`, 'image/jpeg');
         await supabaseAdmin.from('live_streams').update({ thumbnail_url: url }).eq('id', r.id);
         logger.info(`[replay-thumb] ${r.id} ok`);
       } catch (e: any) { logger.error(`[replay-thumb] ${r.id}: ${String(e?.message || e).slice(0, 200)}`); }
     }
   } finally { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+
+/**
+ * 🎬 P2 — RAPPEL J+1 du parcours guidé : un replay d'hier sans clip → notification
+ * « Votre live d'hier attend son clip ». Une seule fois (clip_reminder_sent_at).
+ */
+export async function processClipReminders(): Promise<void> {
+  const { createNotification } = await import('../services/notification.service.js');
+  const { data } = await supabaseAdmin.from('live_streams')
+    .select('id, title, vendor_user_id')
+    .not('replay_url', 'is', null)
+    .is('clip_reminder_sent_at', null)
+    .lt('ended_at', new Date(Date.now() - 24 * 3600e3).toISOString())
+    .gt('ended_at', new Date(Date.now() - 72 * 3600e3).toISOString())
+    .limit(20);
+  for (const r of ((data as any[]) || [])) {
+    const { count } = await supabaseAdmin.from('live_clips')
+      .select('id', { count: 'exact', head: true }).eq('stream_id', r.id);
+    if (!count) {
+      await createNotification({
+        userId: r.vendor_user_id,
+        title: '🎬 Votre live attend son clip',
+        message: `« ${r.title} » : créez un clip (≤ 5 min) au Studio pour le publier — le replay brut reste privé.`,
+        type: 'clip_reminder',
+        metadata: { link: `/studio-clips?stream=${r.id}` },
+      }).catch(() => {});
+    }
+    await supabaseAdmin.from('live_streams').update({ clip_reminder_sent_at: new Date().toISOString() }).eq('id', r.id);
+  }
+}
+
+/**
+ * 🧹 P2 — RÉTENTION de la matière première : purge des replays bruts NON MONTÉS
+ * au-delà de clip_config.raw_replay_retention_days (défaut 30), avec
+ * avertissement J-3 (« votre replay expire — montez-le »). Les clips générés
+ * restent. Gère les fichiers privés (bucket live-replays) et l'héritage public
+ * Supabase ; les URLs GCS sont laissées à l'ancienne purge (loggé).
+ */
+export async function processReplayRetention(): Promise<void> {
+  const { createNotification } = await import('../services/notification.service.js');
+  const { data: cfg } = await supabaseAdmin.from('clip_config').select('raw_replay_retention_days').eq('id', true).maybeSingle();
+  const days = Math.max(3, Number((cfg as any)?.raw_replay_retention_days || 30));
+  const now = Date.now();
+
+  // 1) Avertissement J-3 (une seule fois), seulement si aucun clip prêt n'existe.
+  const warnBefore = new Date(now - (days - 3) * 86400e3).toISOString();
+  const { data: toWarn } = await supabaseAdmin.from('live_streams')
+    .select('id, title, vendor_user_id')
+    .not('replay_url', 'is', null)
+    .is('replay_expiry_notified_at', null)
+    .lt('ended_at', warnBefore)
+    .limit(20);
+  for (const r of ((toWarn as any[]) || [])) {
+    const { count } = await supabaseAdmin.from('live_clips')
+      .select('id', { count: 'exact', head: true }).eq('stream_id', r.id).eq('status', 'ready');
+    if (!count) {
+      await createNotification({
+        userId: r.vendor_user_id,
+        title: '⏳ Votre replay expire bientôt',
+        message: `« ${r.title} » sera purgé dans 3 jours — montez-le au Studio pour garder un clip.`,
+        type: 'replay_expiry',
+        metadata: { link: `/studio-clips?stream=${r.id}` },
+      }).catch(() => {});
+    }
+    await supabaseAdmin.from('live_streams').update({ replay_expiry_notified_at: new Date().toISOString() }).eq('id', r.id);
+  }
+
+  // 2) Purge au-delà de la rétention — le fichier est supprimé, la ligne et les
+  //    clips restent (replay_url → null). GCS : loggé, purge existante conservée.
+  const purgeBefore = new Date(now - days * 86400e3).toISOString();
+  const { data: toPurge } = await supabaseAdmin.from('live_streams')
+    .select('id, replay_url').not('replay_url', 'is', null).lt('ended_at', purgeBefore).limit(20);
+  let purged = 0;
+  for (const r of ((toPurge as any[]) || [])) {
+    const url = String(r.replay_url);
+    const privatePath = privateReplayPath(url);
+    const publicMarker = `/object/public/${CLIP_BUCKET}/`;
+    const pubIdx = url.indexOf(publicMarker);
+    try {
+      if (privatePath) {
+        const { error } = await supabaseAdmin.storage.from(REPLAY_BUCKET).remove([privatePath]);
+        if (error && !/not.*found/i.test(error.message)) throw new Error(error.message);
+      } else if (pubIdx >= 0) {
+        const p = decodeURIComponent(url.slice(pubIdx + publicMarker.length).split('?')[0]);
+        const { error } = await supabaseAdmin.storage.from(CLIP_BUCKET).remove([p]);
+        if (error && !/not.*found/i.test(error.message)) throw new Error(error.message);
+      } else {
+        logger.warn(`[replay-retention] ${r.id}: URL non gérée (GCS ?) — laissée à live-replays.purge`);
+        continue;
+      }
+      await supabaseAdmin.from('live_streams').update({ replay_url: null }).eq('id', r.id);
+      purged++;
+    } catch (e: any) {
+      logger.error(`[replay-retention] ${r.id}: ${String(e?.message || e).slice(0, 200)}`);
+    }
+  }
+  if (purged) logger.info(`[replay-retention] ${purged} replay(s) brut(s) purgés (> ${days} j)`);
 }

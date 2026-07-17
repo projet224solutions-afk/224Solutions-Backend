@@ -18,7 +18,10 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
-import { processQueuedClips, runClipWatchdog, processReplayThumbnails, processReplayTranscodes } from './clipWorker.js';
+import {
+  processQueuedClips, runClipWatchdog, processReplayThumbnails, processReplayTranscodes,
+  processClipReminders, processReplayRetention,
+} from './clipWorker.js';
 import { env } from '../config/env.js';
 import { collectAfricanRates, refreshBcrgOnly, checkBcrgHeadChanged } from '../services/fxRates.service.js';
 import { createNotification } from '../services/notification.service.js';
@@ -207,6 +210,8 @@ registerHandler('clips.process', async () => { await processQueuedClips(); });
 registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
 registerHandler('replays.thumbnails', async () => { await processReplayThumbnails(); });
 registerHandler('replays.transcode', async () => { await processReplayTranscodes(); });
+registerHandler('replays.clip-reminders', async () => { await processClipReminders(); });
+registerHandler('replays.retention', async () => { await processReplayRetention(); });
 
 // Purge des preuves de livraison 7 jours APRÈS la confirmation de réception du client :
 // supprime les fichiers du bucket privé + efface les chemins en base (RGPD/rétention courte).
@@ -1364,6 +1369,9 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('replays.thumbnails', {}).catch(() => {}), 2 * 60 * 1000));
       // P1 Studio : transcodage webm→mp4 des replays (nouveaux + backfill) toutes les 2 min.
       recurringTimers.push(setInterval(() => this.enqueue('replays.transcode', {}).catch(() => {}), 2 * 60 * 1000));
+      // P2 : rappel J+1 « créez votre clip » (6 h) + rétention/purge des replays bruts (24 h).
+      recurringTimers.push(setInterval(() => this.enqueue('replays.clip-reminders', {}).catch(() => {}), 6 * 3600 * 1000));
+      recurringTimers.push(setInterval(() => this.enqueue('replays.retention', {}).catch(() => {}), 24 * 3600 * 1000));
 
       logger.info('✅ In-process recurring jobs scheduled');
       return;
@@ -1426,6 +1434,8 @@ export const jobQueue = {
       await queue.add('clips.watchdog', {}, { repeat: { every: 5 * 60 * 1000 } });
       await queue.add('replays.thumbnails', {}, { repeat: { every: 2 * 60 * 1000 } });
       await queue.add('replays.transcode', {}, { repeat: { every: 2 * 60 * 1000 } });
+      await queue.add('replays.clip-reminders', {}, { repeat: { every: 6 * 3600 * 1000 } });
+      await queue.add('replays.retention', {}, { repeat: { every: 24 * 3600 * 1000 } });
 
       logger.info('✅ Recurring jobs scheduled');
     } catch (err: any) {

@@ -88,10 +88,13 @@ async function requireSupplierContext(req: AuthenticatedRequest, res: Response):
 async function publicVendorCard(vendorId: string) {
   const { data } = await supabaseAdmin
     .from('vendors')
-    .select('id, business_name, logo_url, public_id, rating, is_active, user_id')
+    .select('id, business_name, logo_url, public_id, rating, is_active, user_id, sale_type')
     .eq('id', vendorId)
     .maybeSingle();
   if (!data || data.is_active === false) return null;
+  // 🏷️ Un DÉTAILLANT ne vend pas en gros → invisible comme FOURNISSEUR
+  // (même réponse « aucune correspondance » — anti-énumération).
+  if ((data as any).sale_type === 'detaillant') return null;
   return {
     vendor_id: data.id,
     business_name: data.business_name,
@@ -99,6 +102,30 @@ async function publicVendorCard(vendorId: string) {
     public_id: (data as any).public_id || null,
     rating: (data as any).rating ?? null,
   };
+}
+
+/** Type de vente du vendeur (detaillant | detail_gros | gros). */
+async function vendorSaleType(vendorId: string): Promise<string> {
+  const { data, error } = await supabaseAdmin
+    .from('vendors').select('sale_type').eq('id', vendorId).maybeSingle();
+  if (error) throw error;
+  return String((data as any)?.sale_type || 'detail_gros');
+}
+
+/**
+ * 🛡️ Garde VENTE EN GROS : les endpoints du côté VENDEUR B2B (création de lien
+ * de vente…) exigent sale_type ∈ {detail_gros, gros}. Le côté ACHAT reste
+ * ouvert à tous (le détaillant est le CLIENT du B2B) ; les LECTURES restent
+ * ouvertes (suivi du « B2B en cours » après une descente de type).
+ * Répond 403 SALE_TYPE_REQUIRED et renvoie false si refus.
+ */
+async function requireWholesaleSaleType(vendorId: string, res: Response): Promise<boolean> {
+  const saleType = await vendorSaleType(vendorId);
+  if (saleType === 'detaillant') {
+    fail(res, 403, 'Activez la vente en gros (type de vente) pour utiliser l\'espace Ventes B2B', 'SALE_TYPE_REQUIRED');
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -841,6 +868,8 @@ router.post('/links', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequ
     const input = parsed.data;
     const vendorId = await requireSupplierContext(req, res);
     if (!vendorId) return;
+    // 🛡️ Vendre en gros exige le type de vente adapté (jamais bloquant à l'ACHAT).
+    if (!(await requireWholesaleSaleType(vendorId, res))) return;
 
     const singleUse = input.single_use !== false;
     const { data, error } = await supabaseAdmin.rpc('create_b2b_stock_link' as any, {

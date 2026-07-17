@@ -13,7 +13,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { authRateLimit, paymentRateLimit } from '../middlewares/routeRateLimiter.js';
 import { sendSms } from '../services/sms.service.js';
 import { userHasFcmToken, sendPushToUser } from '../services/push.service.js';
-import { verifyWalletPin } from '../services/walletPin.service.js';
+import { verifyWalletPin, isPinSchemaAvailableForMoney } from '../services/walletPin.service.js';
 import { createNotification } from '../services/notification.service.js';
 
 const router = Router();
@@ -452,6 +452,10 @@ router.post('/withdrawal/confirm', verifyJWT, paymentRateLimit, async (req: Auth
     res.status(409).json({ success: false, error: 'Demande expirée' }); return;
   }
 
+  // 🔒 Fail-closed argent : schéma PIN absent → refus.
+  if (!(await isPinSchemaAvailableForMoney())) {
+    res.status(503).json({ success: false, error: 'Sécurité PIN indisponible — retrait refusé par prudence.', error_code: 'PIN_SCHEMA_UNAVAILABLE' }); return;
+  }
   const pinRes = await verifyWalletPin(clientId, pin);   // service PIN EXISTANT (verrous inclus)
   if (!pinRes.valid) {
     const attempts = r.pin_attempts + 1;
@@ -503,6 +507,10 @@ router.post('/withdrawal/client-qr', verifyJWT, paymentRateLimit, async (req: Au
   const amount = Number(req.body?.amount);
   const pin = String(req.body?.pin || '');
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+  // 🔒 Fail-closed argent : schéma PIN absent → refus.
+  if (!(await isPinSchemaAvailableForMoney())) {
+    res.status(503).json({ success: false, error: 'Sécurité PIN indisponible — retrait refusé par prudence.', error_code: 'PIN_SCHEMA_UNAVAILABLE' }); return;
+  }
   const pinRes = await verifyWalletPin(clientId, pin);   // PIN vérifié ICI (avant), l'agent n'en a pas besoin
   if (!pinRes.valid) { res.status(401).json({ success: false, error: pinRes.error || 'Code PIN invalide', locked_until: pinRes.lockedUntil }); return; }
 

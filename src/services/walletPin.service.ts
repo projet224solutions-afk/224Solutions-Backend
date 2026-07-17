@@ -2,6 +2,59 @@ import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { logger } from '../config/logger.js';
+
+/**
+ * 🔒 FAIL-CLOSED sur l'ARGENT : si les colonnes PIN manquent (migration
+ * absente), les routes d'argent doivent REFUSER (503 PIN_SCHEMA_UNAVAILABLE)
+ * — jamais laisser passer. Les lectures gardent la tolérance historique.
+ * L'indisponibilité est alertée (system_alerts, 1/h par process).
+ */
+let pinSchemaAlertAt = 0;
+export async function isPinSchemaAvailableForMoney(): Promise<boolean> {
+  const { error } = await supabaseAdmin.from('wallets').select('pin_enabled').limit(1);
+  if (!error) return true;
+  if (!isWalletPinSchemaMissingError(error)) return true; // autre panne → gérée par le flux appelant
+  if (Date.now() - pinSchemaAlertAt > 3600_000) {
+    pinSchemaAlertAt = Date.now();
+    logger.error('[walletPin] SCHÉMA PIN ABSENT — routes argent en fail-closed (migration PIN manquante)');
+    try {
+      await supabaseAdmin.from('system_alerts').insert({
+        title: 'Schéma PIN absent — argent bloqué (fail-closed)',
+        message: 'Les colonnes wallets.pin_* sont introuvables : les routes d’argent refusent (503 PIN_SCHEMA_UNAVAILABLE). Appliquer la migration PIN.',
+        severity: 'critical', module: 'wallet_pin', status: 'active',
+      } as never);
+    } catch { /* l'alerte ne casse jamais le flux */ }
+  }
+  return false;
+}
+
+/**
+ * 🎚️ Politique PIN (pdg_settings) — RELUE À CHAQUE APPEL : une modification
+ * PDG s'applique immédiatement, sans redéploiement.
+ *  - pin_required_transfer_threshold : seuil GNF (défaut 500 000).
+ *  - pin_required_operations : opérations couvertes.
+ */
+export async function getPinPolicy(): Promise<{ threshold: number; operations: string[] }> {
+  let threshold = 500000;
+  let operations = ['transfer', 'withdrawal', 'payment_link', 'b2b_payment'];
+  try {
+    const { data } = await supabaseAdmin.from('pdg_settings')
+      .select('setting_key, setting_value')
+      .in('setting_key', ['pin_required_transfer_threshold', 'pin_required_operations']);
+    for (const row of ((data || []) as Array<{ setting_key: string; setting_value: unknown }>)) {
+      const v = row.setting_value as { value?: unknown } | unknown[];
+      if (row.setting_key === 'pin_required_transfer_threshold') {
+        const n = Number((v as { value?: unknown })?.value ?? v);
+        if (Number.isFinite(n) && n >= 0) threshold = n;
+      } else if (row.setting_key === 'pin_required_operations') {
+        const arr = Array.isArray(v) ? v : Array.isArray((v as { value?: unknown })?.value) ? (v as { value: unknown[] }).value : null;
+        if (arr && arr.length) operations = arr.map(String);
+      }
+    }
+  } catch { /* défauts sûrs */ }
+  return { threshold, operations };
+}
 
 const PIN_LENGTH = 6;
 const MAX_FAILED_ATTEMPTS = 5;

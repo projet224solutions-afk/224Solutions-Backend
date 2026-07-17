@@ -182,7 +182,11 @@ router.post('/finalize-phone-signup', verifyJWT, async (req: AuthenticatedReques
  * N'exige PAS le mot de passe (le JWT prouve la session) et n'y touche pas.
  * Idempotent : re-poser le même email = succès.
  */
-const AttachBackupEmailSchema = z.object({ email: z.string().email('Email invalide') });
+const AttachBackupEmailSchema = z.object({
+  email: z.string().email('Email invalide'),
+  password: z.string().optional(),
+  pin: z.string().optional(),
+});
 router.post('/attach-backup-email', verifyJWT, authSoftRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
@@ -192,6 +196,31 @@ router.post('/attach-backup-email', verifyJWT, authSoftRateLimit, async (req: Au
       return;
     }
     const normalizedEmail = parsed.data.email.trim().toLowerCase();
+
+    // 🛡️ Anti-détournement : changer l'email du compte exige une RE-PREUVE
+    // d'identité — mot de passe OU PIN wallet (jamais loggé, jamais renvoyé).
+    const { pin, password } = parsed.data;
+    let reproved = false;
+    if (password) {
+      const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(userId);
+      const currentEmail = authUser?.user?.email;
+      if (currentEmail) {
+        const disposable = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const { error: pwErr } = await disposable.auth.signInWithPassword({ email: currentEmail, password });
+        reproved = !pwErr;
+      }
+    }
+    if (!reproved && pin) {
+      const { verifyWalletPin } = await import('../services/walletPin.service.js');
+      const v = await verifyWalletPin(userId, pin);
+      reproved = v.valid;
+    }
+    if (!reproved) {
+      res.status(401).json({ success: false, error: 'Confirmez votre identité (mot de passe ou code PIN) pour modifier l\'email du compte.', error_code: 'REPROOF_REQUIRED' });
+      return;
+    }
     // Jamais une adresse technique comme email de secours.
     if (/@phone\.224solutions?\.net$/i.test(normalizedEmail)) {
       res.status(400).json({ success: false, error: 'Utilisez une adresse email personnelle.' });

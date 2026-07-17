@@ -12,7 +12,7 @@ import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { paymentRateLimit, authRateLimit } from '../middlewares/routeRateLimiter.js';
-import { verifyWalletPin } from '../services/walletPin.service.js';
+import { verifyWalletPin, isPinSchemaAvailableForMoney } from '../services/walletPin.service.js';
 import { createNotification } from '../services/notification.service.js';
 
 const router = Router();
@@ -86,6 +86,11 @@ router.post('/pay', verifyJWT, paymentRateLimit, async (req: AuthenticatedReques
   if (!ref) { res.status(400).json({ success: false, error: 'QR manquant' }); return; }
   if (amount != null && !posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
 
+  // 🔒 Fail-closed argent : schéma PIN absent → refus (jamais de laissez-passer).
+  if (!(await isPinSchemaAvailableForMoney())) {
+    res.status(503).json({ success: false, error: 'Sécurité PIN indisponible — paiement refusé par prudence.', error_code: 'PIN_SCHEMA_UNAVAILABLE' });
+    return;
+  }
   // PIN via le service EXISTANT (verrous + tentatives gérés là-bas).
   const pinRes = await verifyWalletPin(clientId, pin);
   if (!pinRes.valid) { res.status(401).json({ success: false, error: pinRes.error || 'Code PIN invalide', locked_until: pinRes.lockedUntil }); return; }

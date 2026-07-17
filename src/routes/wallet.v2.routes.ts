@@ -26,7 +26,7 @@ import { creditWallet, debitWallet, transferBetweenWallets, selectSenderWallet, 
 import { isFxRateFresh } from '../services/fxFreshness.js';
 import { createNotification } from '../services/notification.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
-import { changeWalletPin, ensureWalletExistsForPin, getWalletPinPolicy, getWalletPinState, resetWalletPinWithPassword, setupWalletPin, verifyWalletPin } from '../services/walletPin.service.js';
+import { changeWalletPin, ensureWalletExistsForPin, getWalletPinPolicy, getWalletPinState, resetWalletPinWithPassword, setupWalletPin, verifyWalletPin, isPinSchemaAvailableForMoney, getPinPolicy } from '../services/walletPin.service.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
 
 const router = Router();
@@ -59,22 +59,65 @@ function hasWalletPinEnabled(walletPinState: { pin_enabled?: boolean | null; pin
   return Boolean(walletPinState?.pin_enabled ?? walletPinState?.pin_hash);
 }
 
-async function requireValidTransactionPin(userId: string, pin: unknown): Promise<{ ok: boolean; error?: string; lockedUntil?: string | null }> {
-  const walletPinState = await getWalletPinState(userId);
-  const pinEnabled = hasWalletPinEnabled(walletPinState);
+/** Montant approximé en GNF (seuil PIN) — taux inconnu → fail-safe : PIN exigé. */
+async function approximateAmountGnf(userId: string, amount: number): Promise<number> {
+  try {
+    const { data: w } = await supabaseAdmin.from('wallets')
+      .select('currency').eq('user_id', userId)
+      .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    const cur = String((w as { currency?: string } | null)?.currency || 'GNF').toUpperCase();
+    if (cur === 'GNF') return amount;
+    const { getInternalFxRate } = await import('../services/marketplacePricing.service.js');
+    const fx = await getInternalFxRate(cur, 'GNF');
+    const rate = Number((fx as { rate?: number } | null)?.rate || 0);
+    return rate > 0 ? amount * rate : Number.MAX_SAFE_INTEGER;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
 
-  // Compatibility mode: if PIN is not configured yet, keep operations available.
-  if (!pinEnabled) {
-    return { ok: true };
+/**
+ * 🔒 Garde PIN des opérations d'ARGENT (crypto INTACTE — verifyWalletPin fait foi) :
+ *  - schéma PIN absent → refus 503 PIN_SCHEMA_UNAVAILABLE (fail-closed + alerte) ;
+ *  - montant ≥ seuil PDG (pdg_settings, relu à chaque appel) :
+ *      · sans PIN configuré → 403 PIN_SETUP_REQUIRED (création obligatoire) ;
+ *      · avec PIN → vérification (verrouillage progressif inclus) ;
+ *  - sous le seuil : compat historique (PIN vérifié si l'utilisateur l'a activé).
+ */
+async function requireValidTransactionPin(
+  userId: string,
+  pin: unknown,
+  opts: { operation: string; amountGnf: number },
+): Promise<{ ok: boolean; error?: string; error_code?: string; status?: number; lockedUntil?: string | null }> {
+  if (!(await isPinSchemaAvailableForMoney())) {
+    return {
+      ok: false, status: 503, error_code: 'PIN_SCHEMA_UNAVAILABLE',
+      error: 'Sécurité PIN indisponible — opération refusée par prudence. Réessayez plus tard.',
+    };
   }
 
-  if (typeof pin !== 'string') {
-    return { ok: false, error: 'Code PIN requis pour confirmer cette opération' };
+  const walletPinState = await getWalletPinState(userId);
+  const pinEnabled = hasWalletPinEnabled(walletPinState);
+  const { threshold, operations } = await getPinPolicy();
+  const requiredByPolicy = operations.includes(opts.operation) && opts.amountGnf >= threshold;
+
+  if (!pinEnabled) {
+    if (requiredByPolicy) {
+      return {
+        ok: false, status: 403, error_code: 'PIN_SETUP_REQUIRED',
+        error: 'Créez votre code PIN pour sécuriser les transferts importants (Wallet → Sécurité).',
+      };
+    }
+    return { ok: true }; // compat sous le seuil (fluidité préservée)
+  }
+
+  if (typeof pin !== 'string' || !pin) {
+    return { ok: false, status: 401, error_code: 'PIN_REQUIRED', error: 'Code PIN requis pour confirmer cette opération' };
   }
 
   const verification = await verifyWalletPin(userId, pin);
   if (!verification.valid) {
-    return { ok: false, error: verification.error, lockedUntil: verification.lockedUntil };
+    return { ok: false, status: 401, error_code: 'PIN_INVALID', error: verification.error, lockedUntil: verification.lockedUntil };
   }
 
   return { ok: true };
@@ -1248,7 +1291,9 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       return;
     }
 
-    const pinCheck = await requireValidTransactionPin(userId, pin);
+    const pinCheck = await requireValidTransactionPin(userId, pin, {
+      operation: 'withdrawal', amountGnf: await approximateAmountGnf(userId, amount),
+    });
     if (!pinCheck.ok) {
       await emitCoreFeatureEvent({
         featureKey: 'wallet.withdraw',
@@ -1257,9 +1302,9 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         criticality: 'critical',
         status: 'failure',
         userId,
-        payload: { amount, reason: pinCheck.error || 'pin_invalid' },
+        payload: { amount, reason: pinCheck.error_code || 'pin_invalid' },
       });
-      res.status(403).json({ success: false, error: pinCheck.error, locked_until: pinCheck.lockedUntil || null });
+      res.status(pinCheck.status || 403).json({ success: false, error: pinCheck.error, error_code: pinCheck.error_code, locked_until: pinCheck.lockedUntil || null });
       return;
     }
 
@@ -1349,7 +1394,9 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       return;
     }
 
-    const pinCheck = await requireValidTransactionPin(senderId, pin);
+    const pinCheck = await requireValidTransactionPin(senderId, pin, {
+      operation: 'transfer', amountGnf: await approximateAmountGnf(senderId, amount),
+    });
     if (!pinCheck.ok) {
       await emitCoreFeatureEvent({
         featureKey: 'wallet.transfer',
@@ -1358,9 +1405,9 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         criticality: 'critical',
         status: 'failure',
         userId: senderId,
-        payload: { amount, recipient_id, resolved_recipient_id: resolvedRecipientId, reason: pinCheck.error || 'pin_invalid' },
+        payload: { amount, recipient_id, resolved_recipient_id: resolvedRecipientId, reason: pinCheck.error_code || 'pin_invalid' },
       });
-      res.status(403).json({ success: false, error: pinCheck.error, locked_until: pinCheck.lockedUntil || null });
+      res.status(pinCheck.status || 403).json({ success: false, error: pinCheck.error, error_code: pinCheck.error_code, locked_until: pinCheck.lockedUntil || null });
       return;
     }
 

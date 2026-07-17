@@ -26,6 +26,7 @@ import { resolveExactUserId } from './profiles.routes.js';
 import { buildOrderFinancialSummary, getBuyerCurrency, getInternalFxRate } from '../services/marketplacePricing.service.js';
 import { z } from 'zod';
 import { idempotencyGuard } from '../middlewares/idempotency.middleware.js';
+import { isPinSchemaAvailableForMoney, getPinPolicy, getWalletPinState, verifyWalletPin } from '../services/walletPin.service.js';
 // @ts-ignore — middleware JS sans types
 import { createRedisLimiter } from '../middlewares/rateLimiter.js';
 
@@ -1035,6 +1036,25 @@ router.post('/links/:id([0-9a-fA-F-]{36})/accept', verifyJWT, idempotencyGuard, 
       const { data: link } = await supabaseAdmin
         .from('payment_links').select('total, montant, devise').eq('id', req.params.id).maybeSingle();
       const total = Number((link as any)?.total ?? (link as any)?.montant ?? 0);
+
+      // 🔒 PIN au paiement B2B ≥ seuil (politique PDG, relue à chaque appel) —
+      // fail-closed si le schéma PIN est absent ; crypto INTACTE (verifyWalletPin).
+      if (!(await isPinSchemaAvailableForMoney())) {
+        return fail(res, 503, 'Sécurité PIN indisponible — paiement refusé par prudence.', 'PIN_SCHEMA_UNAVAILABLE');
+      }
+      const { threshold, operations } = await getPinPolicy();
+      if (operations.includes('b2b_payment') && total >= threshold) {
+        const pinState = await getWalletPinState(req.user!.id);
+        const pinEnabled = !!(pinState as any)?.pin_enabled && !!(pinState as any)?.pin_hash;
+        if (!pinEnabled) {
+          return fail(res, 403, 'Créez votre code PIN pour payer les montants importants (Wallet → Sécurité).', 'PIN_SETUP_REQUIRED');
+        }
+        const pin = String(req.body?.pin || '');
+        if (!pin) return fail(res, 401, 'Code PIN requis pour confirmer ce paiement', 'PIN_REQUIRED');
+        const v = await verifyWalletPin(req.user!.id, pin);
+        if (!v.valid) return fail(res, 401, v.error || 'Code PIN invalide', 'PIN_INVALID');
+      }
+
       const feePercent = await getBuyerFeePercent();
       buyerFee = roundMoney(total * (feePercent / 100), String((link as any)?.devise || 'GNF'));
     }

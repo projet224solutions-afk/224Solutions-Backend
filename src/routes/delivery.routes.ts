@@ -110,13 +110,36 @@ router.post('/complete', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       return;
     }
 
+    // 📷 PREUVE PHOTO → BUCKET PRIVÉ (fini le base64 en colonne texte) : si le front
+    // envoie un dataURL, on l'uploade dans delivery-proofs et on stocke le CHEMIN
+    // (marqueur storage:). Échec d'upload → repli base64 (jamais de preuve perdue).
+    let proofValue: string | null = proof_photo_url || null;
+    if (typeof proofValue === 'string' && proofValue.startsWith('data:image/')) {
+      try {
+        const match = proofValue.match(/^data:(image\/[a-z+.-]+);base64,(.+)$/i);
+        if (match) {
+          const contentType = match[1];
+          const bytes = Buffer.from(match[2], 'base64');
+          const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+          const path = `deliveries/${delivery_id}/proof-${Date.now()}.${ext}`;
+          const { error: upErr } = await supabaseAdmin.storage
+            .from('delivery-proofs')
+            .upload(path, bytes, { contentType, upsert: true });
+          if (!upErr) proofValue = `storage:${path}`;
+          else logger.warn(`[Delivery] proof upload failed (repli base64): ${upErr.message}`);
+        }
+      } catch (e: any) {
+        logger.warn(`[Delivery] proof upload error (repli base64): ${e.message}`);
+      }
+    }
+
     // 1) Transition ATOMIQUE en base : livraison 'delivered' + gain + totaux livreur dans
     //    UNE seule transaction (RPC FOR UPDATE + autorisation + idempotence). Plus d'état partiel.
     //    🔐 Le code de remise CLIENT est vérifié DANS le RPC (jamais côté front).
     const { data: rpcRes, error: rpcError } = await supabaseAdmin.rpc('complete_delivery', {
       p_delivery_id: delivery_id,
       p_driver_id: userId,
-      p_proof: proof_photo_url || null,
+      p_proof: proofValue,
       p_signature: signature || null,
       p_confirm_code: typeof confirm_code === 'string' && confirm_code.trim() ? confirm_code.trim() : null,
     } as any);
@@ -817,6 +840,53 @@ router.post('/cod/settle', verifyJWT, async (req: AuthenticatedRequest, res: Res
       criticality: 'critical', status: 'failure', userId: req.user?.id || null, payload: { error: error.message },
     });
     res.status(500).json({ success: false, error: 'Erreur lors du reversement' });
+  }
+});
+
+/**
+ * GET /api/v2/delivery/proof-url?delivery_id=…
+ * URL SIGNÉE (1 h) de la photo de preuve stockée dans le bucket privé delivery-proofs.
+ * Autorisés : le livreur de la course, le vendeur propriétaire, le client destinataire.
+ * (Le bucket est privé et ses policies RLS visent les preuves de commandes — la
+ *  signature passe par service_role APRÈS ce contrôle d'accès explicite.)
+ */
+router.get('/proof-url', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const deliveryId = String(req.query.delivery_id || '');
+    if (!deliveryId) { res.status(400).json({ success: false, error: 'delivery_id requis' }); return; }
+
+    const { data: d, error } = await supabaseAdmin
+      .from('deliveries')
+      .select('id, driver_id, client_id, vendor_id, proof_photo_url')
+      .eq('id', deliveryId)
+      .maybeSingle();
+    if (error) throw error;
+    const row = d as any;
+    if (!row) { res.status(404).json({ success: false, error: 'Livraison introuvable' }); return; }
+
+    let allowed = row.driver_id === userId || row.client_id === userId;
+    if (!allowed && row.vendor_id) {
+      const { data: vendor } = await supabaseAdmin
+        .from('vendors').select('user_id').eq('id', row.vendor_id).maybeSingle();
+      allowed = (vendor as any)?.user_id === userId;
+    }
+    if (!allowed) { res.status(403).json({ success: false, error: 'Accès refusé' }); return; }
+
+    const value = String(row.proof_photo_url || '');
+    if (!value.startsWith('storage:')) {
+      // Ancienne preuve (base64/URL directe) → renvoyée telle quelle.
+      res.json({ success: true, data: { url: value || null, legacy: true } });
+      return;
+    }
+    const { data: signed, error: signError } = await supabaseAdmin.storage
+      .from('delivery-proofs')
+      .createSignedUrl(value.slice('storage:'.length), 3600);
+    if (signError || !signed?.signedUrl) throw signError || new Error('Signature impossible');
+    res.json({ success: true, data: { url: signed.signedUrl, legacy: false } });
+  } catch (e: any) {
+    logger.error(`[Delivery] proof-url error: ${e.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de la génération du lien de preuve' });
   }
 });
 

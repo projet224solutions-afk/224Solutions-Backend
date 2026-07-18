@@ -19,8 +19,8 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { creditWallet } from '../services/wallet.service.js';
-import { createNotifications } from '../services/notification.service.js';
+import { creditWallet, transferBetweenWallets } from '../services/wallet.service.js';
+import { createNotification, createNotifications } from '../services/notification.service.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
 
 const router = Router();
@@ -163,6 +163,57 @@ router.post('/complete', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       } else {
         logger.warn(`[Delivery] wallet credit failed for delivery=${delivery_id}: ${creditResult.error}`);
       }
+    }
+
+    // 💵 CONTRE-REMBOURSEMENT : remise cash d'une livraison COD → la dette
+    // livreur→vendeur est TRACÉE au ledger (idempotent : delivery_id UNIQUE, upsert
+    // ignoreDuplicates) + le vendeur est prévenu. Fire-and-forget, jamais bloquant.
+    if (isCash) {
+      void (async () => {
+        try {
+          const { data: d } = await supabaseAdmin
+            .from('deliveries')
+            .select('id, order_id, vendor_id, price, payment_method, package_description')
+            .eq('id', delivery_id)
+            .maybeSingle();
+          const amount = Number((d as any)?.price) || 0;
+          const pm = String((d as any)?.payment_method || '').toLowerCase();
+          if (!d || amount <= 0 || !['cod', 'cash', 'especes', 'espèces'].includes(pm)) return;
+          const { data: vendor } = await supabaseAdmin
+            .from('vendors')
+            .select('user_id, business_name')
+            .eq('id', (d as any).vendor_id)
+            .maybeSingle();
+          const vendorUserId = (vendor as any)?.user_id;
+          if (!vendorUserId || vendorUserId === userId) return; // auto-livraison : pas de dette envers soi-même
+          const { error: ledgerError } = await supabaseAdmin
+            .from('delivery_cod_ledger')
+            .upsert(
+              {
+                delivery_id,
+                order_id: (d as any).order_id || null,
+                vendor_id: (d as any).vendor_id || null,
+                vendor_user_id: vendorUserId,
+                driver_user_id: userId,
+                amount_due: amount,
+              } as any,
+              { onConflict: 'delivery_id', ignoreDuplicates: true },
+            );
+          if (ledgerError) {
+            logger.error(`[Delivery] COD ledger insert FAILED delivery=${delivery_id}: ${ledgerError.message}`);
+            return;
+          }
+          await createNotification({
+            userId: vendorUserId,
+            title: '💵 Contre-remboursement encaissé',
+            message: `Le livreur a encaissé ${amount.toLocaleString('fr-FR')} GNF en espèces (${(d as any).package_description || 'livraison'}) — reversement attendu sur votre wallet.`,
+            type: 'delivery',
+            metadata: { link: '/vendeur?tab=delivery', delivery_id, amount },
+          });
+        } catch (e: any) {
+          logger.error(`[Delivery] COD ledger error delivery=${delivery_id}: ${e.message}`);
+        }
+      })();
     }
 
     logger.info(`[Delivery] Completed: delivery=${delivery_id}, driver=${userId}, earning=${earning}, credited=${credited}, alreadyDelivered=${alreadyDelivered}`);
@@ -695,6 +746,77 @@ router.post('/self-assign', verifyJWT, async (req: AuthenticatedRequest, res: Re
   } catch (error: any) {
     logger.error(`[Delivery] self-assign error: ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de l\'auto-assignation' });
+  }
+});
+
+/**
+ * POST /api/v2/delivery/cod/settle
+ * Le LIVREUR reverse au vendeur le contre-remboursement encaissé en espèces.
+ * Transfert wallet ATOMIQUE + IDEMPOTENT (moteur wallet existant, clé
+ * cod-settle:<delivery_id>) — le ledger est marqué soldé APRÈS transfert réussi.
+ *
+ * Body : { delivery_id }
+ */
+router.post('/cod/settle', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { delivery_id } = req.body || {};
+    if (!delivery_id || typeof delivery_id !== 'string') {
+      res.status(400).json({ success: false, error: 'delivery_id requis' });
+      return;
+    }
+
+    const { data: row, error: fetchError } = await supabaseAdmin
+      .from('delivery_cod_ledger')
+      .select('id, delivery_id, driver_user_id, vendor_user_id, amount_due, settled_at')
+      .eq('delivery_id', delivery_id)
+      .maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!row) { res.status(404).json({ success: false, error: 'Aucun contre-remboursement pour cette livraison' }); return; }
+    const l = row as any;
+    if (l.driver_user_id !== userId) { res.status(403).json({ success: false, error: 'Ce contre-remboursement ne vous concerne pas' }); return; }
+    if (l.settled_at) { res.json({ success: true, already_settled: true, amount: Number(l.amount_due) }); return; }
+
+    const amount = Number(l.amount_due) || 0;
+    const transfer = await transferBetweenWallets(
+      userId,
+      l.vendor_user_id,
+      amount,
+      `Reversement contre-remboursement livraison #${String(delivery_id).slice(0, 8)}`,
+      `cod-settle:${delivery_id}`,
+    );
+    if (!transfer.success) {
+      res.status(400).json({ success: false, error: transfer.error || 'Transfert impossible (solde insuffisant ?)' });
+      return;
+    }
+
+    await supabaseAdmin
+      .from('delivery_cod_ledger')
+      .update({ settled_at: new Date().toISOString(), settle_transaction_id: transfer.transactionId || null } as any)
+      .eq('id', l.id)
+      .is('settled_at', null);
+
+    void createNotification({
+      userId: l.vendor_user_id,
+      title: '✅ Contre-remboursement reversé',
+      message: `${amount.toLocaleString('fr-FR')} GNF reversés sur votre wallet par le livreur (livraison #${String(delivery_id).slice(0, 8)}).`,
+      type: 'delivery',
+      metadata: { link: '/wallet', delivery_id, amount },
+    });
+
+    logger.info(`[Delivery] COD settled: delivery=${delivery_id}, driver=${userId}, amount=${amount}`);
+    await emitCoreFeatureEvent({
+      featureKey: 'delivery.cod_settle', coreEngine: 'payment', ownerModule: 'delivery',
+      criticality: 'critical', status: 'success', userId, payload: { delivery_id, amount },
+    });
+    res.json({ success: true, amount });
+  } catch (error: any) {
+    logger.error(`[Delivery] cod/settle error: ${error.message}`);
+    await emitCoreFeatureEvent({
+      featureKey: 'delivery.cod_settle', coreEngine: 'payment', ownerModule: 'delivery',
+      criticality: 'critical', status: 'failure', userId: req.user?.id || null, payload: { error: error.message },
+    });
+    res.status(500).json({ success: false, error: 'Erreur lors du reversement' });
   }
 });
 

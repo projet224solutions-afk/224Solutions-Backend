@@ -103,7 +103,7 @@ router.get('/stats', verifyJWT, async (req: AuthenticatedRequest, res: Response)
 router.post('/complete', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { delivery_id, proof_photo_url, signature } = req.body || {};
+    const { delivery_id, proof_photo_url, signature, confirm_code } = req.body || {};
 
     if (!delivery_id || typeof delivery_id !== 'string') {
       res.status(400).json({ success: false, error: 'delivery_id requis' });
@@ -112,16 +112,26 @@ router.post('/complete', verifyJWT, async (req: AuthenticatedRequest, res: Respo
 
     // 1) Transition ATOMIQUE en base : livraison 'delivered' + gain + totaux livreur dans
     //    UNE seule transaction (RPC FOR UPDATE + autorisation + idempotence). Plus d'état partiel.
+    //    🔐 Le code de remise CLIENT est vérifié DANS le RPC (jamais côté front).
     const { data: rpcRes, error: rpcError } = await supabaseAdmin.rpc('complete_delivery', {
       p_delivery_id: delivery_id,
       p_driver_id: userId,
       p_proof: proof_photo_url || null,
       p_signature: signature || null,
-    });
+      p_confirm_code: typeof confirm_code === 'string' && confirm_code.trim() ? confirm_code.trim() : null,
+    } as any);
     if (rpcError) throw rpcError;
     const r = (rpcRes || {}) as any;
 
     if (!r.success) {
+      if (r.error === 'confirm_code_required') {
+        res.status(400).json({ success: false, error: 'Code de remise du client requis', error_code: 'CONFIRM_CODE_REQUIRED' });
+        return;
+      }
+      if (r.error === 'confirm_code_invalid') {
+        res.status(400).json({ success: false, error: 'Code de remise incorrect — demandez au client le code affiché dans son app', error_code: 'CONFIRM_CODE_INVALID' });
+        return;
+      }
       res.status(404).json({ success: false, error: 'Livraison introuvable ou non assignée à ce livreur' });
       return;
     }
@@ -374,6 +384,38 @@ router.post('/start', verifyJWT, async (req: AuthenticatedRequest, res: Response
     }
 
     const { data: row } = await supabaseAdmin.from('deliveries').select('*').eq('id', delivery_id).maybeSingle();
+
+    // 🔐 Au DÉPART du colis : le CLIENT reçoit son code de remise (cloche in-app,
+    // deep-link vers le suivi public). Fire-and-forget — jamais bloquant pour la course.
+    if (!r.already_started && row) {
+      void (async () => {
+        try {
+          const d = row as any;
+          let customerId: string | null = d.client_id || null;
+          if (!customerId && d.order_id) {
+            const { data: order } = await supabaseAdmin.from('orders').select('customer_id').eq('id', d.order_id).maybeSingle();
+            customerId = (order as any)?.customer_id || null;
+          }
+          if (customerId && d.confirm_code) {
+            const { createNotification } = await import('../services/notification.service.js');
+            await createNotification({
+              userId: customerId,
+              title: '🚚 Votre colis est en route',
+              message: `Code de remise : ${d.confirm_code} — donnez-le au livreur à la réception.`,
+              type: 'delivery',
+              metadata: {
+                link: d.tracking_code ? `/track/${d.tracking_code}` : '/profil',
+                delivery_id,
+                confirm_code: d.confirm_code,
+              },
+            });
+          }
+        } catch (e: any) {
+          logger.warn(`[Delivery] start notify client failed: ${e.message}`);
+        }
+      })();
+    }
+
     res.json({ success: true, data: row, already_started: !!r.already_started });
   } catch (error: any) {
     logger.error(`[Delivery] start error: ${error.message}`);

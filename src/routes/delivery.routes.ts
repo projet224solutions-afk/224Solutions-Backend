@@ -20,6 +20,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { creditWallet } from '../services/wallet.service.js';
+import { createNotifications } from '../services/notification.service.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
 
 const router = Router();
@@ -480,6 +481,178 @@ router.post('/track', verifyJWT, async (req: AuthenticatedRequest, res: Response
   } catch (error: any) {
     logger.error(`[Delivery] track error: ${error.message}`);
     res.status(500).json({ success: false, error: 'Erreur lors de l\'enregistrement de la position' });
+  }
+});
+
+/** Charge une livraison ET vérifie que l'appelant est bien le VENDEUR propriétaire. */
+async function loadDeliveryOwnedByVendor(deliveryId: string, userId: string) {
+  const { data: delivery, error } = await supabaseAdmin
+    .from('deliveries')
+    .select('id, status, driver_id, vendor_id, vendor_name, delivery_fee, distance_km, pickup_address, delivery_address, customer_name, payment_method, price')
+    .eq('id', deliveryId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!delivery) return { delivery: null as any, owned: false };
+  const { data: vendor, error: vErr } = await supabaseAdmin
+    .from('vendors')
+    .select('id, user_id, business_name, latitude, longitude')
+    .eq('id', (delivery as any).vendor_id)
+    .maybeSingle();
+  if (vErr) throw vErr;
+  return { delivery: delivery as any, vendor: vendor as any, owned: !!vendor && (vendor as any).user_id === userId };
+}
+
+/**
+ * POST /api/v2/delivery/dispatch
+ * « Confier à un livreur 224 » : propose la course au réseau — offres tracées
+ * (delivery_offers, 15 min) + notification in-app à chaque candidat. Candidats :
+ *  1. taxi-motos EN LIGNE avec position ≤ 10 km (haversine du moteur taxi existant) ;
+ *  2. livreurs de la plateforme (rôle livreur/driver) — le modèle « pull » existant
+ *     (liste des courses pending) reste leur filet, la notification les fait venir.
+ * L'ACCEPTATION reste le claim atomique existant (/accept) : premier arrivé, premier servi.
+ *
+ * Body : { delivery_id }
+ */
+router.post('/dispatch', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { delivery_id } = req.body || {};
+    if (!delivery_id || typeof delivery_id !== 'string') {
+      res.status(400).json({ success: false, error: 'delivery_id requis' });
+      return;
+    }
+
+    const { delivery, vendor, owned } = await loadDeliveryOwnedByVendor(delivery_id, userId);
+    if (!delivery) { res.status(404).json({ success: false, error: 'Livraison introuvable' }); return; }
+    if (!owned) { res.status(403).json({ success: false, error: 'Cette livraison ne vous appartient pas' }); return; }
+    if (delivery.status !== 'pending' || delivery.driver_id) {
+      res.status(400).json({ success: false, error: 'Livraison déjà assignée ou hors dispatch' });
+      return;
+    }
+
+    const fee = Number(delivery.delivery_fee) || 0;
+    const estimatedEarnings = Math.round(fee * DRIVER_EARNING_RATE);
+    const pickup = (delivery.pickup_address || {}) as any;
+    const pLat = Number(pickup.lat ?? vendor?.latitude);
+    const pLng = Number(pickup.lng ?? vendor?.longitude);
+
+    // Candidats : user_id → distance connue (km) ou null.
+    const candidates = new Map<string, number | null>();
+
+    // 1) Taxi-motos proches (haversine, moteur existant) — best-effort : un échec de la RPC
+    //    ne bloque pas le dispatch (les livreurs « pull » restent notifiés).
+    if (Number.isFinite(pLat) && Number.isFinite(pLng)) {
+      try {
+        const { data: nearby } = await supabaseAdmin.rpc('find_nearby_taxi_drivers', {
+          p_lat: pLat, p_lng: pLng, p_radius_km: 10, p_limit: 10, p_taxi_category: null,
+        } as any);
+        for (const d of (nearby || []) as any[]) {
+          const uid = d.user_id || d.driver_user_id;
+          if (uid) candidates.set(String(uid), Number(d.distance_km) || null);
+        }
+      } catch (e: any) {
+        logger.warn(`[Delivery] dispatch nearby lookup failed: ${e.message}`);
+      }
+    }
+
+    // 2) Livreurs plateforme (rôle livreur/driver) — position inconnue hors course.
+    const { data: couriers } = await supabaseAdmin
+      .from('profiles')
+      .select('id')
+      .in('role', ['livreur', 'driver'])
+      .limit(30);
+    for (const p of (couriers || []) as any[]) {
+      if (!candidates.has(String(p.id))) candidates.set(String(p.id), null);
+    }
+    candidates.delete(userId); // jamais s'auto-proposer
+
+    if (candidates.size === 0) {
+      res.status(404).json({ success: false, error: 'Aucun livreur disponible sur la plateforme', error_code: 'NO_COURIER' });
+      return;
+    }
+
+    // 3) Offres tracées (15 min) — best-effort, la notification est le signal principal.
+    const now = Date.now();
+    const offers = Array.from(candidates.entries()).map(([driverUserId, dist]) => ({
+      delivery_id,
+      driver_id: driverUserId,
+      status: 'sent',
+      offered_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 15 * 60 * 1000).toISOString(),
+      distance_to_vendor: dist,
+      estimated_earnings: estimatedEarnings,
+    }));
+    const { error: offersError } = await supabaseAdmin.from('delivery_offers').insert(offers as any);
+    if (offersError) logger.warn(`[Delivery] dispatch offers insert failed: ${offersError.message}`);
+
+    // 4) Notification in-app à chaque candidat (cloche + deep-link vers l'espace livreur).
+    const destination = ((delivery.delivery_address || {}) as any).address || ((delivery.delivery_address || {}) as any).address_line || '';
+    const notified = await createNotifications(
+      Array.from(candidates.keys()).map((driverUserId) => ({
+        userId: driverUserId,
+        title: '🛵 Course de livraison proposée',
+        message: `${vendor?.business_name || delivery.vendor_name || 'Vendeur 224'} → ${destination} · gain estimé ${estimatedEarnings.toLocaleString('fr-FR')} GNF`,
+        type: 'delivery',
+        metadata: { link: '/livreur', delivery_id, estimated_earnings: estimatedEarnings },
+      })),
+    );
+
+    logger.info(`[Delivery] dispatch: delivery=${delivery_id}, vendor=${userId}, candidates=${candidates.size}, notified=${notified}`);
+    res.json({ success: true, data: { candidates: candidates.size, notified } });
+  } catch (error: any) {
+    logger.error(`[Delivery] dispatch error: ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de la proposition aux livreurs' });
+  }
+});
+
+/**
+ * POST /api/v2/delivery/self-assign
+ * « Je livre moi-même » : le vendeur devient le livreur de SA livraison. Claim atomique
+ * (status pending + sans livreur), gain à zéro et encaissement marqué 'self' — le circuit
+ * de gains livreur (98,5 % + crédit wallet) ne se déclenche JAMAIS pour une auto-livraison.
+ *
+ * Body : { delivery_id }
+ */
+router.post('/self-assign', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { delivery_id } = req.body || {};
+    if (!delivery_id || typeof delivery_id !== 'string') {
+      res.status(400).json({ success: false, error: 'delivery_id requis' });
+      return;
+    }
+
+    const { delivery, owned } = await loadDeliveryOwnedByVendor(delivery_id, userId);
+    if (!delivery) { res.status(404).json({ success: false, error: 'Livraison introuvable' }); return; }
+    if (!owned) { res.status(403).json({ success: false, error: 'Cette livraison ne vous appartient pas' }); return; }
+    if (delivery.driver_id === userId) { res.json({ success: true, already: true }); return; }
+
+    // Claim atomique : même garde que /accept (pending + sans livreur).
+    const { data: claimed, error: claimError } = await supabaseAdmin
+      .from('deliveries')
+      .update({
+        driver_id: userId,
+        status: 'assigned',
+        accepted_at: new Date().toISOString(),
+        driver_earning: 0,
+        driver_payment_method: 'self', // déjà « réglé » → aucun crédit wallet au /complete
+      })
+      .eq('id', delivery_id)
+      .eq('status', 'pending')
+      .is('driver_id', null)
+      .select('id')
+      .maybeSingle();
+    if (claimError) throw claimError;
+    if (!claimed) {
+      res.status(409).json({ success: false, error: 'Livraison déjà prise par un livreur' });
+      return;
+    }
+
+    logger.info(`[Delivery] self-assign: delivery=${delivery_id}, vendor=${userId}`);
+    res.json({ success: true });
+  } catch (error: any) {
+    logger.error(`[Delivery] self-assign error: ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lors de l\'auto-assignation' });
   }
 });
 

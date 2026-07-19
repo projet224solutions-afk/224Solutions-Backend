@@ -246,6 +246,35 @@ router.put('/config', verifyJWT, async (req: AuthenticatedRequest, res: Response
   res.json({ success: true, data });
 });
 
+// ── Grille par devise (modèle universel) : défaut global + lignes par devise ──
+router.get('/config/grid', verifyJWT, async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_currency_grid');
+  if (error) { res.status(500).json({ success: false, error: 'Grille indisponible' }); return; }
+  res.json({ success: true, data });
+});
+
+router.put('/config/grid/:currency', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const ccy = String(req.params.currency || '').trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(ccy)) { res.status(400).json({ success: false, error: 'Code devise invalide (3 lettres)' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_currency_config_upsert', { p_currency: ccy, p_changes: req.body || {} });
+  if (error) {
+    const msg = /acash_grid_.*_share|acash_grid_.*_pct/i.test(error.message)
+      ? 'Taux/parts hors bornes (0–100 %).'
+      : /acash_grid_.*_bounds/i.test(error.message) ? 'Plancher/plafond invalides (min ≥ 0, max ≥ min).' : error.message;
+    res.status(400).json({ success: false, error: msg }); return;
+  }
+  res.json({ success: true, data });
+});
+
+router.delete('/config/grid/:currency', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }
+  const ccy = String(req.params.currency || '').trim().toUpperCase();
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_currency_config_delete', { p_currency: ccy });
+  if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  res.json({ success: true, data });
+});
+
 // ── Activation float ────────────────────────────────────────────────────────
 router.post('/activate', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const agent = await getAgentForUser(req.user!.id);

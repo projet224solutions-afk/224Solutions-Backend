@@ -973,6 +973,48 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/dispute', verifyJWT, idemp
   }
 });
 
+/**
+ * GET /api/b2b/supplier/reliquats — FOURNISSEUR : ses commandes réceptionnées
+ * PARTIELLEMENT par l'acheteur (reliquat encore attendu) + les écarts déclarés.
+ * Les données vivent dans le stock_purchase de l'ACHETEUR (RLS) → lues ici via
+ * service_role et restreintes aux commandes du fournisseur.
+ */
+router.get('/supplier/reliquats', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const ctx = await resolveVendorContext(req.user!.id);
+    if (!ctx.vendorId) return fail(res, 403, 'Boutique non trouvée', 'VENDOR_NOT_FOUND');
+
+    const { data: myOrders } = await supabaseAdmin
+      .from('orders').select('id, order_number').eq('vendor_id', ctx.vendorId);
+    const orderIds = (myOrders || []).map((o: any) => o.id);
+    if (orderIds.length === 0) return ok(res, { reliquats: [] });
+    const orderNo = new Map((myOrders || []).map((o: any) => [o.id, o.order_number]));
+
+    const { data: purchases } = await supabaseAdmin
+      .from('stock_purchases')
+      .select('purchase_number, linked_order_id, reception_report, updated_at')
+      .in('linked_order_id', orderIds)
+      .eq('status', 'received_partial')
+      .order('updated_at', { ascending: false });
+
+    const reliquats = (purchases || []).map((p: any) => {
+      const gaps = (p.reception_report?.gaps || []) as Array<{ product_name: string; ordered: number; received: number; gap: number }>;
+      return {
+        order_number: orderNo.get(p.linked_order_id) || null,
+        purchase_number: p.purchase_number,
+        updated_at: p.updated_at,
+        total_gap: gaps.reduce((s, g) => s + (Number(g.gap) || 0), 0),
+        gaps,
+      };
+    }).filter((r) => r.total_gap > 0);
+
+    return ok(res, { reliquats });
+  } catch (error: any) {
+    logger.error(`[b2b/supplier/reliquats] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors du chargement des reliquats');
+  }
+});
+
 // ═══════════════════ ESPACE GROSSISTE — LIENS DE VENTE ═══════════════════════
 
 const CreateStockLinkSchema = z.object({

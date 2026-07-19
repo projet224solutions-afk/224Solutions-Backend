@@ -838,6 +838,141 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
   }
 });
 
+/**
+ * POST /api/b2b/purchases/:purchaseId/release-reliquat — ACHETEUR : « Annuler le
+ * reliquat » d'une réception clôturée avec écart. L'argent a déjà été réglé au reçu
+ * (receive close) ; ici on REND l'écart au stock VENDABLE du fournisseur + trace +
+ * notif. Idempotent.
+ */
+router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/release-reliquat', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const ctx = await resolveVendorContext(req.user!.id);
+    if (!ctx.vendorId) return fail(res, 403, 'Boutique non trouvée', 'VENDOR_NOT_FOUND');
+    if (ctx.isAgent && !vendorContextHasPermission(ctx, 'manage_inventory') && !vendorContextHasPermission(ctx, 'manage_suppliers')) {
+      return fail(res, 403, 'Permission insuffisante', 'PERMISSION_DENIED');
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('b2b_release_reliquat_to_supplier' as any, {
+      p_purchase_id: req.params.purchaseId,
+      p_buyer_vendor_id: ctx.vendorId,
+    });
+    if (error) {
+      logger.error(`[b2b/release-reliquat] RPC: ${error.message}`);
+      return fail(res, 500, 'Erreur lors de la libération du reliquat');
+    }
+    const result = data as any;
+    if (!result?.success) {
+      const code = result?.error || 'RELIQUAT_FAILED';
+      const msg = code === 'INVALID_STATUS'
+        ? 'La réception doit être clôturée avant de rendre le reliquat.'
+        : code === 'PURCHASE_NOT_FOUND' ? 'Achat introuvable' : 'Libération du reliquat impossible';
+      return fail(res, 400, msg, code);
+    }
+
+    if (!result.already_released && result.supplier_user_id && Number(result.released) > 0) {
+      await createNotification({
+        userId: result.supplier_user_id,
+        title: 'Reliquat B2B annulé',
+        message: `L'acheteur a annulé le reliquat de la commande ${result.order_number} — ${result.released} article(s) sont revenus dans votre stock vendable.`,
+        type: 'b2b_reliquat_released',
+        metadata: { link: '/vendeur/suppliers?tab=b2b', order_number: result.order_number },
+      });
+    }
+    return ok(res, { released: result.released, already_released: !!result.already_released, lines: result.lines });
+  } catch (error: any) {
+    logger.error(`[b2b/release-reliquat] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors de la libération du reliquat');
+  }
+});
+
+/**
+ * POST /api/b2b/purchases/:purchaseId/dispute — ACHETEUR : ouvrir un LITIGE sur un
+ * écart de réception. Rattaché au système escrow existant (escrow_disputes, lu par
+ * l'interface PDG) — escrow_id nul si le mode de paiement n'a pas d'escrow. Photos
+ * possibles (evidence_urls). Fournisseur + PDG notifiés.
+ */
+router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/dispute', verifyJWT, idempotencyGuard, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const ctx = await resolveVendorContext(req.user!.id);
+    if (!ctx.vendorId) return fail(res, 403, 'Boutique non trouvée', 'VENDOR_NOT_FOUND');
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 1000) : '';
+    if (!reason) return fail(res, 400, 'Motif du litige requis', 'REASON_REQUIRED');
+    const evidenceUrls = Array.isArray(req.body?.evidence_urls)
+      ? req.body.evidence_urls.filter((u: unknown) => typeof u === 'string').slice(0, 6) : [];
+
+    const { data: purchase } = await supabaseAdmin
+      .from('stock_purchases')
+      .select('id, vendor_id, linked_order_id, purchase_number, reception_report')
+      .eq('id', req.params.purchaseId)
+      .eq('vendor_id', ctx.vendorId)
+      .maybeSingle();
+    if (!purchase || !(purchase as any).linked_order_id) return fail(res, 404, 'Achat introuvable', 'PURCHASE_NOT_FOUND');
+    const pur = purchase as any;
+
+    // Escrow de la commande (peut être absent en crédit / on_reception).
+    const { data: escrow } = await supabaseAdmin
+      .from('escrow_transactions')
+      .select('id, seller_id, status')
+      .eq('order_id', pur.linked_order_id)
+      .maybeSingle();
+
+    // Anti-doublon : un litige déjà ouvert pour cette commande ?
+    const { data: existing } = await supabaseAdmin
+      .from('escrow_disputes')
+      .select('id')
+      .filter('metadata->>purchase_id', 'eq', pur.id)
+      .neq('status', 'resolved')
+      .limit(1);
+    if (existing && existing.length > 0) return fail(res, 400, 'Un litige est déjà en cours pour cette commande', 'DISPUTE_EXISTS');
+
+    const { data: order } = await supabaseAdmin
+      .from('orders').select('order_number, vendor_id').eq('id', pur.linked_order_id).maybeSingle();
+    const supplierVendorId = (order as any)?.vendor_id;
+    const { data: supVendor } = supplierVendorId
+      ? await supabaseAdmin.from('vendors').select('user_id').eq('id', supplierVendorId).maybeSingle()
+      : { data: null };
+
+    const { data: dispute, error: dErr } = await supabaseAdmin
+      .from('escrow_disputes')
+      .insert({
+        escrow_id: escrow ? (escrow as any).id : null,
+        initiator_user_id: req.user!.id,
+        initiator_role: 'buyer',
+        reason,
+        status: 'open',
+        evidence_urls: evidenceUrls,
+        metadata: {
+          b2b: true,
+          purchase_id: pur.id,
+          purchase_number: pur.purchase_number,
+          order_id: pur.linked_order_id,
+          gaps: pur.reception_report?.gaps || [],
+          request_type: 'b2b_reception_gap',
+        },
+      })
+      .select('id')
+      .single();
+    if (dErr || !dispute) {
+      logger.error(`[b2b/dispute] création: ${dErr?.message}`);
+      return fail(res, 500, 'Erreur lors de la création du litige');
+    }
+
+    if ((supVendor as any)?.user_id) {
+      await createNotification({
+        userId: (supVendor as any).user_id,
+        title: 'Litige B2B ouvert',
+        message: `L'acheteur a ouvert un litige sur la réception de la commande ${(order as any)?.order_number || ''} — motif : ${reason.slice(0, 120)}.`,
+        type: 'b2b_dispute_opened',
+        metadata: { link: '/vendeur/suppliers?tab=b2b', order_number: (order as any)?.order_number },
+      });
+    }
+    return ok(res, { dispute_id: dispute.id });
+  } catch (error: any) {
+    logger.error(`[b2b/dispute] ${error?.message}`);
+    return fail(res, 500, 'Erreur lors de la création du litige');
+  }
+});
+
 // ═══════════════════ ESPACE GROSSISTE — LIENS DE VENTE ═══════════════════════
 
 const CreateStockLinkSchema = z.object({

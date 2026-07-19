@@ -57,7 +57,11 @@ function makeFetch() {
     }
     if (String(url).includes('/sms/admin/v1')) {
       calls.admin++;
-      return { ok: true, json: async () => ([{ country: 'guinea 224', availableUnits: 842, expirationDate: '2026-12-31' }]) } as any;
+      // Format réel Orange : pays en ISO-3, status ACTIVE/PENDING.
+      return { ok: true, json: async () => ([
+        { country: 'GIN', status: 'ACTIVE', availableUnits: 842, expirationDate: '2026-12-31' },
+        { country: 'SEN', status: 'PENDING', availableUnits: 0, expirationDate: '2026-07-19' },
+      ]) } as any;
     }
     return { ok: false, status: 404, json: async () => ({}) } as any;
   });

@@ -220,8 +220,19 @@ export async function orangeSend(to: string, message: string, countryCode?: stri
   }
 }
 
-/** Solde d'un pays activé via /sms/admin/v1/contracts. { units, expiresAt } ou null si indisponible. */
-export async function orangeBalance(iso: string): Promise<{ units: number; expiresAt: string | null } | null> {
+// Orange renvoie le pays en ISO-3 (GIN, SEN, …) dans /contracts. Table ISO-2 → ISO-3
+// pour attribuer chaque contrat au bon pays. EXTENSIBLE : ajouter une ligne suffit.
+const ISO2_TO_ISO3: Record<string, string> = {
+  GN: 'GIN', SN: 'SEN', ML: 'MLI', CI: 'CIV', BF: 'BFA', NE: 'NER', TG: 'TGO', BJ: 'BEN',
+  CM: 'CMR', CD: 'COD', GW: 'GNB', BW: 'BWA', EG: 'EGY', TN: 'TUN', MA: 'MAR', JO: 'JOR',
+};
+
+/**
+ * Solde d'un pays activé via /sms/admin/v1/contracts. { units, expiresAt, status } ou null.
+ * On agrège les contrats ACTIFS du pays (status 'ACTIVE'/'ACTIVATED'). Un contrat
+ * 'PENDING' (souscription non approuvée) → 0 unité utilisable, status remonté.
+ */
+export async function orangeBalance(iso: string): Promise<{ units: number; expiresAt: string | null; status: string } | null> {
   if (!orangeGloballyReady()) return null;
   try {
     const token = await getToken();
@@ -230,23 +241,24 @@ export async function orangeBalance(iso: string): Promise<{ units: number; expir
     });
     if (!res.ok) return null;
     const j: any = await res.json();
-    // Réponse Orange = liste de contrats/offres ; on somme les unités du pays (indicatif).
-    const cfg = countryConfig(iso);
-    const dial = (cfg?.senderAddress.match(/\+(\d{1,4})/) || [])[1] || '';
     const list: any[] = Array.isArray(j) ? j : (j?.contracts || j?.partnerContracts || []);
-    let units = 0; let expiresAt: string | null = null;
-    for (const item of list) {
-      const country = String(item?.country || item?.countryName || '').toLowerCase();
-      const offerName = String(item?.offerName || item?.serviceName || '').toLowerCase();
-      const matchesDial = dial && (country.includes(dial) || offerName.includes(dial));
-      // Si l'API ne discrimine pas par pays, on prend l'agrégat (mieux que rien) ;
-      // sinon on ne compte que les lignes du pays.
-      if (!dial || matchesDial || list.length === 1) {
+    const iso3 = ISO2_TO_ISO3[String(iso).toUpperCase()] || '';
+    const mine = list.filter((it) => {
+      const c = String(it?.country || it?.countryName || '').toUpperCase();
+      return iso3 ? c === iso3 : list.length === 1;
+    });
+    if (mine.length === 0) return { units: 0, expiresAt: null, status: 'none' };
+    let units = 0; let expiresAt: string | null = null; let status = 'pending';
+    for (const item of mine) {
+      const st = String(item?.status || '').toUpperCase();
+      // On ne compte les unités que des contrats réellement actifs.
+      if (st === 'ACTIVE' || st === 'ACTIVATED') {
         units += Number(item?.availableUnits ?? item?.balance ?? 0) || 0;
-        expiresAt = item?.expirationDate || item?.expires || expiresAt;
+        status = 'active';
       }
+      expiresAt = item?.expirationDate || item?.expires || expiresAt;
     }
-    return { units, expiresAt };
+    return { units, expiresAt, status };
   } catch {
     return null;
   }

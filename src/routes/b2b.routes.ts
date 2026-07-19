@@ -368,7 +368,7 @@ router.get('/suppliers/:supplierRowId/catalog', verifyJWT, async (req: Authentic
 
     const { data: products, error } = await supabaseAdmin
       .from('products')
-      .select('id, name, description, price, stock_quantity, images, sku, category_id, sell_by_carton, units_per_carton, price_carton, currency')
+      .select('id, name, description, price, stock_quantity, images, sku, barcode, category_id, sell_by_carton, units_per_carton, price_carton, currency')
       .eq('vendor_id', (supplier as any).linked_vendor_id)
       .eq('is_active', true)
       .gt('stock_quantity', 0)

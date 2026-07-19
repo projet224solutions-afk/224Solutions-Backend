@@ -9,6 +9,7 @@
  *   E. Original unit tests (idempotency, state machine, currency)
  */
 
+import { describe, test, expect } from 'vitest';
 import crypto from 'crypto';
 
 // ==================== A. WEBHOOK STRIPE RAW BODY ====================

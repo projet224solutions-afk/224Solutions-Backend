@@ -787,6 +787,22 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
     });
     if (error) {
       logger.error(`[b2b/receive] RPC: ${error.message}`);
+      // Erreurs par LIGNE (RAISE atomique : rien n'a été réceptionné). Format
+      // « B2B_RECV:CODE:nom_produit » → message clair identifiant la ligne.
+      const m = /B2B_RECV:([A-Z_]+):?(.*)/.exec(error.message);
+      if (m) {
+        const code = m[1];
+        const prod = (m[2] || '').split(/\s*\(/)[0].trim();
+        const perLine: Record<string, string> = {
+          RECEIVED_EXCEEDS_ORDERED: 'Quantité reçue supérieure au restant attendu',
+          BUYER_PRODUCT_INVALID: 'Produit de destination invalide',
+          STOCK_ENTRY_FAILED: 'Échec de l\'entrée en stock',
+          LINE_NOT_FOUND: 'Ligne introuvable',
+          INVALID_RECEIVED_QTY: 'Quantité reçue invalide',
+        };
+        const base = perLine[code] || 'Réception refusée';
+        return fail(res, 409, prod ? `${base} — ligne « ${prod} ». Rien n'a été réceptionné.` : `${base}. Rien n'a été réceptionné.`, code);
+      }
       const friendly = /B2B_ESCROW_RELEASE_FAILED/.test(error.message)
         ? 'Échec de la libération de l\'escrow — réception annulée'
         : 'Erreur lors de la réception';

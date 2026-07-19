@@ -1,19 +1,21 @@
 /**
- * 📱 SMS SERVICE — Twilio (backend Node.js) avec repli Edge Function
+ * 📱 SMS SERVICE — passerelle multi-fournisseurs (Orange multi-pays → Twilio → Edge)
  *
- * Ordre de tentative :
+ * Ordre de tentative (bascule au fournisseur suivant, JAMAIS d'échec silencieux) :
+ *   0. ORANGE (si activé ET pays du destinataire configuré) — sender/solde propres
+ *      à chaque pays via ORANGE_SMS_{ISO}_*. Un pays non configuré/désactivé ou un
+ *      solde épuisé → refus propre → on bascule.
  *   1. Si le BACKEND a des clés Twilio (TWILIO_ACCOUNT_SID/AUTH_TOKEN + un
  *      expéditeur), on appelle Twilio directement.
- *   2. SINON, on bascule sur l'Edge Function Supabase `send-sms` (qui détient
- *      déjà les secrets Twilio du projet) → pas besoin de dupliquer les clés
- *      dans le backend.
+ *   2. SINON, Edge Function Supabase `send-sms` (secrets Twilio du projet).
  *
- * Renvoie { ok, error } avec le message RÉEL de Twilio (utile pour diagnostiquer :
+ * Renvoie { ok, error } avec le message RÉEL du fournisseur (utile pour diagnostiquer :
  * « Invalid From Number », crédit épuisé, numéro non vérifié en trial…).
  */
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { orangeSend } from './sms/orangeSms.js';
 
 // Formatage E.164 pan-africain : logique pure extraite dans phoneFormat.ts (testable sans env).
 // Ré-exporté ici pour ne pas casser les imports existants (`from '../services/sms.service.js'`).
@@ -72,6 +74,20 @@ export async function sendSms(to: string, message: string, countryCode?: string)
   if (!to || !message) return { ok: false, error: 'Destinataire ou message manquant' };
   const formattedPhone = formatPhoneIntl(to, countryCode);
 
+  // ── Fournisseur 0 : Orange (multi-pays) ──────────────────────────────────
+  // Tenté d'abord quand il est activé ; un refus (pays non configuré / solde
+  // épuisé / échec API) fait BASCULER vers Twilio/Edge, jamais échouer en silence.
+  try {
+    const orange = await orangeSend(to, message, countryCode);
+    if (orange.ok) return { ok: true };
+    if (!orange.skipped) {
+      logger.warn(`[SMS] Orange refus ${formattedPhone} (${orange.code}: ${orange.error}) → bascule fournisseur suivant`);
+    }
+  } catch (err: any) {
+    logger.warn(`[SMS] Orange exception ${formattedPhone}: ${err?.message} → bascule`);
+  }
+
+  // ── Fournisseurs 1 & 2 : Twilio backend, sinon Edge ──────────────────────
   const hasBackendTwilio = Boolean(
     env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && (env.TWILIO_MESSAGING_SERVICE_SID || env.TWILIO_PHONE_NUMBER)
   );

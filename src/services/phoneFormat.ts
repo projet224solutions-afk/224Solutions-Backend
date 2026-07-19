@@ -41,6 +41,29 @@ export function dialCodeForCountry(countryCode?: string): string | undefined {
   return iso ? COUNTRY_DIAL_CODES[iso] : undefined;
 }
 
+// Indicatifs triés par longueur DÉCROISSANTE → le plus long préfixe l'emporte
+// (ex. +224 → GN avant que +20 → EG ne puisse matcher). Figé au chargement.
+const DIAL_CODES_BY_LENGTH: Array<[string, string]> = Object.entries(COUNTRY_DIAL_CODES)
+  .sort((a, b) => b[1].length - a[1].length);
+
+/**
+ * Déduit le code pays ISO-2 d'un numéro E.164 (`+224…`) par plus-long-préfixe.
+ * Utile pour ROUTER un SMS vers le bon expéditeur pays (Orange GN/SN/CI…) quand
+ * l'appelant n'a pas fourni de countryCode. Renvoie undefined si aucun indicatif
+ * connu ne correspond (ex. indicatif non répertorié → le routeur basculera).
+ * NB : certains indicatifs sont partagés (US/CA = +1) → premier match par ordre
+ * d'insertion, sans importance pour le routage SMS (même fournisseur).
+ */
+export function isoFromE164(e164?: string): string | undefined {
+  const phone = String(e164 || '').replace(/[\s().-]/g, '').trim();
+  const digits = phone.startsWith('+') ? phone.slice(1) : phone.startsWith('00') ? phone.slice(2) : phone;
+  if (!digits) return undefined;
+  for (const [iso, dial] of DIAL_CODES_BY_LENGTH) {
+    if (digits.startsWith(dial)) return iso;
+  }
+  return undefined;
+}
+
 /**
  * Normalise un numéro au format E.164 selon un PAYS EXPLICITE (ISO-2).
  *

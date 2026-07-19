@@ -3,7 +3,7 @@
  * Module PUR (sans env/DB) → exécutable isolément par vitest.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { formatPhoneIntl, dialCodeForCountry, COUNTRY_DIAL_CODES } from './phoneFormat.js';
+import { formatPhoneIntl, dialCodeForCountry, COUNTRY_DIAL_CODES, isoFromE164 } from './phoneFormat.js';
 
 // Le repli sans pays logue un warning : on le neutralise pour ne pas polluer la sortie.
 vi.mock('../config/logger.js', () => ({
@@ -97,5 +97,22 @@ describe('dialCodeForCountry', () => {
     expect(COUNTRY_DIAL_CODES.GN).toBe('224');
     expect(COUNTRY_DIAL_CODES.SN).toBe('221');
     expect(COUNTRY_DIAL_CODES.CI).toBe('225');
+  });
+});
+
+describe('isoFromE164 — routage par indicatif (plus-long-préfixe)', () => {
+  it('+224… → GN, +221… → SN, +225… → CI', () => {
+    expect(isoFromE164('+224620000000')).toBe('GN');
+    expect(isoFromE164('+221771234567')).toBe('SN');
+    expect(isoFromE164('+2250712345678')).toBe('CI');
+  });
+  it('indicatif court +20 (Égypte) non masqué par +2xx', () => {
+    expect(isoFromE164('+201000000000')).toBe('EG');
+    expect(isoFromE164('+243810000000')).toBe('CD'); // +243 ≠ +20
+  });
+  it('accepte le format 00 et renvoie undefined si indicatif inconnu', () => {
+    expect(isoFromE164('00224620000000')).toBe('GN');
+    expect(isoFromE164('+9990000000')).toBeUndefined();
+    expect(isoFromE164('')).toBeUndefined();
   });
 });

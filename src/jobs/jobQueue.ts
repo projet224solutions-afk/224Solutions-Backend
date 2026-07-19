@@ -205,6 +205,12 @@ registerHandler('auth-otp.cleanup', async () => {
   logger.info('Auth OTP cleanup: codes expirés (> 1 h) purgés');
 });
 
+// 🟠 SMS Orange : surveillance du solde par pays activé + alerte PDG sous le seuil.
+registerHandler('sms.orange-balance-check', async () => {
+  const { checkOrangeBalances } = await import('../services/sms/smsBalance.service.js');
+  await checkOrangeBalances();
+});
+
 // 🎬 Studio Clips : worker ffmpeg (jobs serveur) + watchdog anti-zombie.
 registerHandler('clips.process', async () => { await processQueuedClips(); });
 registerHandler('clips.watchdog', async () => { await runClipWatchdog(); });
@@ -1331,6 +1337,7 @@ export const jobQueue = {
       recurringTimers.push(setInterval(() => this.enqueue('payment-links.cleanup-expired', {}).catch(() => {}), everyHour));
       recurringTimers.push(setInterval(() => this.enqueue('group-buys.finalize-expired', {}).catch(() => {}), everyHour));
       recurringTimers.push(setInterval(() => this.enqueue('fx.african-rates-refresh', {}).catch(() => {}), everyHour));
+      recurringTimers.push(setInterval(() => this.enqueue('sms.orange-balance-check', {}).catch(() => {}), every6Hours));
       // Surveillance BCRG toutes les 1 minute — HEAD check léger, GET uniquement si changement
       recurringTimers.push(setInterval(() => this.enqueue('fx.bcrg-live-check', {}).catch(() => {}), 60 * 1000));
       // Restaurant : annulation auto + remboursement des commandes non acceptées en 3 min (check toutes les 60s)
@@ -1401,6 +1408,8 @@ export const jobQueue = {
       await queue.add('payment-links.cleanup-expired', {}, { repeat: { every: 3600000 } });
       await queue.add('group-buys.finalize-expired', {}, { repeat: { every: 3600000 } });
       await queue.add('fx.african-rates-refresh', {}, { repeat: { every: 3600000 } });
+      // SMS Orange : solde par pays toutes les 6 h + alerte PDG sous le seuil
+      await queue.add('sms.orange-balance-check', {}, { repeat: { every: 6 * 3600000 } });
       // Surveillance BCRG toutes les 1 minute — HEAD check léger, GET uniquement si changement
       await queue.add('fx.bcrg-live-check', {}, { repeat: { every: 60 * 1000 } });
       // Restaurant : annulation auto 3 min des commandes non acceptées (check toutes les 60s)

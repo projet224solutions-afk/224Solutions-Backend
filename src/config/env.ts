@@ -69,6 +69,14 @@ export const env = {
   TWILIO_PHONE_NUMBER: optionalEnv('TWILIO_PHONE_NUMBER', ''),
   TWILIO_MESSAGING_SERVICE_SID: optionalEnv('TWILIO_MESSAGING_SERVICE_SID', ''),
 
+  // Orange SMS : UN SEUL couple d'identifiants pour TOUTE l'application (tous pays).
+  // La config PAR PAYS (sender address/name, activation) vit dans ORANGE_SMS_{ISO}_*,
+  // lue dynamiquement par le provider (services/sms/orangeSms.ts) — PAS ici.
+  ORANGE_CLIENT_ID: optionalEnv('ORANGE_CLIENT_ID', ''),
+  ORANGE_CLIENT_SECRET: optionalEnv('ORANGE_CLIENT_SECRET', ''),
+  ORANGE_SMS_ENABLED: optionalEnv('ORANGE_SMS_ENABLED', 'false') === 'true',
+  ORANGE_SMS_LOW_BALANCE_THRESHOLD: optionalEnvInt('ORANGE_SMS_LOW_BALANCE_THRESHOLD', 100),
+
   // Live shopping : fournisseur du transport vidéo (agora en Vague 1, livekit en Vague 2).
   // Doit rester aligné avec VITE_LIVE_PROVIDER côté frontend.
   LIVE_PROVIDER: optionalEnv('LIVE_PROVIDER', 'agora'),
@@ -239,6 +247,12 @@ export function assertSecretsOnBoot(): void {
   // Secrets de paiement recommandés (warn — requis seulement si le service est actif)
   for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']) {
     if (!process.env[k]) warnings.push(`${k} absent — paiements ${k.includes('WEBHOOK') ? 'webhook ' : ''}Stripe indisponibles`);
+  }
+
+  // Orange SMS : activé sans identifiants → le provider basculera systématiquement
+  // sur Twilio (jamais bloquant, mais autant le signaler). Aucune valeur affichée.
+  if (env.ORANGE_SMS_ENABLED && !(process.env.ORANGE_CLIENT_ID && process.env.ORANGE_CLIENT_SECRET)) {
+    warnings.push('ORANGE_SMS_ENABLED=true mais ORANGE_CLIENT_ID/SECRET manquants — Orange sera ignoré (bascule Twilio)');
   }
 
   for (const w of warnings) console.warn(`[secrets] ⚠️  ${w}`);

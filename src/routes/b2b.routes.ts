@@ -839,6 +839,25 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
       });
     }
 
+    // 💰 PRIX DE VENTE AUTOMATIQUE (anti-vente-à-perte) : à partir du PMP après
+    // réception, applique/propose le prix de vente selon les réglages du vendeur.
+    let pricing: any = null;
+    try {
+      const priceLines = ((result.report as any[]) || [])
+        .filter((r) => r?.buyer_product_id && r?.new_cost != null)
+        .map((r) => ({ product_id: r.buyer_product_id, pmp: Number(r.new_cost), is_new: !!r.created }));
+      if (priceLines.length > 0) {
+        const { data: pr } = await supabaseAdmin.rpc('apply_reception_pricing' as any, {
+          p_vendor_id: vendorId,
+          p_lines: priceLines,
+          p_reason: `réception ${(result as any).order_number || ''}`.trim(),
+        });
+        pricing = pr || null;
+      }
+    } catch (e: any) {
+      logger.warn(`[b2b/receive] pricing auto non bloquant: ${e?.message}`);
+    }
+
     return ok(res, {
       final: !!result.final,
       status: result.status,
@@ -847,6 +866,7 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
       received_value: result.received_value,
       ordered_value: result.ordered_value,
       debt_id: result.debt_id ?? null,
+      pricing,
     });
   } catch (error: any) {
     logger.error(`[b2b/receive] ${error?.message}`);

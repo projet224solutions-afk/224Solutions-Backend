@@ -32,6 +32,19 @@ ORANGE_SMS_LOW_BALANCE_THRESHOLD=100
 > Ces valeurs sont des **secrets** : elles vivent uniquement dans `.env` (jamais en base,
 > jamais dans les logs, jamais côté frontend).
 
+### Variante : l'« en-tête d'autorisation » prêt à l'emploi
+
+MyApps affiche souvent aussi un **en-tête d'autorisation** déjà encodé, du style
+`Basic <base64>`. Ce n'est **pas** une clé supplémentaire : c'est exactement
+`base64(client_id:client_secret)`. Deux options équivalentes :
+
+- **Option A (recommandée)** : renseigner `ORANGE_CLIENT_ID` + `ORANGE_CLIENT_SECRET`
+  (le backend fabrique l'en-tête lui-même). Laisser `ORANGE_AUTHORIZATION` vide.
+- **Option B** : coller l'en-tête tel quel dans `ORANGE_AUTHORIZATION=Basic <base64>` et
+  laisser `ORANGE_CLIENT_ID`/`ORANGE_CLIENT_SECRET` vides. S'il est renseigné, il **prime**.
+
+Ne remplir **qu'une seule** des deux options.
+
 ---
 
 ## 2. La configuration PAR PAYS (3 lignes par pays)

@@ -78,9 +78,22 @@ export function countryConfig(iso: string): CountryConfig | null {
   return { iso: up, enabled, senderAddress, senderName };
 }
 
+/**
+ * En-tête Authorization pour l'OAuth Orange. Deux façons équivalentes de le fournir :
+ *  - ORANGE_AUTHORIZATION = l'en-tête prêt de MyApps (« Basic <base64> »), collé tel quel
+ *    (le préfixe « Basic » est ajouté s'il manque). PRIME s'il est présent.
+ *  - sinon ORANGE_CLIENT_ID + ORANGE_CLIENT_SECRET → l'en-tête est calculé.
+ */
+function orangeAuthHeader(): string {
+  const raw = (env.ORANGE_AUTHORIZATION || '').trim();
+  if (raw) return /^basic\s/i.test(raw) ? raw : `Basic ${raw}`;
+  return 'Basic ' + Buffer.from(`${env.ORANGE_CLIENT_ID}:${env.ORANGE_CLIENT_SECRET}`).toString('base64');
+}
+
 /** Orange est-il globalement activé ET correctement doté d'identifiants ? */
 export function orangeGloballyReady(): boolean {
-  return env.ORANGE_SMS_ENABLED && Boolean(env.ORANGE_CLIENT_ID && env.ORANGE_CLIENT_SECRET);
+  return env.ORANGE_SMS_ENABLED
+    && Boolean((env.ORANGE_CLIENT_ID && env.ORANGE_CLIENT_SECRET) || env.ORANGE_AUTHORIZATION);
 }
 
 /** Liste des pays configurés ET activés (pour le job solde + l'écran PDG). */
@@ -114,11 +127,10 @@ async function getToken(): Promise<string> {
   // Un seul appel token concurrent.
   if (tokenInflight) return tokenInflight;
   tokenInflight = (async () => {
-    const basic = Buffer.from(`${env.ORANGE_CLIENT_ID}:${env.ORANGE_CLIENT_SECRET}`).toString('base64');
     const res = await fetchImpl(OAUTH_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Basic ${basic}`,
+        Authorization: orangeAuthHeader(),
         'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
       },

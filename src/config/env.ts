@@ -74,6 +74,10 @@ export const env = {
   // lue dynamiquement par le provider (services/sms/orangeSms.ts) — PAS ici.
   ORANGE_CLIENT_ID: optionalEnv('ORANGE_CLIENT_ID', ''),
   ORANGE_CLIENT_SECRET: optionalEnv('ORANGE_CLIENT_SECRET', ''),
+  // Alternative : l'« en-tête d'autorisation » prêt à l'emploi affiché par MyApps
+  // (« Basic <base64(client_id:client_secret)> »). Si renseigné, il PRIME sur le
+  // couple ID/Secret — on peut coller la valeur d'Orange telle quelle.
+  ORANGE_AUTHORIZATION: optionalEnv('ORANGE_AUTHORIZATION', ''),
   ORANGE_SMS_ENABLED: optionalEnv('ORANGE_SMS_ENABLED', 'false') === 'true',
   ORANGE_SMS_LOW_BALANCE_THRESHOLD: optionalEnvInt('ORANGE_SMS_LOW_BALANCE_THRESHOLD', 100),
 
@@ -249,10 +253,12 @@ export function assertSecretsOnBoot(): void {
     if (!process.env[k]) warnings.push(`${k} absent — paiements ${k.includes('WEBHOOK') ? 'webhook ' : ''}Stripe indisponibles`);
   }
 
-  // Orange SMS : activé sans identifiants → le provider basculera systématiquement
-  // sur Twilio (jamais bloquant, mais autant le signaler). Aucune valeur affichée.
-  if (env.ORANGE_SMS_ENABLED && !(process.env.ORANGE_CLIENT_ID && process.env.ORANGE_CLIENT_SECRET)) {
-    warnings.push('ORANGE_SMS_ENABLED=true mais ORANGE_CLIENT_ID/SECRET manquants — Orange sera ignoré (bascule Twilio)');
+  // Orange SMS : activé sans identifiants (ni couple ID/Secret, ni en-tête Basic) →
+  // le provider basculera systématiquement sur Twilio. Aucune valeur affichée.
+  if (env.ORANGE_SMS_ENABLED
+      && !(process.env.ORANGE_CLIENT_ID && process.env.ORANGE_CLIENT_SECRET)
+      && !process.env.ORANGE_AUTHORIZATION) {
+    warnings.push('ORANGE_SMS_ENABLED=true mais aucun identifiant (ORANGE_CLIENT_ID/SECRET ou ORANGE_AUTHORIZATION) — Orange sera ignoré (bascule Twilio)');
   }
 
   for (const w of warnings) console.warn(`[secrets] ⚠️  ${w}`);

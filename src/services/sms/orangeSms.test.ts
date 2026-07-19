@@ -39,6 +39,7 @@ vi.mock('../../config/redis.js', () => ({
 }));
 
 import { orangeSend, orangeBalance, __setOrangeFetch, __resetOrangeState, countryConfig } from './orangeSms.js';
+import { env } from '../../config/env.js';
 
 const TOKEN = 'TOKENVALUE_SENTINEL';
 
@@ -160,5 +161,30 @@ describe('Orange — solde par pays', () => {
     expect(gn?.enabled).toBe(true);
     expect(gn?.senderAddress).toBe('tel:+224620000000');
     expect(countryConfig('XXX')).toBeNull();
+  });
+});
+
+describe('Orange — en-tête d\'autorisation collé tel quel', () => {
+  it('ORANGE_AUTHORIZATION (Basic …) est utilisé et suffit à activer Orange', async () => {
+    // Sans ID/Secret mais avec l'en-tête prêt de MyApps.
+    (env as any).ORANGE_CLIENT_ID = '';
+    (env as any).ORANGE_CLIENT_SECRET = '';
+    (env as any).ORANGE_AUTHORIZATION = 'Basic SEVBREVSX1NFTlRJTkVM';
+    try {
+      const captured: any[] = [];
+      __setOrangeFetch((async (url: string, init: any) => {
+        captured.push({ url, auth: init?.headers?.Authorization });
+        if (String(url).includes('/oauth/')) return { ok: true, json: async () => ({ access_token: TOKEN, expires_in: 3600 }) } as any;
+        return { ok: true, json: async () => ({}) } as any;
+      }) as any);
+      const r = await orangeSend('620000009', 'msg', 'GN');
+      expect(r.ok).toBe(true);
+      const oauthCall = captured.find((c) => String(c.url).includes('/oauth/'));
+      expect(oauthCall.auth).toBe('Basic SEVBREVSX1NFTlRJTkVM'); // en-tête repris tel quel
+    } finally {
+      (env as any).ORANGE_CLIENT_ID = 'CLIENTID_SENTINEL';
+      (env as any).ORANGE_CLIENT_SECRET = 'SECRET_SENTINEL_XYZ';
+      (env as any).ORANGE_AUTHORIZATION = '';
+    }
   });
 });

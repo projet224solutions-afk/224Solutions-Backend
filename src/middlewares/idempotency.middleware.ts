@@ -32,6 +32,7 @@ export async function idempotencyGuard(req: AuthenticatedRequest, res: Response,
     res.status(400).json({
       success: false,
       error: 'Header Idempotency-Key requis pour cette opération',
+      error_code: 'IDEMPOTENCY_KEY_MISSING',
     });
     return;
   }
@@ -42,6 +43,7 @@ export async function idempotencyGuard(req: AuthenticatedRequest, res: Response,
     res.status(400).json({
       success: false,
       error: 'Idempotency-Key doit être un UUID v4 valide',
+      error_code: 'IDEMPOTENCY_KEY_INVALID',
     });
     return;
   }

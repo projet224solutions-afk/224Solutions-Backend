@@ -2,7 +2,8 @@
  * 🎬 STUDIO CLIPS — worker ffmpeg (Chantier A3). Traite les jobs live_clips rendered_on='server'.
  * Pipeline (temp dir dédié, nettoyé en finally) : download replay (GCS public) → découpe segments
  * (copy, fallback re-encode) → concat → habillage 720p (logo boutique + bandeau produit) en une
- * passe → musique (amix -18dB / loudnorm) → version verticale 9:16 → couverture JPEG → upload GCS.
+ * passe → musique (volume réglable + ducking + fondus in/out via clipFilters / loudnorm) →
+ * version verticale 9:16 → couverture JPEG → upload GCS.
  * ffmpeg/ffprobe = binaires système (EC2). Args en TABLEAUX (jamais de concat shell → anti-injection).
  * Concurrence 1 (claim_next_clip_job avec SKIP LOCKED). Watchdog anti-zombie (clip_watchdog).
  */
@@ -13,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
+import { buildAudioFilter, normalizeAudioOpts } from './clipFilters.js';
 
 const pexec = promisify(execFile);
 // Les clips vivent sur Supabase Storage (comme les replays/images) → public + CORS garantis.
@@ -82,7 +84,10 @@ async function uploadClipFile(localPath: string, objectPath: string, contentType
 interface ClipRow {
   id: string; vendor_id: string; stream_id: string | null;
   segments: Array<{ start_s: number; end_s: number }>;
-  overlay: { product_name?: string; price?: number; currency?: string; show_logo?: boolean };
+  overlay: {
+    product_name?: string; price?: number; currency?: string; show_logo?: boolean;
+    audio?: { music_volume?: number; original_volume?: number; duck?: boolean; music_only?: boolean };
+  };
   music_track_id: string | null; cover_time_s: number | null;
 }
 
@@ -156,26 +161,27 @@ async function processClip(clip: ClipRow): Promise<void> {
       last = 'vout';
     }
 
-    // 4) Audio : musique en fond (-18dB, fondu 2s) ou loudnorm de l'audio d'origine.
+    // 4) Audio : musique en fond (volume réglable + fondu in/out + ducking) ou loudnorm de
+    //    l'audio d'origine. Filtre construit par clipFilters.buildAudioFilter (testé unitairement).
     const body = path.join(dir, 'body.mp4');
+    const totalDur = clip.segments.reduce((a, s) => a + (s.end_s - s.start_s), 0);
     let musicLocal: string | null = null;
     if (clip.music_track_id) {
       const { data: mt } = await supabaseAdmin.from('clip_music_tracks').select('url').eq('id', clip.music_track_id).eq('is_active', true).maybeSingle();
       const murl = (mt as any)?.url;
       if (murl && /^https?:\/\//.test(murl)) { try { musicLocal = path.join(dir, 'music.m4a'); await download(murl, musicLocal); } catch { musicLocal = null; } }
     }
-    if (musicLocal) {
-      filterInputs.push('-stream_loop', '-1', '-i', musicLocal);
-      const musicIdx = logoLocal ? 2 : 1;
-      const af = `[0:a]aresample=async=1[a0];[${musicIdx}:a]volume=-18dB,afade=t=out:st=0:d=2[am];[a0][am]amix=inputs=2:duration=first:dropout_transition=2[aout]`;
-      const filter = vf.join(';') + ';' + af;
-      await ff([...filterInputs, '-filter_complex', filter, '-map', `[${last}]`, '-map', '[aout]',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', body]);
-    } else {
-      const filter = vf.join(';') + ';[0:a]loudnorm[aout]';
-      await ff([...filterInputs, '-filter_complex', filter, '-map', `[${last}]`, '-map', '[aout]',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', body]);
-    }
+    const hasMusic = !!musicLocal;
+    if (hasMusic) filterInputs.push('-stream_loop', '-1', '-i', musicLocal!);
+    const audioOpts = normalizeAudioOpts(clip.overlay?.audio, {
+      hasMusic,
+      musicInputIndex: logoLocal ? 2 : 1, // 0=raw, [1=logo], puis musique
+      totalDurationS: totalDur,
+    });
+    const filter = vf.join(';') + ';' + buildAudioFilter(audioOpts);
+    await ff([...filterInputs, '-filter_complex', filter, '-map', `[${last}]`, '-map', '[aout]',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+      ...(hasMusic ? ['-shortest'] : []), body]);
     await setProgress(clip.id, 70);
 
     // 5) Version verticale 9:16 (1080x1920) : fond flouté + vidéo centrée (meilleur rendu que crop).

@@ -112,6 +112,7 @@ import mediaRoutes from './routes/media.routes.js';
 // @ts-ignore
 import internalRoutes from './routes/internal.routes.js';
 import clipsRoutes from './routes/clips.routes.js';
+import geoRoutes from './routes/geo.routes.js';
 // @ts-ignore
 import { rateLimiter } from './middlewares/rateLimiter.js';
 import { ipBlocklist, autoBlockGuard, refreshBlocklist } from './middlewares/ipBlocklist.js';
@@ -279,6 +280,7 @@ app.use('/api/migrations', migrationsRoutes);
 
 // 🎬 Studio Clips (vendeur : création/suivi/suppression de clips promo)
 app.use('/api/clips', clipsRoutes);
+app.use('/api/geo', geoRoutes);
 
 // Webhooks (public, signature-validated, BEFORE auth middleware)
 app.use('/webhooks', webhookRoutes);

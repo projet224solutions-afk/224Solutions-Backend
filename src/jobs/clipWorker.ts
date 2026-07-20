@@ -14,7 +14,7 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { buildAudioFilter, normalizeAudioOpts } from './clipFilters.js';
+import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts } from './clipFilters.js';
 
 const pexec = promisify(execFile);
 // Les clips vivent sur Supabase Storage (comme les replays/images) → public + CORS garantis.
@@ -37,7 +37,6 @@ export function privateReplayUrl(objectPath: string): string {
   return `${base}/storage/v1/object/authenticated/${REPLAY_BUCKET}/${objectPath}`;
 }
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
-const BLUE = '0x04439E';
 
 let running = false; // verrou process (concurrence 1 dans cette instance)
 
@@ -87,6 +86,7 @@ interface ClipRow {
   overlay: {
     product_name?: string; price?: number; currency?: string; show_logo?: boolean;
     audio?: { music_volume?: number; original_volume?: number; duck?: boolean; music_only?: boolean };
+    style?: { title?: string; title_position?: 'top' | 'bottom'; enhance?: boolean; watermark?: boolean };
   };
   music_track_id: string | null; cover_time_s: number | null;
 }
@@ -142,24 +142,20 @@ async function processClip(clip: ClipRow): Promise<void> {
     const priceLabel = clip.overlay?.price ? `${Number(clip.overlay.price).toLocaleString('fr-FR')} ${esc(clip.overlay.currency || 'GNF')}` : '';
     const bannerTxt = [esc(clip.overlay?.product_name || ''), priceLabel].filter(Boolean).join('   ');
 
-    // Filtre : base scale+pad 1280x720 → [bg]; bandeau (drawbox bleu 80% + drawtext) ; logo overlay.
-    const vf: string[] = [`[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[base]`];
-    let last = 'base';
-    if (bannerTxt) {
-      vf.push(`[${last}]drawbox=x=0:y=ih-96:w=iw:h=96:color=${BLUE}@0.8:t=fill[bx]`);
-      vf.push(`[bx]drawtext=fontfile=${FONT}:text='${bannerTxt}':fontcolor=white:fontsize=34:x=40:y=h-64[bt]`);
-      last = 'bt';
-    }
+    // Filtre d'habillage (base scale+pad → amélioration image → bandeau → titre → logo/filigrane)
+    // construit par clipFilters.buildVideoOverlayChain (testé unitairement). Sortie = [vout].
+    const style = normalizeStyleOpts(clip.overlay?.style);
+    const { filters: vf, lastLabel: last } = buildVideoOverlayChain({
+      bannerText: bannerTxt,
+      hasLogo: !!logoLocal,
+      title: style.title ? esc(style.title) : '',
+      titlePosition: style.titlePosition,
+      enhance: style.enhance,
+      watermark: style.watermark,
+      fontFile: FONT,
+    });
     const filterInputs = ['-i', raw];
-    if (logoLocal) {
-      filterInputs.push('-i', logoLocal);
-      vf.push(`[1:v]scale=iw*0.12:-1[lg]`);
-      vf.push(`[${last}][lg]overlay=W-w-24:H-h-120:format=auto[vout]`);
-      last = 'vout';
-    } else {
-      vf.push(`[${last}]null[vout]`);
-      last = 'vout';
-    }
+    if (logoLocal) filterInputs.push('-i', logoLocal);
 
     // 4) Audio : musique en fond (volume réglable + fondu in/out + ducking) ou loudnorm de
     //    l'audio d'origine. Filtre construit par clipFilters.buildAudioFilter (testé unitairement).

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { buildAudioFilter, normalizeAudioOpts, type AudioMixOpts } from './clipFilters.js';
+import {
+  buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts,
+  type AudioMixOpts, type VideoOverlayOpts,
+} from './clipFilters.js';
 
 const base = (over: Partial<AudioMixOpts> = {}): AudioMixOpts => ({
   hasMusic: true,
@@ -80,5 +83,75 @@ describe('normalizeAudioOpts — défauts + garde-fous', () => {
 
   it('totalDurationS jamais nul (évite un st de fondu invalide)', () => {
     expect(normalizeAudioOpts({}, { ...ctx, totalDurationS: 0 }).totalDurationS).toBeGreaterThan(0);
+  });
+});
+
+const vbase = (over: Partial<VideoOverlayOpts> = {}): VideoOverlayOpts => ({
+  bannerText: '', hasLogo: false, title: '', titlePosition: 'bottom',
+  enhance: false, watermark: false, fontFile: '/f.ttf', ...over,
+});
+
+const isChained = (filters: string[]): boolean => {
+  // Chaque maillon consomme le label produit par le précédent ; la sortie finale est [vout].
+  const joined = filters.join(';');
+  return joined.startsWith('[0:v]') && joined.includes('[vout]');
+};
+
+describe('buildVideoOverlayChain — habillage', () => {
+  it('minimal (rien) : base → null → [vout]', () => {
+    const { filters, lastLabel } = buildVideoOverlayChain(vbase());
+    expect(lastLabel).toBe('vout');
+    expect(filters.some((f) => f.includes('[base]null[vout]'))).toBe(true);
+    expect(isChained(filters)).toBe(true);
+  });
+
+  it('amélioration d’image : filtre eq inséré après la base', () => {
+    const { filters } = buildVideoOverlayChain(vbase({ enhance: true }));
+    expect(filters.some((f) => f.includes('eq=contrast=1.08:saturation=1.15:brightness=0.03'))).toBe(true);
+    expect(isChained(filters)).toBe(true);
+  });
+
+  it('titre à l’écran : drawtext centré, ombré, limité aux 3 premières s', () => {
+    const { filters } = buildVideoOverlayChain(vbase({ title: 'Soldes', titlePosition: 'bottom' }));
+    const t = filters.find((f) => f.includes("text='Soldes'"))!;
+    expect(t).toContain('bordercolor=black');
+    expect(t).toContain("enable='lt(t,3)'");
+    expect(t).toContain('x=(w-tw)/2');
+    expect(isChained(filters)).toBe(true);
+  });
+
+  it('titre en haut : y=80', () => {
+    const { filters } = buildVideoOverlayChain(vbase({ title: 'X', titlePosition: 'top' }));
+    expect(filters.find((f) => f.includes("text='X'"))).toContain(':y=80:');
+  });
+
+  it('logo opaque (défaut) : bas-droite, sans transparence', () => {
+    const { filters } = buildVideoOverlayChain(vbase({ hasLogo: true }));
+    expect(filters.some((f) => f.includes('overlay=W-w-24:H-h-120'))).toBe(true);
+    expect(filters.some((f) => f.includes('colorchannelmixer'))).toBe(false);
+  });
+
+  it('filigrane : logo semi-transparent (aa=0.6) en haut-droite', () => {
+    const { filters } = buildVideoOverlayChain(vbase({ hasLogo: true, watermark: true }));
+    expect(filters.some((f) => f.includes('colorchannelmixer=aa=0.6'))).toBe(true);
+    expect(filters.some((f) => f.includes('overlay=W-w-24:24'))).toBe(true);
+  });
+
+  it('combiné (enhance+banner+title+logo) reste correctement chaîné jusqu’à [vout]', () => {
+    const { filters, lastLabel } = buildVideoOverlayChain(
+      vbase({ enhance: true, bannerText: 'Produit  1000 GNF', title: 'Promo', hasLogo: true }),
+    );
+    expect(lastLabel).toBe('vout');
+    expect(isChained(filters)).toBe(true);
+  });
+});
+
+describe('normalizeStyleOpts', () => {
+  it('défauts sûrs quand overlay.style absent', () => {
+    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false });
+  });
+  it('lit les valeurs fournies', () => {
+    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true }))
+      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true });
   });
 });

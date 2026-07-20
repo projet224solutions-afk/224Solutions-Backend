@@ -100,3 +100,89 @@ export function buildAudioFilter(o: AudioMixOpts): string {
 }
 
 export const CLIP_AUDIO_BLUE = BLUE;
+
+// ══════════════════════ HABILLAGE VIDÉO (styles pro) ══════════════════════
+
+export interface VideoOverlayOpts {
+  /** Texte du bandeau produit (DÉJÀ échappé), '' si aucun produit. */
+  bannerText: string;
+  /** Un input logo est présent (index ffmpeg 1). */
+  hasLogo: boolean;
+  /** Titre à l'écran (DÉJÀ échappé), '' si aucun. Affiché les 3 premières s. */
+  title: string;
+  /** Position du titre. */
+  titlePosition: 'top' | 'bottom';
+  /** Amélioration d'image (contraste/saturation/luminosité) — lives sombres. */
+  enhance: boolean;
+  /** Logo en filigrane sur TOUTE la durée (opacité réduite, coin haut) plutôt qu'un logo opaque. */
+  watermark: boolean;
+  /** Chemin de la police pour drawtext. */
+  fontFile: string;
+}
+
+/** Normalise overlay.style (JSONB non fiable) → réglages d'habillage sûrs. */
+export function normalizeStyleOpts(raw: any): {
+  title: string; titlePosition: 'top' | 'bottom'; enhance: boolean; watermark: boolean;
+} {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  return {
+    title: typeof s.title === 'string' ? s.title : '',
+    titlePosition: s.title_position === 'top' ? 'top' : 'bottom',
+    enhance: s.enhance === true,
+    watermark: s.watermark === true,
+  };
+}
+
+/**
+ * Construit la chaîne de filtres VIDÉO d'habillage (une seule passe ffmpeg) à partir
+ * de la base 1280×720 déjà scalée/padée. Chaque maillon est optionnel et se chaîne sur
+ * le label précédent ; la sortie est toujours [vout].
+ *
+ * Ordre : base → amélioration d'image → bandeau produit → titre à l'écran → logo/filigrane.
+ */
+export function buildVideoOverlayChain(o: VideoOverlayOpts): { filters: string[]; lastLabel: string } {
+  const filters: string[] = [
+    `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[base]`,
+  ];
+  let last = 'base';
+
+  if (o.enhance) {
+    // Rehausse douce (les lives en boutique sont souvent sombres).
+    filters.push(`[${last}]eq=contrast=1.08:saturation=1.15:brightness=0.03[enh]`);
+    last = 'enh';
+  }
+
+  if (o.bannerText) {
+    filters.push(`[${last}]drawbox=x=0:y=ih-96:w=iw:h=96:color=${BLUE}@0.8:t=fill[bx]`);
+    filters.push(`[bx]drawtext=fontfile=${o.fontFile}:text='${o.bannerText}':fontcolor=white:fontsize=34:x=40:y=h-64[bt]`);
+    last = 'bt';
+  }
+
+  if (o.title) {
+    // Titre grand, blanc, ombre portée (bord noir) → lisible sur tout fond ; 3 premières s.
+    const y = o.titlePosition === 'top' ? '80' : 'h-180';
+    filters.push(
+      `[${last}]drawtext=fontfile=${o.fontFile}:text='${o.title}':fontcolor=white:fontsize=52:` +
+      `borderw=3:bordercolor=black@0.85:x=(w-tw)/2:y=${y}:enable='lt(t,3)'[ti]`,
+    );
+    last = 'ti';
+  }
+
+  if (o.hasLogo) {
+    if (o.watermark) {
+      // Filigrane : logo semi-transparent (60%) en haut-droite, toute la durée.
+      filters.push(`[1:v]scale=iw*0.1:-1,format=rgba,colorchannelmixer=aa=0.6[lg]`);
+      filters.push(`[${last}][lg]overlay=W-w-24:24:format=auto[vout]`);
+    } else {
+      // Logo opaque en bas-droite (au-dessus du bandeau).
+      filters.push(`[1:v]scale=iw*0.12:-1[lg]`);
+      filters.push(`[${last}][lg]overlay=W-w-24:H-h-120:format=auto[vout]`);
+    }
+    last = 'vout';
+  } else {
+    filters.push(`[${last}]null[vout]`);
+    last = 'vout';
+  }
+
+  return { filters, lastLabel: last };
+}

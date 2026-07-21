@@ -14,7 +14,41 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts } from './clipFilters.js';
+import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts, buildIntroOutroChain } from './clipFilters.js';
+
+const FONT_CLIP = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+
+/** Génère un carton INTRO/OUTRO (fond bleu 224 + nom boutique + logo + CTA outro). */
+async function makeIntroOutro(
+  ff: (args: string[], t?: number) => Promise<void>,
+  dir: string, kind: 'intro' | 'outro', durS: number, shopName: string,
+  ctaLine: string | undefined, logoFile: string | null,
+): Promise<string> {
+  const out = path.join(dir, `${kind}.mp4`);
+  const inputs = [
+    '-f', 'lavfi', '-i', `color=c=0x04439E:s=1280x720:d=${durS}:r=30`,
+    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+  ];
+  if (logoFile) inputs.push('-i', logoFile);
+  const { filters, lastLabel } = buildIntroOutroChain({ kind, shopName: shopName || '224Solutions', ctaLine, hasLogo: !!logoFile, fontFile: FONT_CLIP });
+  await ff([...inputs, '-filter_complex', filters.join(';'), '-map', `[${lastLabel}]`, '-map', '1:a',
+    '-t', String(durS), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', out]);
+  return out;
+}
+
+/** Concatène des clips de sources hétérogènes via le filtre concat (normalise scale/fps/sar/audio). */
+async function concatNormalized(
+  ff: (args: string[], t?: number) => Promise<void>, parts: string[], out: string,
+): Promise<void> {
+  const inputs = parts.flatMap((p) => ['-i', p]);
+  const norm = parts.map((_, i) =>
+    `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}];[${i}:a]aresample=48000[a${i}]`,
+  ).join(';');
+  const concatIn = parts.map((_, i) => `[v${i}][a${i}]`).join('');
+  const filter = `${norm};${concatIn}concat=n=${parts.length}:v=1:a=1[v][a]`;
+  await ff([...inputs, '-filter_complex', filter, '-map', '[v]', '-map', '[a]',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', out]);
+}
 
 const pexec = promisify(execFile);
 // Les clips vivent sur Supabase Storage (comme les replays/images) → public + CORS garantis.
@@ -130,21 +164,24 @@ async function processClip(clip: ClipRow): Promise<void> {
       await ff(['-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', raw]);
     });
 
-    // 3) Habillage 720p en UNE passe : scale/pad + logo (bas-droite) + bandeau produit (bas).
-    let logoLocal: string | null = null;
-    if (clip.overlay?.show_logo) {
-      const { data: v } = await supabaseAdmin.from('vendors').select('logo_url').eq('id', clip.vendor_id).maybeSingle();
+    // 3) Habillage 720p + (option) INTRO/OUTRO. Logo + nom récupérés si l'habillage OU l'intro/outro les requiert.
+    const style = normalizeStyleOpts(clip.overlay?.style);
+    let logoFile: string | null = null;
+    let shopName = '';
+    if (clip.overlay?.show_logo || style.intro || style.outro) {
+      const { data: v } = await supabaseAdmin.from('vendors').select('logo_url, business_name').eq('id', clip.vendor_id).maybeSingle();
+      shopName = (v as any)?.business_name || '';
       const logoUrl = (v as any)?.logo_url;
       if (logoUrl && /^https?:\/\//.test(logoUrl)) {
-        try { logoLocal = path.join(dir, 'logo.png'); await download(logoUrl, logoLocal); } catch { logoLocal = null; }
+        try { logoFile = path.join(dir, 'logo.png'); await download(logoUrl, logoFile); } catch { logoFile = null; }
       }
     }
+    const logoLocal = clip.overlay?.show_logo ? logoFile : null; // logo/filigrane d'habillage : seulement si demandé
     const priceLabel = clip.overlay?.price ? `${Number(clip.overlay.price).toLocaleString('fr-FR')} ${esc(clip.overlay.currency || 'GNF')}` : '';
     const bannerTxt = [esc(clip.overlay?.product_name || ''), priceLabel].filter(Boolean).join('   ');
 
     // Filtre d'habillage (base scale+pad → amélioration image → bandeau → titre → logo/filigrane)
     // construit par clipFilters.buildVideoOverlayChain (testé unitairement). Sortie = [vout].
-    const style = normalizeStyleOpts(clip.overlay?.style);
     const { filters: vf, lastLabel: last } = buildVideoOverlayChain({
       bannerText: bannerTxt,
       hasLogo: !!logoLocal,
@@ -180,6 +217,26 @@ async function processClip(clip: ClipRow): Promise<void> {
       ...(hasMusic ? ['-shortest'] : []), body]);
     await setProgress(clip.id, 70);
 
+    // 4b) INTRO / OUTRO générés (option) : cartons 224 (fond bleu + logo + nom + CTA) concaténés
+    // autour du corps. ISOLÉ + REPLI : tout échec (filtre/ffmpeg) laisse le clip SANS cartons
+    // (loggé), jamais d'échec du clip entier — l'intro/outro est cosmétique.
+    const cardsDur = (style.intro ? 1.5 : 0) + (style.outro ? 2 : 0);
+    if (style.intro || style.outro) {
+      try {
+        const parts: string[] = [];
+        if (style.intro) parts.push(await makeIntroOutro(ff, dir, 'intro', 1.5, shopName, undefined, logoFile));
+        parts.push(body);
+        if (style.outro) parts.push(await makeIntroOutro(ff, dir, 'outro', 2, shopName, 'Commandez sur 224solution.net', logoFile));
+        if (parts.length > 1) {
+          const withCards = path.join(dir, 'withcards.mp4');
+          await concatNormalized(ff, parts, withCards);
+          await fs.rename(withCards, body); // le corps inclut désormais l'intro/outro
+        }
+      } catch (e: any) {
+        logger.warn(`[clips] ${clip.id} intro/outro ignoré (repli sans cartons): ${String(e?.message || e).slice(0, 160)}`);
+      }
+    }
+
     // 5) Version verticale 9:16 (1080x1920) : fond flouté + vidéo centrée (meilleur rendu que crop).
     const vertical = path.join(dir, 'vertical.mp4');
     await ff(['-i', body, '-filter_complex',
@@ -205,7 +262,8 @@ async function processClip(clip: ClipRow): Promise<void> {
     // suffit pas (règle inviolable) : > max + 2 s de tolérance → failed, jamais publié.
     const { data: cfg } = await supabaseAdmin.from('clip_config').select('max_clip_duration_s').eq('id', true).maybeSingle();
     const maxS = Number((cfg as any)?.max_clip_duration_s || 300);
-    if (outDur > maxS + 2) throw new Error(`DUREE_SORTIE_DEPASSEE (${Math.round(outDur)}s > ${maxS}s)`);
+    // Tolérance = 2 s + durée des cartons intro/outro (qui s'ajoutent légitimement au contenu).
+    if (outDur > maxS + 2 + cardsDur) throw new Error(`DUREE_SORTIE_DEPASSEE (${Math.round(outDur)}s > ${maxS}s + cartons)`);
     const stat = await fs.stat(body);
     await supabaseAdmin.from('live_clips').update({
       status: 'ready', progress: 100,

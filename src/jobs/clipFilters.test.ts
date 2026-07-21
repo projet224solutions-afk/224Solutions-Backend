@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts,
+  buildIntroOutroChain,
   type AudioMixOpts, type VideoOverlayOpts,
 } from './clipFilters.js';
 
@@ -148,10 +149,33 @@ describe('buildVideoOverlayChain — habillage', () => {
 
 describe('normalizeStyleOpts', () => {
   it('défauts sûrs quand overlay.style absent', () => {
-    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false });
+    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false, intro: false, outro: false });
   });
   it('lit les valeurs fournies', () => {
-    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true }))
-      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true });
+    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true, intro: true, outro: true }))
+      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true, intro: true, outro: true });
+  });
+});
+
+describe('buildIntroOutroChain — cartons intro/outro', () => {
+  it('intro sans logo : nom centré → [v]', () => {
+    const { filters, lastLabel } = buildIntroOutroChain({ kind: 'intro', shopName: 'Ma Boutique', hasLogo: false, fontFile: '/f.ttf' });
+    expect(lastLabel).toBe('v');
+    expect(filters.some((f) => f.includes("text='Ma Boutique'"))).toBe(true);
+    expect(filters.some((f) => f.includes('[nm]null[v]'))).toBe(true);
+    expect(filters.join(';')).toContain('[v]');
+  });
+
+  it('outro avec logo + CTA : nom + cta + overlay logo', () => {
+    const { filters } = buildIntroOutroChain({ kind: 'outro', shopName: 'Shop', ctaLine: 'Commandez sur 224solution.net', hasLogo: true, fontFile: '/f.ttf' });
+    expect(filters.some((f) => f.includes("text='Shop'"))).toBe(true);
+    expect(filters.some((f) => f.includes("text='Commandez sur 224solution.net'"))).toBe(true);
+    expect(filters.some((f) => f.includes('[2:v]scale=-1:200[lg]'))).toBe(true);
+    expect(filters.some((f) => f.includes('overlay=(W-w)/2'))).toBe(true);
+  });
+
+  it('intro n’affiche pas de CTA (réservé à l’outro)', () => {
+    const { filters } = buildIntroOutroChain({ kind: 'intro', shopName: 'X', ctaLine: 'NE PAS AFFICHER', hasLogo: false, fontFile: '/f.ttf' });
+    expect(filters.some((f) => f.includes('NE PAS AFFICHER'))).toBe(false);
   });
 });

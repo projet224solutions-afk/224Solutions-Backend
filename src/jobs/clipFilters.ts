@@ -123,6 +123,7 @@ export interface VideoOverlayOpts {
 /** Normalise overlay.style (JSONB non fiable) → réglages d'habillage sûrs. */
 export function normalizeStyleOpts(raw: any): {
   title: string; titlePosition: 'top' | 'bottom'; enhance: boolean; watermark: boolean;
+  intro: boolean; outro: boolean;
 } {
   const s = raw && typeof raw === 'object' ? raw : {};
   return {
@@ -130,7 +131,63 @@ export function normalizeStyleOpts(raw: any): {
     titlePosition: s.title_position === 'top' ? 'top' : 'bottom',
     enhance: s.enhance === true,
     watermark: s.watermark === true,
+    intro: s.intro === true,
+    outro: s.outro === true,
   };
+}
+
+// ══════════════════════ INTRO / OUTRO générés (carton titre) ══════════════════════
+
+/** Échappe un texte pour drawtext (miroir du worker — dupliqué ici pour rester testable seul). */
+function escText(t: string): string {
+  return String(t || '').replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, '’').replace(/%/g, '\\%').slice(0, 60);
+}
+
+export interface IntroOutroOpts {
+  kind: 'intro' | 'outro';
+  shopName: string;      // DÉJÀ brut (échappé ici)
+  ctaLine?: string;      // outro : lien / appel à l'action (déjà brut)
+  hasLogo: boolean;      // un input logo est présent (index 2 : 0=gradient, 1=anullsrc, 2=logo)
+  fontFile: string;
+}
+
+/**
+ * Chaîne filter_complex d'un carton INTRO/OUTRO (fond dégradé 224 déjà fourni en entrée 0,
+ * audio silencieux en entrée 1, logo optionnel en entrée 2). Sortie vidéo [v] ; l'audio est
+ * mappé par le worker sur [1:a]. Logo centré au-dessus, nom de la boutique dessous, + CTA (outro).
+ */
+export function buildIntroOutroChain(o: IntroOutroOpts): { filters: string[]; lastLabel: string } {
+  const name = escText(o.shopName);
+  const cta = o.kind === 'outro' && o.ctaLine ? escText(o.ctaLine) : '';
+  const filters: string[] = [];
+  let last = '0:v';
+
+  // Nom de la boutique (gros, centré, ombré).
+  filters.push(
+    `[${last}]drawtext=fontfile=${o.fontFile}:text='${name}':fontcolor=white:fontsize=64:` +
+    `borderw=2:bordercolor=black@0.6:x=(w-tw)/2:y=(h-th)/2+90[nm]`,
+  );
+  last = 'nm';
+
+  // Outro : ligne d'appel à l'action sous le nom.
+  if (cta) {
+    filters.push(
+      `[${last}]drawtext=fontfile=${o.fontFile}:text='${cta}':fontcolor=white:fontsize=34:` +
+      `borderw=2:bordercolor=black@0.6:x=(w-tw)/2:y=(h-th)/2+170[cta]`,
+    );
+    last = 'cta';
+  }
+
+  // Logo centré au-dessus du nom.
+  if (o.hasLogo) {
+    filters.push(`[2:v]scale=-1:200[lg]`);
+    filters.push(`[${last}][lg]overlay=(W-w)/2:(H-h)/2-140[v]`);
+    last = 'v';
+  } else {
+    filters.push(`[${last}]null[v]`);
+    last = 'v';
+  }
+  return { filters, lastLabel: last };
 }
 
 /**

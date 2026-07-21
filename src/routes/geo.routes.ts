@@ -96,19 +96,26 @@ const TZ_COUNTRY: Record<string, string> = {
 
 const SUPPORTED_LANGS = new Set(['fr', 'en', 'ar', 'pt', 'es', 'de', 'it', 'nl', 'ru', 'tr', 'zh']);
 
-// Mapping pays → devise depuis la table `countries` (source PDG), caché en mémoire 1 h.
+// Mapping pays → devise ET langue depuis la table `countries` (source PDG, éditable), caché 1 h.
 let currencyMap: Record<string, string> = {};
-let currencyMapAt = 0;
-async function countryCurrency(iso: string): Promise<string> {
+let langMap: Record<string, string> = {};
+let countryMapsAt = 0;
+async function loadCountryMaps(): Promise<void> {
   const now = Date.now();
-  if (now - currencyMapAt > 3600_000) {
-    try {
-      const { data } = await supabaseAdmin.from('countries').select('country_code, currency_code');
-      const m: Record<string, string> = {};
-      for (const r of (data as any[]) || []) if (r.country_code && r.currency_code) m[r.country_code] = r.currency_code;
-      if (Object.keys(m).length) { currencyMap = m; currencyMapAt = now; }
-    } catch { /* on garde l'ancien cache / le défaut */ }
-  }
+  if (now - countryMapsAt <= 3600_000 && Object.keys(currencyMap).length) return;
+  try {
+    const { data } = await supabaseAdmin.from('countries').select('country_code, currency_code, default_language');
+    const cm: Record<string, string> = {}; const lm: Record<string, string> = {};
+    for (const r of (data as any[]) || []) {
+      if (!r.country_code) continue;
+      if (r.currency_code) cm[r.country_code] = r.currency_code;
+      if (r.default_language) lm[r.country_code] = r.default_language;
+    }
+    if (Object.keys(cm).length) { currencyMap = cm; langMap = lm; countryMapsAt = now; }
+  } catch { /* on garde l'ancien cache / les défauts */ }
+}
+async function countryCurrency(iso: string): Promise<string> {
+  await loadCountryMaps();
   return currencyMap[iso] || 'GNF';
 }
 
@@ -152,8 +159,8 @@ router.get('/detect', async (req: Request, res: Response) => {
     // c. Défaut
     if (!country) { country = 'GN'; method = 'default'; confidence = 0; }
 
-    const currency = await countryCurrency(country);
-    const language = COUNTRY_LANG[country] || (SUPPORTED_LANGS.has(browserLang) ? browserLang : 'fr');
+    const currency = await countryCurrency(country); // charge aussi langMap (source PDG)
+    const language = langMap[country] || COUNTRY_LANG[country] || (SUPPORTED_LANGS.has(browserLang) ? browserLang : 'fr');
 
     const result = {
       country, currency, language,
@@ -190,6 +197,38 @@ router.get('/diagnostics', verifyJWT, async (req: AuthenticatedRequest, res: Res
     alert_threshold: FALLBACK_RATE_THRESHOLD,
     note: 'Compteur en mémoire par instance (VPS mono-instance), fenêtre glissante 1 h.',
   });
+});
+
+// ── Mapping pays éditable PDG (devise / indicatif / langue / actif) — GAP B ──
+router.get('/countries', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', req.user!.id).maybeSingle();
+  if (!['pdg', 'admin', 'ceo'].includes(String((prof as any)?.role || '').toLowerCase())) {
+    res.status(403).json({ success: false, error: 'PDG uniquement' }); return;
+  }
+  const { data, error } = await supabaseAdmin.from('countries')
+    .select('country_code, country_name, currency_code, currency_symbol, phone_code, default_language, is_active, flag_emoji')
+    .order('country_name', { ascending: true });
+  if (error) { res.status(500).json({ success: false, error: 'Liste indisponible' }); return; }
+  ok(res, data || []);
+});
+
+router.patch('/countries/:code', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', req.user!.id).maybeSingle();
+  if (!['pdg', 'admin', 'ceo'].includes(String((prof as any)?.role || '').toLowerCase())) {
+    res.status(403).json({ success: false, error: 'PDG uniquement' }); return;
+  }
+  const code = String(req.params.code || '').toUpperCase().slice(0, 3);
+  const b = req.body || {};
+  const upd: Record<string, any> = { updated_at: new Date().toISOString() };
+  if (typeof b.currency_code === 'string') upd.currency_code = b.currency_code.toUpperCase().slice(0, 3);
+  if (typeof b.phone_code === 'string') upd.phone_code = b.phone_code.replace(/[^0-9]/g, '').slice(0, 4);
+  if (typeof b.default_language === 'string') upd.default_language = b.default_language.toLowerCase().slice(0, 2);
+  if (typeof b.is_active === 'boolean') upd.is_active = b.is_active;
+  if (typeof b.country_name === 'string' && b.country_name.trim()) upd.country_name = b.country_name.trim().slice(0, 80);
+  const { error } = await supabaseAdmin.from('countries').update(upd).eq('country_code', code);
+  if (error) { res.status(500).json({ success: false, error: 'Mise à jour impossible' }); return; }
+  countryMapsAt = 0; // invalide le cache mémoire → changement pris en compte immédiatement
+  ok(res, { updated: true, code });
 });
 
 export default router;

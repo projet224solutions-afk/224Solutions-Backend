@@ -14,7 +14,7 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts, buildIntroOutroChain } from './clipFilters.js';
+import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts, buildIntroOutroChain, buildTransitionChain } from './clipFilters.js';
 
 const FONT_CLIP = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
@@ -160,12 +160,29 @@ async function processClip(clip: ClipRow): Promise<void> {
     const listFile = path.join(dir, 'list.txt');
     await fs.writeFile(listFile, segFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n'));
     const raw = path.join(dir, 'raw.mp4');
-    await ff(['-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', raw]).catch(async () => {
-      await ff(['-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', raw]);
-    });
+    const style = normalizeStyleOpts(clip.overlay?.style);
+    // Transition entre segments (option) : xfade+acrossfade. ISOLÉ + REPLI : tout échec →
+    // coupe franche (concat éprouvé). Défaut 'cut' = concat inchangé, zéro régression.
+    const durations = clip.segments.map((s) => s.end_s - s.start_s);
+    const tr = buildTransitionChain(durations, style.transition, 0.3);
+    let rawDone = false;
+    if (tr) {
+      try {
+        await ff([...segFiles.flatMap((f) => ['-i', f]), '-filter_complex', tr.filter,
+          '-map', `[${tr.vLabel}]`, '-map', `[${tr.aLabel}]`,
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', raw]);
+        rawDone = true;
+      } catch (e: any) {
+        logger.warn(`[clips] ${clip.id} transition ignorée (repli coupe franche): ${String(e?.message || e).slice(0, 140)}`);
+      }
+    }
+    if (!rawDone) {
+      await ff(['-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', raw]).catch(async () => {
+        await ff(['-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', raw]);
+      });
+    }
 
     // 3) Habillage 720p + (option) INTRO/OUTRO. Logo + nom récupérés si l'habillage OU l'intro/outro les requiert.
-    const style = normalizeStyleOpts(clip.overlay?.style);
     let logoFile: string | null = null;
     let shopName = '';
     if (clip.overlay?.show_logo || style.intro || style.outro) {

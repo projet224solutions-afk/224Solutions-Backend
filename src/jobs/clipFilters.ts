@@ -101,6 +101,42 @@ export function buildAudioFilter(o: AudioMixOpts): string {
 
 export const CLIP_AUDIO_BLUE = BLUE;
 
+// ══════════════════════ TRANSITIONS entre segments (xfade) ══════════════════════
+
+export type ClipTransition = 'cut' | 'fade' | 'fadeblack';
+
+/**
+ * Construit le filtre xfade+acrossfade enchaînant N segments (entrées ffmpeg 0..N-1),
+ * avec une transition de `dur` s. Retourne le filtergraph + les labels de sortie [vout]/[aout].
+ * `cut` OU moins de 2 segments → null (l'appelant garde le concat éprouvé). La transition est
+ * bornée pour ne jamais dépasser la moitié du plus court segment.
+ */
+export function buildTransitionChain(
+  durations: number[], transition: ClipTransition, dur = 0.3,
+): { filter: string; vLabel: string; aLabel: string } | null {
+  const n = durations.length;
+  if (transition === 'cut' || n < 2) return null;
+  const shortest = Math.min(...durations);
+  const t = Math.max(0.1, Math.min(dur, shortest / 2)); // borne : jamais > moitié du plus court
+  const xtype = transition === 'fadeblack' ? 'fadeblack' : 'fade';
+
+  const parts: string[] = [];
+  let vPrev = '[0:v]';
+  let aPrev = '[0:a]';
+  let cumulated = durations[0];
+  for (let i = 1; i < n; i++) {
+    const vOut = i === n - 1 ? 'vout' : `vx${i}`;
+    const aOut = i === n - 1 ? 'aout' : `ax${i}`;
+    const offset = Math.max(0, cumulated - t);
+    parts.push(`${vPrev}[${i}:v]xfade=transition=${xtype}:duration=${t.toFixed(2)}:offset=${offset.toFixed(2)}[${vOut}]`);
+    parts.push(`${aPrev}[${i}:a]acrossfade=d=${t.toFixed(2)}[${aOut}]`);
+    vPrev = `[${vOut}]`;
+    aPrev = `[${aOut}]`;
+    cumulated = cumulated + durations[i] - t;
+  }
+  return { filter: parts.join(';'), vLabel: 'vout', aLabel: 'aout' };
+}
+
 // ══════════════════════ HABILLAGE VIDÉO (styles pro) ══════════════════════
 
 export interface VideoOverlayOpts {
@@ -123,9 +159,10 @@ export interface VideoOverlayOpts {
 /** Normalise overlay.style (JSONB non fiable) → réglages d'habillage sûrs. */
 export function normalizeStyleOpts(raw: any): {
   title: string; titlePosition: 'top' | 'bottom'; enhance: boolean; watermark: boolean;
-  intro: boolean; outro: boolean;
+  intro: boolean; outro: boolean; transition: 'cut' | 'fade' | 'fadeblack';
 } {
   const s = raw && typeof raw === 'object' ? raw : {};
+  const tr = s.transition === 'fade' || s.transition === 'fadeblack' ? s.transition : 'cut';
   return {
     title: typeof s.title === 'string' ? s.title : '',
     titlePosition: s.title_position === 'top' ? 'top' : 'bottom',
@@ -133,6 +170,7 @@ export function normalizeStyleOpts(raw: any): {
     watermark: s.watermark === true,
     intro: s.intro === true,
     outro: s.outro === true,
+    transition: tr,
   };
 }
 

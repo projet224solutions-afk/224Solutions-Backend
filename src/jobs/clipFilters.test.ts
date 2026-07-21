@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts,
-  buildIntroOutroChain,
+  buildIntroOutroChain, buildTransitionChain,
   type AudioMixOpts, type VideoOverlayOpts,
 } from './clipFilters.js';
 
@@ -149,11 +149,11 @@ describe('buildVideoOverlayChain — habillage', () => {
 
 describe('normalizeStyleOpts', () => {
   it('défauts sûrs quand overlay.style absent', () => {
-    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false, intro: false, outro: false });
+    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false, intro: false, outro: false, transition: 'cut' });
   });
   it('lit les valeurs fournies', () => {
-    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true, intro: true, outro: true }))
-      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true, intro: true, outro: true });
+    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade' }))
+      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade' });
   });
 });
 
@@ -177,5 +177,46 @@ describe('buildIntroOutroChain — cartons intro/outro', () => {
   it('intro n’affiche pas de CTA (réservé à l’outro)', () => {
     const { filters } = buildIntroOutroChain({ kind: 'intro', shopName: 'X', ctaLine: 'NE PAS AFFICHER', hasLogo: false, fontFile: '/f.ttf' });
     expect(filters.some((f) => f.includes('NE PAS AFFICHER'))).toBe(false);
+  });
+});
+
+describe('buildTransitionChain — transitions xfade', () => {
+  it('cut ou < 2 segments → null (concat conservé)', () => {
+    expect(buildTransitionChain([5, 5], 'cut')).toBeNull();
+    expect(buildTransitionChain([5], 'fade')).toBeNull();
+  });
+
+  it('2 segments fade : xfade + acrossfade, offset = dur0 - t', () => {
+    const r = buildTransitionChain([10, 8], 'fade', 0.3)!;
+    expect(r.filter).toContain('xfade=transition=fade:duration=0.30:offset=9.70');
+    expect(r.filter).toContain('acrossfade=d=0.30');
+    expect(r.vLabel).toBe('vout');
+    expect(r.aLabel).toBe('aout');
+  });
+
+  it('3 segments : offsets cumulés + labels intermédiaires', () => {
+    const r = buildTransitionChain([10, 8, 6], 'fade', 0.3)!;
+    // 1er xfade offset = 10-0.3 = 9.70 ; 2e = (10+8-0.3)-0.3 = 17.40
+    expect(r.filter).toContain('offset=9.70');
+    expect(r.filter).toContain('offset=17.40');
+    expect(r.filter).toContain('[vx1]');
+  });
+
+  it('fadeblack : transition=fadeblack', () => {
+    expect(buildTransitionChain([5, 5], 'fadeblack')!.filter).toContain('xfade=transition=fadeblack');
+  });
+
+  it('durée bornée à la moitié du plus court segment', () => {
+    // plus court = 0.5 → t borné à 0.25 (pas 0.3)
+    expect(buildTransitionChain([0.5, 5], 'fade', 0.3)!.filter).toContain('duration=0.25');
+  });
+});
+
+describe('normalizeStyleOpts — transition', () => {
+  it('défaut cut, lit fade/fadeblack', () => {
+    expect(normalizeStyleOpts(undefined).transition).toBe('cut');
+    expect(normalizeStyleOpts({ transition: 'fade' }).transition).toBe('fade');
+    expect(normalizeStyleOpts({ transition: 'fadeblack' }).transition).toBe('fadeblack');
+    expect(normalizeStyleOpts({ transition: 'bogus' }).transition).toBe('cut');
   });
 });

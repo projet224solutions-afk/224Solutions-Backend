@@ -15,8 +15,8 @@
 -- SEULE différence vs la v2 (20260717210000) : `shipped` accepté dans la garde de statut
 -- + un bloc de retour de stock pour `shipped`. Tout le reste est identique.
 --
--- ⚠️ NON APPLIQUÉE ICI. À tester en BEGIN/…/ROLLBACK puis appliquer avec DATABASE_URL
---    (idempotente : CREATE OR REPLACE).
+-- ✅ APPLIQUÉE EN PROD le 2026-07-21 (via API Management, preuve ROLLBACK sur la commande fantôme
+--    ACH20260720-4448 : cancel → success, shipped→cancelled achat+commande, stock fournisseur +13).
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.cancel_b2b_order(

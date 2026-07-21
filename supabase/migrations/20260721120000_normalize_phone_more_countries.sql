@@ -5,6 +5,8 @@
 -- retombait sur '224' (Guinée) = E.164 faux. Bug LATENT (l'UI envoie déjà l'E.164
 -- complet, préservé par la branche « ≥ 11 chiffres »), corrigé ici par robustesse.
 -- Additif : même signature, même volatilité IMMUTABLE, seul le CASE s'élargit.
+-- ✅ APPLIQUÉE EN PROD le 2026-07-21 (preuve ROLLBACK : FR '612345678'→+33612345678,
+--    SN→+221771234567, E.164 +234… préservé, GN par défaut inchangé).
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.normalize_phone(p text, default_country text DEFAULT 'GN')

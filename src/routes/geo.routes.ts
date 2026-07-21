@@ -20,8 +20,50 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { cache } from '../config/redis.js';
 import { ok } from '../utils/apiResponse.js';
+import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 
 const router = Router();
+
+// ── Observabilité (traçabilité PDG) : répartition des méthodes de détection sur une
+// fenêtre glissante d'1 h, EN MÉMOIRE (par instance — VPS mono-instance). Alerte
+// system_alerts si le taux de repli 'default' dépasse un seuil (GeoIP probablement KO).
+const geoStats: Record<'geoip' | 'timezone' | 'default', number> = { geoip: 0, timezone: 0, default: 0 };
+let geoStatsSince = 0; // rempli au 1er comptage (Date.now() interdit au niveau module ? non — runtime OK)
+let lastFallbackAlertAt = 0;
+const FALLBACK_RATE_THRESHOLD = 0.2;   // 20 % de repli 'default'
+const FALLBACK_MIN_SAMPLES = 50;       // pas d'alerte sous 50 détections (bruit)
+
+function recordDetection(method: string): void {
+  const now = Date.now();
+  if (geoStatsSince === 0 || now - geoStatsSince > 3600_000) {
+    geoStats.geoip = 0; geoStats.timezone = 0; geoStats.default = 0; geoStatsSince = now;
+  }
+  if (method === 'geoip' || method === 'timezone' || method === 'default') geoStats[method]++;
+}
+
+async function maybeAlertFallback(): Promise<void> {
+  const total = geoStats.geoip + geoStats.timezone + geoStats.default;
+  if (total < FALLBACK_MIN_SAMPLES) return;
+  const rate = geoStats.default / total;
+  if (rate < FALLBACK_RATE_THRESHOLD) return;
+  if (Date.now() - lastFallbackAlertAt < 3600_000) return; // throttle 1/h par instance
+  lastFallbackAlertAt = Date.now();
+  try {
+    const alertKey = 'geo_fallback_high';
+    const { data: existing } = await supabaseAdmin.from('system_alerts')
+      .select('id').eq('module', 'geo_detection').eq('status', 'active')
+      .filter('metadata->>alert_key', 'eq', alertKey).maybeSingle();
+    if (existing) return; // alerte déjà ouverte
+    await supabaseAdmin.from('system_alerts').insert({
+      title: '[geo_detection] Taux de repli géo élevé',
+      message: `${Math.round(rate * 100)}% des détections retombent sur le défaut GN/GNF/fr (${total} détections / 1 h). La géolocalisation IP est probablement défaillante — les visiteurs étrangers voient des prix en GNF.`,
+      severity: 'high', module: 'geo_detection', status: 'active',
+      suggested_fix: "Vérifier trust proxy + X-Forwarded-For sur le VPS et la fraîcheur de la base geoip-lite (GeoLite2).",
+      metadata: { alert_key: alertKey, fallback_rate: Math.round(rate * 100) / 100, samples: total },
+    });
+    logger.warn(`[geo] alerte repli élevé: ${Math.round(rate * 100)}% sur ${total} détections`);
+  } catch (e: any) { logger.warn(`[geo] alerte system_alerts échouée: ${e?.message || e}`); }
+}
 
 // Pays → langue par défaut (francophone / anglophone / lusophone / arabe / …).
 const COUNTRY_LANG: Record<string, string> = {
@@ -94,7 +136,7 @@ router.get('/detect', async (req: Request, res: Response) => {
   try {
     const key = `geo:${ipPrefix(rawIp)}:${tz}:${browserLang}`;
     const cached = await cache.get<any>(key);
-    if (cached) return ok(res, cached);
+    if (cached) { recordDetection(cached.detection_method); return ok(res, cached); }
 
     let country: string | null = null;
     let method = 'default';
@@ -118,6 +160,8 @@ router.get('/detect', async (req: Request, res: Response) => {
       timezone: tz || null, detection_method: method, confidence,
     };
     await cache.set(key, result, 24 * 3600);
+    recordDetection(method);
+    void maybeAlertFallback();
     logger.info(`[geo] ${anonymizeIp(rawIp)} → ${country}/${currency}/${language} (${method})`);
     return ok(res, result);
   } catch (err: any) {
@@ -128,6 +172,24 @@ router.get('/detect', async (req: Request, res: Response) => {
       timezone: tz || null, detection_method: 'default', confidence: 0,
     });
   }
+});
+
+// ── GET /api/geo/diagnostics : traçabilité PDG (répartition des méthodes + taux de repli) ──
+router.get('/diagnostics', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { data: prof } = await supabaseAdmin.from('profiles').select('role').eq('id', req.user!.id).maybeSingle();
+  if (!['pdg', 'admin', 'ceo'].includes(String((prof as any)?.role || '').toLowerCase())) {
+    res.status(403).json({ success: false, error: 'PDG uniquement' });
+    return;
+  }
+  const total = geoStats.geoip + geoStats.timezone + geoStats.default;
+  ok(res, {
+    window_started_at: geoStatsSince ? new Date(geoStatsSince).toISOString() : null,
+    total,
+    by_method: { ...geoStats },
+    fallback_rate: total ? Math.round((geoStats.default / total) * 1000) / 1000 : 0,
+    alert_threshold: FALLBACK_RATE_THRESHOLD,
+    note: 'Compteur en mémoire par instance (VPS mono-instance), fenêtre glissante 1 h.',
+  });
 });
 
 export default router;

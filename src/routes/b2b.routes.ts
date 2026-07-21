@@ -533,6 +533,8 @@ const AdjustmentsSchema = z.object({
     unit_price: z.number().min(0).nullish(),
   })).max(200).nullish(),
   note: z.string().max(500).nullish(),
+  // P2.3 : le fournisseur pré-autorise (ou non) que l'acheteur règle à crédit à la réception.
+  allow_credit_on_reception: z.boolean().nullish(),
 });
 
 /**
@@ -559,6 +561,14 @@ router.post('/orders/:orderId([0-9a-fA-F-]{36})/confirm', verifyJWT, idempotency
     }
     const result = data as any;
     if (!result?.success) return b2bTransitionError(res, result);
+
+    // 💳 P2.3 : appliquer la pré-autorisation de crédit à la réception (le RPC a validé que
+    // l'appelant est bien le fournisseur de cette commande).
+    if (typeof parsed.data.allow_credit_on_reception === 'boolean') {
+      await supabaseAdmin.from('stock_purchases')
+        .update({ credit_on_reception_allowed: parsed.data.allow_credit_on_reception } as any)
+        .eq('linked_order_id', req.params.orderId);
+    }
 
     await createNotification({
       userId: result.buyer_user_id,
@@ -710,6 +720,9 @@ const ReceiveSchema = z.object({
   })).min(1).max(200),
   close: z.boolean().nullish(),
   note: z.string().max(1000).nullish(),
+  // P2.3 : l'acheteur choisit de régler À CRÉDIT à la réception (n'aboutit que si le
+  // fournisseur l'a pré-autorisé sur la commande — sinon la RPC renvoie CREDIT_NOT_ALLOWED).
+  settle_credit: z.boolean().nullish(),
 });
 
 /**
@@ -784,6 +797,7 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
       p_wallet_debit_amount: walletDebit,
       p_buyer_wallet_currency: walletCurrency,
       p_buyer_fee_amount: buyerFee,
+      p_settle_credit: input.settle_credit ?? false,
     });
     if (error) {
       logger.error(`[b2b/receive] RPC: ${error.message}`);
@@ -800,6 +814,7 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
           WALLET_NOT_FOUND: { status: 402, msg: 'Portefeuille introuvable pour cette devise. Aucune marchandise n\'a été réceptionnée.' },
           DEBIT_MISMATCH: { status: 409, msg: 'Incohérence de montant détectée — réessayez.' },
           INVALID_WALLET_AMOUNT: { status: 409, msg: 'Montant de règlement invalide.' },
+          CREDIT_NOT_ALLOWED: { status: 409, msg: 'Le fournisseur n\'autorise pas le paiement à crédit à la réception.' },
         };
         if (walletErr[code]) {
           return fail(res, walletErr[code].status, walletErr[code].msg, code);

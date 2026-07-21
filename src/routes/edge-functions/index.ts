@@ -38,6 +38,7 @@ import externalPaymentsRoutes from "./external-payments.routes.js";
 import aiIntelligenceRoutes from "./ai-intelligence.routes.js";
 import infrastructureRoutes from "./infrastructure.routes.js";
 import copiloteSearchRoutes from "./copilote-search.routes.js";
+import phoneSignupRoutes from "./phone-signup.routes.js";
 
 const router = Router();
 
@@ -56,6 +57,7 @@ function isPublicEdgePath(p: string): boolean {
     p.includes('webhook') ||          // tous les webhooks (vérifiés par signature)
     p === '/health' ||
     p === '/send-otp-email' ||
+    p === '/phone-signup-send' ||   // OTP d'inscription — utilisateur pas encore créé
     p === '/paypal-client-id'
   );
 }
@@ -107,6 +109,7 @@ router.use("/webhooks", webhooksRoutes);
 router.use("/products", productsRoutes);
 router.use("/orders", ordersRoutes);
 router.use("/analytics", analyticsRoutes);
+router.use("/", phoneSignupRoutes);
 router.use("/", translationMediaRoutes);
 router.use("/", infrastructureRoutes);
 router.use("/", notificationsRoutes);

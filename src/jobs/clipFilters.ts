@@ -160,9 +160,11 @@ export interface VideoOverlayOpts {
 export function normalizeStyleOpts(raw: any): {
   title: string; titlePosition: 'top' | 'bottom'; enhance: boolean; watermark: boolean;
   intro: boolean; outro: boolean; transition: 'cut' | 'fade' | 'fadeblack';
+  format: '9:16' | '1:1' | '16:9';
 } {
   const s = raw && typeof raw === 'object' ? raw : {};
   const tr = s.transition === 'fade' || s.transition === 'fadeblack' ? s.transition : 'cut';
+  const fmt = s.format === '1:1' || s.format === '16:9' ? s.format : '9:16';
   return {
     title: typeof s.title === 'string' ? s.title : '',
     titlePosition: s.title_position === 'top' ? 'top' : 'bottom',
@@ -171,7 +173,15 @@ export function normalizeStyleOpts(raw: any): {
     intro: s.intro === true,
     outro: s.outro === true,
     transition: tr,
+    format: fmt,
   };
+}
+
+/** Dimensions de la 2e version (téléchargeable) selon le format choisi. 16:9 = même que le paysage. */
+export function secondaryFormatSize(format: '9:16' | '1:1' | '16:9'): { w: number; h: number } | null {
+  if (format === '1:1') return { w: 1080, h: 1080 };
+  if (format === '9:16') return { w: 1080, h: 1920 };
+  return null; // 16:9 → réutilise le paysage, pas de 2e rendu
 }
 
 // ══════════════════════ INTRO / OUTRO générés (carton titre) ══════════════════════

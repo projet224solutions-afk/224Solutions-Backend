@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts,
-  buildIntroOutroChain, buildTransitionChain,
+  buildIntroOutroChain, buildTransitionChain, secondaryFormatSize,
   type AudioMixOpts, type VideoOverlayOpts,
 } from './clipFilters.js';
 
@@ -149,11 +149,11 @@ describe('buildVideoOverlayChain — habillage', () => {
 
 describe('normalizeStyleOpts', () => {
   it('défauts sûrs quand overlay.style absent', () => {
-    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false, intro: false, outro: false, transition: 'cut' });
+    expect(normalizeStyleOpts(undefined)).toEqual({ title: '', titlePosition: 'bottom', enhance: false, watermark: false, intro: false, outro: false, transition: 'cut', format: '9:16' });
   });
   it('lit les valeurs fournies', () => {
-    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade' }))
-      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade' });
+    expect(normalizeStyleOpts({ title: 'Hi', title_position: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade', format: '1:1' }))
+      .toEqual({ title: 'Hi', titlePosition: 'top', enhance: true, watermark: true, intro: true, outro: true, transition: 'fade', format: '1:1' });
   });
 });
 
@@ -218,5 +218,19 @@ describe('normalizeStyleOpts — transition', () => {
     expect(normalizeStyleOpts({ transition: 'fade' }).transition).toBe('fade');
     expect(normalizeStyleOpts({ transition: 'fadeblack' }).transition).toBe('fadeblack');
     expect(normalizeStyleOpts({ transition: 'bogus' }).transition).toBe('cut');
+  });
+  it('format défaut 9:16, lit 1:1 / 16:9, rejette le reste', () => {
+    expect(normalizeStyleOpts(undefined).format).toBe('9:16');
+    expect(normalizeStyleOpts({ format: '1:1' }).format).toBe('1:1');
+    expect(normalizeStyleOpts({ format: '16:9' }).format).toBe('16:9');
+    expect(normalizeStyleOpts({ format: '4:3' }).format).toBe('9:16');
+  });
+});
+
+describe('secondaryFormatSize', () => {
+  it('9:16 → 1080×1920, 1:1 → 1080×1080, 16:9 → null (réutilise paysage)', () => {
+    expect(secondaryFormatSize('9:16')).toEqual({ w: 1080, h: 1920 });
+    expect(secondaryFormatSize('1:1')).toEqual({ w: 1080, h: 1080 });
+    expect(secondaryFormatSize('16:9')).toBeNull();
   });
 });

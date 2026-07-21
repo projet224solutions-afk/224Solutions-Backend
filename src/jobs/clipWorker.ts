@@ -14,7 +14,7 @@ import os from 'os';
 import path from 'path';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts, buildIntroOutroChain, buildTransitionChain } from './clipFilters.js';
+import { buildAudioFilter, normalizeAudioOpts, buildVideoOverlayChain, normalizeStyleOpts, buildIntroOutroChain, buildTransitionChain, secondaryFormatSize } from './clipFilters.js';
 
 const FONT_CLIP = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
@@ -254,11 +254,19 @@ async function processClip(clip: ClipRow): Promise<void> {
       }
     }
 
-    // 5) Version verticale 9:16 (1080x1920) : fond flouté + vidéo centrée (meilleur rendu que crop).
+    // 5) 2e version selon le FORMAT choisi (9:16 défaut, 1:1 carré, 16:9 = paysage) : fond flouté
+    // + vidéo centrée (meilleur rendu que crop). C'est cette version que le vendeur télécharge.
     const vertical = path.join(dir, 'vertical.mp4');
-    await ff(['-i', body, '-filter_complex',
-      `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];[0:v]scale=1080:-1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
-      '-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', vertical]);
+    const fmtSize = secondaryFormatSize(style.format);
+    if (fmtSize) {
+      const { w, h } = fmtSize;
+      await ff(['-i', body, '-filter_complex',
+        `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=20:2[bg];[0:v]scale=${w}:-1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
+        '-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p', '-c:a', 'aac', vertical]);
+    } else {
+      // 16:9 : la version « téléchargeable » est le paysage lui-même.
+      await fs.copyFile(body, vertical);
+    }
 
     // 6) Couverture : frame à cover_time_s (défaut : milieu du 1er segment) → JPEG.
     const firstDur = clip.segments[0].end_s - clip.segments[0].start_s;

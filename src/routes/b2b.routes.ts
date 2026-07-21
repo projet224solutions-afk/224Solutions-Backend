@@ -792,6 +792,18 @@ router.post('/purchases/:purchaseId([0-9a-fA-F-]{36})/receive', verifyJWT, idemp
       const m = /B2B_RECV:([A-Z_]+):?(.*)/.exec(error.message);
       if (m) {
         const code = m[1];
+        // ── Erreurs de RÈGLEMENT (wallet) : NE PAS les traiter comme des erreurs « par ligne »
+        // (sinon le montant « solde 0.00 < requis X » s'affiche comme un nom de produit). Message
+        // clair + bon statut + error_code → le front propose les issues (recharger / payer autrement).
+        const walletErr: Record<string, { status: number; msg: string }> = {
+          INSUFFICIENT_FUNDS: { status: 402, msg: 'Solde insuffisant pour régler cette réception. Aucune marchandise n\'a été réceptionnée.' },
+          WALLET_NOT_FOUND: { status: 402, msg: 'Portefeuille introuvable pour cette devise. Aucune marchandise n\'a été réceptionnée.' },
+          DEBIT_MISMATCH: { status: 409, msg: 'Incohérence de montant détectée — réessayez.' },
+          INVALID_WALLET_AMOUNT: { status: 409, msg: 'Montant de règlement invalide.' },
+        };
+        if (walletErr[code]) {
+          return fail(res, walletErr[code].status, walletErr[code].msg, code);
+        }
         const prod = (m[2] || '').split(/\s*\(/)[0].trim();
         const perLine: Record<string, string> = {
           RECEIVED_EXCEEDS_ORDERED: 'Quantité reçue supérieure au restant attendu',
@@ -1500,6 +1512,34 @@ router.get('/kpis', verifyJWT, async (req: AuthenticatedRequest, res: Response) 
   } catch (error: any) {
     logger.error(`[b2b/kpis] ${error?.message}`);
     return fail(res, 500, 'Erreur lors du chargement des indicateurs');
+  }
+});
+
+// ── GET /api/b2b/wallet-balance?currency=GNF ──
+// Solde du wallet de l'ACHETEUR (vendeur, owner) pour une devise donnée. Le dialog de réception
+// l'affiche AVANT validation (paiement wallet à la réception) pour éviter au vendeur de découvrir
+// un solde insuffisant après avoir tout saisi. Cible le wallet du VENDEUR, pas de l'agent qui opère.
+router.get('/wallet-balance', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const ctx = await resolveVendorContext(req.user!.id);
+    if (!ctx.vendorId) { fail(res, 403, 'Boutique non trouvée', 'VENDOR_NOT_FOUND'); return; }
+    const currency = String(req.query.currency || 'GNF').toUpperCase().slice(0, 8);
+    const { data: v } = await supabaseAdmin.from('vendors').select('user_id').eq('id', ctx.vendorId).maybeSingle();
+    const ownerId = (v as any)?.user_id;
+    if (!ownerId) { fail(res, 404, 'Vendeur introuvable'); return; }
+    const { data, error } = await supabaseAdmin
+      .from('wallets').select('balance, currency, is_blocked, wallet_status')
+      .eq('user_id', ownerId).eq('currency', currency).maybeSingle();
+    if (error) { logger.error(`[b2b/wallet-balance] ${error.message}`); fail(res, 500, 'Solde indisponible'); return; }
+    ok(res, {
+      currency,
+      balance: Number((data as any)?.balance ?? 0),
+      exists: !!data,
+      blocked: !!((data as any)?.is_blocked) || (!!(data as any)?.wallet_status && (data as any).wallet_status !== 'active'),
+    });
+  } catch (error: any) {
+    logger.error(`[b2b/wallet-balance] ${error?.message}`);
+    fail(res, 500, 'Solde indisponible');
   }
 });
 

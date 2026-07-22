@@ -242,4 +242,86 @@ router.post('/phone-signup-verify', async (req: Request, res: Response): Promise
   }
 });
 
+/**
+ * RESET / CONNEXION PAR TÉLÉPHONE — envoi d'OTP (remplace l'Edge `phone-send-otp` :
+ * recherche par égalité stricte de formats + Twilio direct → c'était LA cause du
+ * « Ce numéro n'est lié à aucun compte » alors que le compte existe, et un envoi HORS passerelle).
+ *
+ * Recherche CANONIQUE : resolve_user_id_by_phone (normalisation E.164 avec pays du contexte,
+ * égalité sur profiles.phone_e164 — fini les « 9 derniers chiffres »). Envoi via LA passerelle
+ * (usage 'reset'). Réponses HONNÊTES : found:false (vrai « aucun compte ») distinct de
+ * sms_unavailable (panne d'envoi) — jamais l'un déguisé en l'autre.
+ */
+router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { phone, country_code } = req.body || {};
+    if (!phone) { res.status(400).json({ success: false, error: 'Numéro requis' }); return; }
+    const iso = typeof country_code === 'string' && country_code.length >= 2 ? country_code.toUpperCase() : undefined;
+
+    // Recherche canonique (tolérante à la saisie : local / 0 / espaces / 00 / +E.164)
+    const { data: userId, error: rpcErr } = await supabaseAdmin.rpc('resolve_user_id_by_phone', {
+      p_phone: String(phone), p_country: iso || null,
+    });
+    if (rpcErr) {
+      logger.error(`[phone-send-otp] resolve: ${rpcErr.message}`);
+      res.status(500).json({ success: false, error: 'Erreur serveur' });
+      return;
+    }
+    if (!userId) {
+      // VRAI « aucun compte » — le front guide vers l'email (jamais un mensonge de panne).
+      res.json({ success: false, found: false });
+      return;
+    }
+
+    const { data: profile } = await supabaseAdmin.from('profiles')
+      .select('id, phone, phone_e164').eq('id', userId as string).single();
+    const storedPhone: string = (profile?.phone_e164 || profile?.phone || String(phone)).trim();
+
+    // Rate-limit PAR NUMÉRO : 3 / 15 min (journal passerelle, multi-instance)
+    if ((await recentSendCount(storedPhone, 'reset')) >= 3) {
+      res.status(429).json({ success: false, error: 'Trop de demandes pour ce numéro. Réessayez dans quelques minutes.', error_code: 'RATE_LIMITED' });
+      return;
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await supabaseAdmin.from('auth_otp_codes').delete()
+      .eq('identifier', storedPhone).eq('user_type', 'phone_login').eq('verified', false);
+
+    const { error: insertError } = await supabaseAdmin.from('auth_otp_codes').insert({
+      user_type: 'phone_login', // contrat historique — phone-verify-otp (Edge) lit ce type
+      user_id: userId as string,
+      identifier: storedPhone,
+      otp_code: otp,
+      expires_at: expiresAt.toISOString(),
+      verified: false,
+      attempts: 0,
+      created_at: new Date().toISOString(),
+    });
+    if (insertError) {
+      logger.error(`[phone-send-otp] OTP insert: ${insertError.message}`);
+      res.status(500).json({ success: false, error: 'Erreur serveur' });
+      return;
+    }
+
+    const sent = await sendSms(storedPhone, `224Solutions - Votre code de vérification : ${otp}\nValable 10 minutes.`, iso, 'reset');
+    if (!sent.ok) {
+      logger.warn(`[phone-send-otp] SMS échec ${storedPhone.slice(0, 6)}***: ${sent.error}`);
+      res.status(502).json({
+        success: false,
+        error: "L'envoi par SMS est momentanément indisponible. Réessayez, ou utilisez votre adresse email.",
+        sms_unavailable: true,
+        found: true, // le compte EXISTE — jamais « aucun compte » pour une panne d'envoi
+      });
+      return;
+    }
+
+    res.json({ success: true, found: true, phone: storedPhone });
+  } catch (err: any) {
+    logger.error(`[phone-send-otp] ${err?.message || err}`);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 export default router;

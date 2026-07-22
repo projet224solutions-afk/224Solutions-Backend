@@ -174,8 +174,8 @@ async function notifyActivation(targetUserId: string, phone: string | null): Pro
     if (await userHasFcmToken(targetUserId)) {
       await sendPushToUser(targetUserId, { title, message: msg1, data: { type: 'agent_cash_activated' } });
     } else if (phone) {
-      await sendSms(phone, `224Solutions : ${msg1}`);
-      await sendSms(phone, msg2);
+      await sendSms(phone, `224Solutions : ${msg1}`, undefined, 'agent_cash');
+      await sendSms(phone, msg2, undefined, 'agent_cash');
     }
   } catch (e: any) { logger.warn(`[agent-cash] notif activation ignorée: ${e?.message}`); }
 }
@@ -220,13 +220,13 @@ async function issueClientOtp(agentId: string, clientId: string, phone: string, 
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
   });
   if (error) return false;
-  await sendSms(phone, `224Solutions : code de retrait ${otp} (valable 5 min). Ne le communiquez qu'à l'agent pour valider votre retrait.`);
+  await sendSms(phone, `224Solutions : code de retrait ${otp} (valable 5 min). Ne le communiquez qu'à l'agent pour valider votre retrait.`, undefined, 'agent_cash');
   return true;
 }
 
 // SMS post-transaction (preuve pour le client à téléphone simple), best-effort.
 async function postTxSms(userId: string, text: string): Promise<void> {
-  try { const ph = await clientPhone(userId); if (ph) await sendSms(ph, text); } catch { /* non bloquant */ }
+  try { const ph = await clientPhone(userId); if (ph) await sendSms(ph, text, undefined, 'agent_cash'); } catch { /* non bloquant */ }
 }
 
 // ── Config ────────────────────────────────────────────────────────────────

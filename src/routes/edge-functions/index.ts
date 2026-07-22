@@ -58,6 +58,7 @@ function isPublicEdgePath(p: string): boolean {
     p === '/health' ||
     p === '/send-otp-email' ||
     p === '/phone-signup-send' ||   // OTP d'inscription — utilisateur pas encore créé
+    p === '/phone-signup-verify' || // vérif OTP + création du compte — utilisateur pas encore créé
     p === '/paypal-client-id'
   );
 }

@@ -211,9 +211,18 @@ router.post('/sub-agents', verifyJWT, async (req: AuthenticatedRequest, res: Res
     });
     if (profileError) logger.warn(`[agents/sub-agents] profile: ${profileError.message}`);
 
-    // 8) Wallet général — best-effort (dépend de profiles → créé juste avant)
+    // Devise dérivée du PAYS (source unique DB : resolve_default_currency_for_user) — plus de 'GNF' en dur.
+    // Le trigger wallet_set_country_currency force de toute façon le wallet principal sur la devise du pays.
+    let agentCurrency = 'GNF';
+    try {
+      const { data: ccy } = await supabaseAdmin.rpc('resolve_default_currency_for_user', { p_user_id: newUserId });
+      if (typeof ccy === 'string' && /^[A-Z]{3}$/.test(ccy)) agentCurrency = ccy;
+    } catch { /* repli GNF */ }
+
+    // 8) Wallet général — best-effort (dépend de profiles → créé juste avant).
+    //    Devise omise : le trigger la dérive du pays (jamais un code en dur).
     const { error: walletError } = await supabaseAdmin.from('wallets').insert({
-      user_id: newUserId, balance: 0, currency: 'GNF',
+      user_id: newUserId, balance: 0,
     });
     if (walletError) logger.warn(`[agents/sub-agents] wallet général: ${walletError.message}`);
 
@@ -225,7 +234,7 @@ router.post('/sub-agents', verifyJWT, async (req: AuthenticatedRequest, res: Res
     } else {
       logger.warn(`[agents/sub-agents] create_agent_wallet RPC: ${rpcWalletError.message} — tentative directe`);
       const { error: directWalletError } = await supabaseAdmin.from('agent_wallets').insert({
-        agent_id: newAgent.id, balance: 0, currency: 'GNF', currency_type: 'GNF', wallet_status: 'active',
+        agent_id: newAgent.id, balance: 0, currency: agentCurrency, currency_type: agentCurrency, wallet_status: 'active',
       });
       if (!directWalletError) agentWalletOk = true;
       else logger.warn(`[agents/sub-agents] agent_wallets direct: ${directWalletError.message}`);

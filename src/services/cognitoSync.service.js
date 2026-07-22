@@ -49,12 +49,12 @@ export async function syncCognitoUser(cognitoUser, additionalData = {}) {
         [user.id, role]
       );
 
-      // 3. Créer le wallet
+      // 3. Créer le wallet — devise omise : le trigger la dérive du pays (plus de 'GNF' en dur)
       await client.query(
-        `INSERT INTO wallets (user_id, currency)
-         VALUES ($1, $2)
+        `INSERT INTO wallets (user_id)
+         VALUES ($1)
          ON CONFLICT (user_id) DO NOTHING`,
-        [user.id, additionalData.currency || 'GNF']
+        [user.id]
       );
 
       // 4. Log d'audit

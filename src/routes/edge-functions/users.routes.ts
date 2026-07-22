@@ -522,7 +522,8 @@ router.post("/agents/create", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: agentErr.message });
     }
 
-    await supabaseAdmin.from("wallets").insert({ user_id: authCreated.user.id, balance: 0, currency: "GNF" });
+    // Devise omise : le trigger wallet_set_country_currency la dérive du pays (plus de 'GNF' en dur).
+    await supabaseAdmin.from("wallets").insert({ user_id: authCreated.user.id, balance: 0 });
 
     return res.status(201).json({ success: true, agent, phone_login_available: phoneLoginAvailable });
   } catch (error) {

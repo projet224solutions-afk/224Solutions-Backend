@@ -9,6 +9,8 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { env } from '../config/env.js';
 import { orangeEnabledCountries, orangeGloballyReady, countryConfig } from '../services/sms/orangeSms.js';
+import { sendSms } from '../services/sms.service.js';
+import { z } from 'zod';
 
 const router = Router();
 
@@ -49,6 +51,29 @@ router.get('/orange/country/:iso', verifyJWT, async (req: AuthenticatedRequest, 
   const cfg = countryConfig(String(req.params.iso));
   if (!cfg) { fail(res, 400, 'Code pays ISO-2 invalide', 'BAD_ISO'); return; }
   ok(res, { country: cfg.iso, enabled: cfg.enabled, configured: Boolean(cfg.senderAddress), sender_name: cfg.senderName });
+});
+
+/**
+ * Envoi d'un SMS de TEST (PDG uniquement) — permet de valider la passerelle SEUL,
+ * dès qu'un pack Orange/Twilio est provisionné, sans attendre un vrai flux d'inscription.
+ * Passe par la cascade sendSms (Orange → Twilio → Edge) et remonte le message RÉEL du
+ * fournisseur en cas d'échec (crédit épuisé, numéro non vérifié, from invalide…).
+ */
+const TestSmsSchema = z.object({
+  phone: z.string().trim().min(6, 'Numéro trop court').max(20),
+  country: z.string().trim().length(2).optional(),  // ISO-2 pour router le bon fournisseur
+});
+
+router.post('/test', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!(await isPdg(req.user!.id))) { fail(res, 403, 'Réservé au PDG', 'FORBIDDEN'); return; }
+  const parsed = TestSmsSchema.safeParse(req.body);
+  if (!parsed.success) { fail(res, 400, parsed.error.issues[0]?.message || 'Numéro de test invalide', 'BAD_PHONE'); return; }
+  const { phone, country } = parsed.data;
+  const stamp = new Date().toISOString().slice(11, 19);
+  const message = `224Solutions - Test passerelle SMS (${stamp}). Si vous recevez ce message, l'envoi fonctionne pour ce numero.`;
+  const r = await sendSms(phone, message, country ? country.toUpperCase() : undefined);
+  if (!r.ok) { fail(res, 502, r.error || "Échec de l'envoi", 'SMS_SEND_FAILED'); return; }
+  ok(res, { sent: true });
 });
 
 export default router;

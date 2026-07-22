@@ -21,8 +21,17 @@ import { logger } from '../config/logger.js';
 import { cache } from '../config/redis.js';
 import { ok } from '../utils/apiResponse.js';
 import { verifyJWT, type AuthenticatedRequest } from '../middlewares/auth.middleware.js';
+import { routeRateLimit } from '../middlewares/routeRateLimiter.js';
 
 const router = Router();
+
+// Anti-abus de /detect : 60 req/min PAR IP, FAIL-OPEN (repli mémoire si Redis absent —
+// un limiteur ne doit jamais casser la détection). Généreux : un utilisateur légitime
+// n'appelle /detect qu'une fois (résultat caché 24 h) ; seul le martèlement est freiné,
+// et le client a de toute façon un repli local (GN/GNF/fr) sur toute erreur.
+const geoDetectRateLimit = routeRateLimit({
+  maxRequests: 60, windowSeconds: 60, keyPrefix: 'geo:detect', perUser: false, perIp: true, failClosed: false, logBreach: false,
+});
 
 // ── Observabilité (traçabilité PDG) : répartition des méthodes de détection sur une
 // fenêtre glissante d'1 h, EN MÉMOIRE (par instance — VPS mono-instance). Alerte
@@ -133,7 +142,7 @@ function ipPrefix(ip: string): string {
   return ip || 'unknown';
 }
 
-router.get('/detect', async (req: Request, res: Response) => {
+router.get('/detect', geoDetectRateLimit, async (req: Request, res: Response) => {
   const tz = typeof req.query.tz === 'string' ? req.query.tz : '';
   const browserLang = (typeof req.query.lang === 'string' ? req.query.lang : '').slice(0, 2).toLowerCase();
 

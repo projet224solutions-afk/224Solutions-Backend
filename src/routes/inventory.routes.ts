@@ -71,10 +71,14 @@ const ValidatePurchaseSchema = z.object({
   total_amount: z.number().min(0),
   items: z.array(z.object({
     product_id: z.string().uuid().nullish(),
+    product_name: z.string().max(300).nullish(),
     quantity: z.number(),
+    received_quantity: z.number().min(0).nullish(),  // réception par ligne (défaut = commandé)
     purchase_price: z.number().nullish(),
     selling_price: z.number().nullish(),
     supplier_id: z.string().uuid().nullish(),
+    missing_reason: z.string().max(50).nullish(),
+    missing_notes: z.string().max(500).nullish(),
   })).min(1, 'Au moins un article requis'),
 });
 

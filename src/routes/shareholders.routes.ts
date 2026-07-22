@@ -142,10 +142,27 @@ router.post('/', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: 
       full_name, email, phone, temp_password,
       category, action_scope, country, percentage, internal_notes,
       residence_country,
+      investment_amount, investment_currency, payout_cap_multiple, payout_cap_amount, perpetual,
     } = req.body;
 
     if (!full_name || !email || !temp_password || !category || !action_scope || !percentage) {
       res.status(400).json({ success: false, error: 'Champs obligatoires manquants' });
+      return;
+    }
+
+    // PLAFOND DE SORTIE obligatoire (ou perpétuel EXPLICITE) — jamais de perpétuel par défaut.
+    const invAmt = investment_amount != null && investment_amount !== '' ? Number(investment_amount) : null;
+    const capMult = payout_cap_multiple != null && payout_cap_multiple !== '' ? Number(payout_cap_multiple) : null;
+    let capAmount: number | null = payout_cap_amount != null && payout_cap_amount !== '' ? Number(payout_cap_amount) : null;
+    if (capAmount == null && invAmt != null && capMult != null && capMult > 0) {
+      capAmount = Math.round(invAmt * capMult);
+    }
+    if (perpetual !== true && (capAmount == null || capAmount <= 0)) {
+      res.status(400).json({
+        success: false,
+        error: 'Plafond de sortie obligatoire : fournissez un montant investi + multiple (ex. 3.0), ou cochez explicitement « sans plafond ».',
+        error_code: 'PAYOUT_CAP_REQUIRED',
+      });
       return;
     }
 
@@ -233,6 +250,10 @@ router.post('/', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: 
         country: action_scope === 'country' ? (country || null) : null,
         percentage: Number(percentage),
         status: 'active',
+        investment_amount: invAmt,
+        investment_currency: investment_currency || null,
+        payout_cap_multiple: perpetual === true ? null : capMult,
+        payout_cap_amount: perpetual === true ? null : capAmount,
       });
 
     if (assignErr) {
@@ -537,6 +558,178 @@ router.post('/:id/transfer', requireRole(PDG_ROLES), async (req: AuthenticatedRe
     res.json({ success: true, transferred_to: target.full_name });
   } catch (err: any) {
     logger.error('shareholders.transfer - unhandled:', err.message);
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLAFOND DE SORTIE + CYCLE DE VIE (par ATTRIBUTION = « l'accord »)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Trace un événement de cycle de vie dans l'audit (non bloquant). */
+function logLifecycle(actorId: string, action: string, assignmentId: string, value: Record<string, any>): void {
+  supabaseAdmin.from('shareholder_audit_logs').insert({
+    actor_id: actorId, action, entity_type: 'shareholder_assignment', entity_id: assignmentId, new_value: value,
+  });
+}
+
+/**
+ * POST /api/shareholders/assignments/:assignmentId/cap
+ * Saisie (ou saisie RÉTROACTIVE) du plafond : montant investi + multiple → plafond.
+ * `perpetual:true` = sans plafond EXPLICITE. Ne modifie JAMAIS total_paid_to_date (maintenu par trigger).
+ */
+router.post('/assignments/:assignmentId/cap', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { assignmentId } = req.params;
+    const { investment_amount, investment_currency, payout_cap_multiple, payout_cap_amount, perpetual } = req.body;
+    const invAmt = investment_amount != null && investment_amount !== '' ? Number(investment_amount) : null;
+    const capMult = payout_cap_multiple != null && payout_cap_multiple !== '' ? Number(payout_cap_multiple) : null;
+    let capAmount: number | null = payout_cap_amount != null && payout_cap_amount !== '' ? Number(payout_cap_amount) : null;
+    if (capAmount == null && invAmt != null && capMult != null && capMult > 0) capAmount = Math.round(invAmt * capMult);
+    if (perpetual !== true && (capAmount == null || capAmount <= 0)) {
+      res.status(400).json({ success: false, error: 'Plafond obligatoire : montant investi + multiple, ou « sans plafond » explicite.', error_code: 'PAYOUT_CAP_REQUIRED' });
+      return;
+    }
+    const { error } = await supabaseAdmin.from('shareholder_assignments').update({
+      investment_amount: invAmt,
+      investment_currency: investment_currency || null,
+      payout_cap_multiple: perpetual === true ? null : capMult,
+      payout_cap_amount: perpetual === true ? null : capAmount,
+      updated_at: new Date().toISOString(),
+    }).eq('id', assignmentId);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'set_payout_cap', assignmentId, { invAmt, capMult, capAmount, perpetual: perpetual === true });
+    const { data: status } = await supabaseAdmin.rpc('shareholder_cap_status', { p_assignment_id: assignmentId });
+    res.json({ success: true, cap_status: status });
+  } catch (err: any) {
+    logger.error('shareholders.cap - unhandled:', err.message);
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** GET /api/shareholders/assignments/:assignmentId/cap-status — investi/plafond/versé/reste/progression. */
+router.get('/assignments/:assignmentId/cap-status', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin.rpc('shareholder_cap_status', { p_assignment_id: req.params.assignmentId });
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, cap_status: data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** POST /assignments/:assignmentId/beneficiary — SUCCESSION : bénéficiaire désigné. */
+router.post('/assignments/:assignmentId/beneficiary', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { beneficiary } = req.body;
+    if (!beneficiary || !String(beneficiary).trim()) { res.status(400).json({ success: false, error: 'Bénéficiaire requis' }); return; }
+    const { error } = await supabaseAdmin.from('shareholder_assignments')
+      .update({ beneficiary: String(beneficiary).trim(), updated_at: new Date().toISOString() }).eq('id', req.params.assignmentId);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'set_beneficiary', req.params.assignmentId, { beneficiary });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/**
+ * POST /assignments/:assignmentId/buyout — RACHAT ANTICIPÉ : la société solde l'accord.
+ * Enregistre le montant de rachat + statut `bought_out`. Le VERSEMENT effectif passe par le flux
+ * de paiement standard (débit coffre PDG) — cet endpoint ne déplace pas d'argent en douce.
+ */
+router.post('/assignments/:assignmentId/buyout', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { buyout_amount, note } = req.body;
+    const { data: a, error: aErr } = await supabaseAdmin.from('shareholder_assignments')
+      .select('payout_cap_amount, total_paid_to_date').eq('id', req.params.assignmentId).single();
+    if (aErr || !a) { res.status(404).json({ success: false, error: 'Attribution introuvable' }); return; }
+    const remaining = a.payout_cap_amount != null ? Math.max(0, Number(a.payout_cap_amount) - Number(a.total_paid_to_date || 0)) : null;
+    const amount = buyout_amount != null && buyout_amount !== '' ? Number(buyout_amount) : remaining;
+    const { error } = await supabaseAdmin.from('shareholder_assignments').update({
+      status: 'bought_out', buyout_amount: amount, bought_out_at: new Date().toISOString(),
+      lifecycle_note: note || null, updated_at: new Date().toISOString(),
+    }).eq('id', req.params.assignmentId);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'buyout', req.params.assignmentId, { amount, remaining });
+    res.json({ success: true, buyout_amount: amount, remaining_before: remaining });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** POST /assignments/:assignmentId/suspend — SUSPENSION/LITIGE : gèle les versements, motif obligatoire. */
+router.post('/assignments/:assignmentId/suspend', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || !String(reason).trim()) { res.status(400).json({ success: false, error: 'Motif de suspension obligatoire', error_code: 'REASON_REQUIRED' }); return; }
+    const { error } = await supabaseAdmin.from('shareholder_assignments')
+      .update({ status: 'suspended', suspension_reason: String(reason).trim(), updated_at: new Date().toISOString() }).eq('id', req.params.assignmentId);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'suspend_assignment', req.params.assignmentId, { reason });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** POST /assignments/:assignmentId/resume — lève la suspension (retour `active`). */
+router.post('/assignments/:assignmentId/resume', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { error } = await supabaseAdmin.from('shareholder_assignments')
+      .update({ status: 'active', suspension_reason: null, updated_at: new Date().toISOString() })
+      .eq('id', req.params.assignmentId).eq('status', 'suspended');
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'resume_assignment', req.params.assignmentId, {});
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/**
+ * POST /assignments/:assignmentId/lifecycle — note de cycle de vie (arrêt service/pays)
+ * + clause de cession de la société (le droit se poursuit chez l'acquéreur, ou est soldé).
+ */
+router.post('/assignments/:assignmentId/lifecycle', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { lifecycle_note, company_sale_clause } = req.body;
+    const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+    if (lifecycle_note !== undefined) patch.lifecycle_note = lifecycle_note || null;
+    if (company_sale_clause !== undefined) patch.company_sale_clause = company_sale_clause || null;
+    const { error } = await supabaseAdmin.from('shareholder_assignments').update(patch).eq('id', req.params.assignmentId);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    logLifecycle(req.user!.id, 'lifecycle_note', req.params.assignmentId, patch);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** GET /api/shareholders/config — mention juridique + portée des votes (lecture PDG & partenaire). */
+router.get('/config', requireRole(ACTIONNAIRE_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin.from('shareholder_config')
+      .select('legal_mention, votes_advisory, default_cap_multiple').eq('id', 1).maybeSingle();
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    res.json({ success: true, config: data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Erreur interne' });
+  }
+});
+
+/** PUT /api/shareholders/config — le PDG édite la mention juridique (validée par son juriste). */
+router.put('/config', requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { legal_mention, votes_advisory, default_cap_multiple } = req.body;
+    const patch: Record<string, any> = { updated_at: new Date().toISOString(), updated_by: req.user!.id };
+    if (typeof legal_mention === 'string' && legal_mention.trim()) patch.legal_mention = legal_mention.trim();
+    if (typeof votes_advisory === 'boolean') patch.votes_advisory = votes_advisory;
+    if (default_cap_multiple != null && Number(default_cap_multiple) > 0) patch.default_cap_multiple = Number(default_cap_multiple);
+    const { error } = await supabaseAdmin.from('shareholder_config').update(patch).eq('id', 1);
+    if (error) { res.status(500).json({ success: false, error: error.message }); return; }
+    res.json({ success: true });
+  } catch (err: any) {
     res.status(500).json({ success: false, error: 'Erreur interne' });
   }
 });

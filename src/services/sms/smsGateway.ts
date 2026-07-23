@@ -17,7 +17,7 @@
 import { env } from '../../config/env.js';
 import { logger } from '../../config/logger.js';
 import { supabaseAdmin } from '../../config/supabase.js';
-import { orangeSend } from './orangeSms.js';
+import { orangeSend, countryConfig } from './orangeSms.js';
 import { formatPhoneIntl, isoFromE164 } from '../phoneFormat.js';
 import { pickOrder as pickOrderPure, maskPhone, hashPhone, DEFAULT_ORDER, type RoutingRow } from './smsRouting.js';
 
@@ -186,6 +186,27 @@ export async function gatewaySend(
 
   await alertAllProvidersFailed(iso || '', usage, lastError);
   return { ok: false, error: lastError };
+}
+
+/**
+ * Un fournisseur configuré peut-il livrer ce pays ? (SANS envoyer — utilisé par
+ * l'anti-énumération : la branche « compte inexistant » doit répondre EXACTEMENT comme
+ * la branche « compte existant » l'aurait fait, y compris pour un pays non couvert.)
+ */
+export async function canDeliverTo(iso?: string): Promise<boolean> {
+  const rows = await loadRouting();
+  const { order } = pickOrder(rows, iso);
+  for (const name of order) {
+    const p = PROVIDERS[name];
+    if (!p.isConfigured(iso)) continue;
+    if (name === 'orange') {
+      const cfg = countryConfig(iso || '');
+      if (cfg?.enabled && cfg?.senderAddress) return true;
+      continue; // Orange global actif mais pays non souscrit → il skipperait à l'envoi
+    }
+    return true; // twilio/edge : pas de restriction par pays
+  }
+  return false;
 }
 
 /** Nombre de demandes récentes pour un numéro/usage (rate-limit 3 / 15 min / numéro, multi-instance). */

@@ -20,7 +20,7 @@ import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase.js';
 import { logger } from '../../config/logger.js';
 import { sendSms } from '../../services/sms.service.js';
-import { recentSendCount } from '../../services/sms/smsGateway.js';
+import { recentSendCount, canDeliverTo } from '../../services/sms/smsGateway.js';
 import { routeRateLimit } from '../../middlewares/routeRateLimiter.js';
 
 const router = Router();
@@ -257,6 +257,14 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
     const { phone, country_code } = req.body || {};
     if (!phone) { res.status(400).json({ success: false, error: 'Numéro requis' }); return; }
     const iso = typeof country_code === 'string' && country_code.length >= 2 ? country_code.toUpperCase() : undefined;
+    const normalized = normalizePhone(String(phone));
+
+    // Rate-limit PAR NUMÉRO **avant** toute résolution (le 429 ne doit pas être un oracle
+    // d'existence : il se déclenche à l'identique que le compte existe ou non).
+    if ((await recentSendCount(normalized, 'reset')) >= 3) {
+      res.status(429).json({ success: false, error: 'Trop de demandes pour ce numéro. Réessayez dans quelques minutes.', error_code: 'RATE_LIMITED' });
+      return;
+    }
 
     // Recherche canonique (tolérante à la saisie : local / 0 / espaces / 00 / +E.164)
     const { data: userId, error: rpcErr } = await supabaseAdmin.rpc('resolve_user_id_by_phone', {
@@ -268,20 +276,24 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
       return;
     }
     if (!userId) {
-      // VRAI « aucun compte » — le front guide vers l'email (jamais un mensonge de panne).
-      res.json({ success: false, found: false });
+      // ANTI-ÉNUMÉRATION (validé PDG) : réponse IDENTIQUE à un envoi réussi — l'existence
+      // d'un compte n'est JAMAIS révélée. Seul le vrai propriétaire reçoit (ou non) un code.
+      // On simule aussi la couverture pays pour ne pas créer d'oracle « 502 = compte existe ».
+      if (!(await canDeliverTo(iso))) {
+        res.status(502).json({
+          success: false,
+          error: "L'envoi par SMS est momentanément indisponible. Réessayez, ou utilisez votre adresse email.",
+          sms_unavailable: true,
+        });
+        return;
+      }
+      res.json({ success: true, sent: true, phone: normalized });
       return;
     }
 
     const { data: profile } = await supabaseAdmin.from('profiles')
       .select('id, phone, phone_e164').eq('id', userId as string).single();
-    const storedPhone: string = (profile?.phone_e164 || profile?.phone || String(phone)).trim();
-
-    // Rate-limit PAR NUMÉRO : 3 / 15 min (journal passerelle, multi-instance)
-    if ((await recentSendCount(storedPhone, 'reset')) >= 3) {
-      res.status(429).json({ success: false, error: 'Trop de demandes pour ce numéro. Réessayez dans quelques minutes.', error_code: 'RATE_LIMITED' });
-      return;
-    }
+    const storedPhone: string = (profile?.phone_e164 || profile?.phone || normalized).trim();
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -307,17 +319,19 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
 
     const sent = await sendSms(storedPhone, `224Solutions - Votre code de vérification : ${otp}\nValable 10 minutes.`, iso, 'reset');
     if (!sent.ok) {
+      // Panne d'envoi HONNÊTE — même forme que la branche « inconnu + pays non couvert »
+      // (aucun drapeau d'existence, l'anti-énumération reste étanche).
       logger.warn(`[phone-send-otp] SMS échec ${storedPhone.slice(0, 6)}***: ${sent.error}`);
       res.status(502).json({
         success: false,
         error: "L'envoi par SMS est momentanément indisponible. Réessayez, ou utilisez votre adresse email.",
         sms_unavailable: true,
-        found: true, // le compte EXISTE — jamais « aucun compte » pour une panne d'envoi
       });
       return;
     }
 
-    res.json({ success: true, found: true, phone: storedPhone });
+    // Réponse générique — identique à la branche « aucun compte » (anti-énumération).
+    res.json({ success: true, sent: true, phone: storedPhone });
   } catch (err: any) {
     logger.error(`[phone-send-otp] ${err?.message || err}`);
     res.status(500).json({ success: false, error: 'Erreur serveur' });

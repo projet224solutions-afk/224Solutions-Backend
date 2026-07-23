@@ -2,6 +2,7 @@ import { Router } from "express";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { logger } from "../../config/logger.js";
 import { sendSms } from "../../services/sms.service.js";
+import { authRateLimit } from "../../middlewares/routeRateLimiter.js";
 import {
   loadServiceAccount,
   getBucketName,
@@ -184,7 +185,9 @@ router.post("/security-alert", async (req: any, res: any) => {
   }
 });
 
-router.post("/sms", async (req: any, res: any) => {
+// Rate-limit dédié (fail-closed) : anti SMS-bombing / smishing / coût. Le durcissement
+// complémentaire (réserver à un rôle admin) est recommandé dans SECURITY_AUDIT.md (à valider).
+router.post("/sms", authRateLimit, async (req: any, res: any) => {
   try {
     const { phone_number, message_body, user_id, country_code } = req.body;
     if (!phone_number || !message_body) return res.status(400).json({ success: false, error: "phone_number et message_body requis" });

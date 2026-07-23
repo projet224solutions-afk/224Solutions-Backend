@@ -12,6 +12,16 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { signBureauToken } from '../services/bureauAuth.service.js';
 import { verifyBureauJWT, type BureauRequest } from '../middlewares/bureauAuth.middleware.js';
+import { authRateLimit } from '../middlewares/routeRateLimiter.js';
+
+/**
+ * Anti-injection de filtre PostgREST : un `identifier` interpolé dans `.or(...)` ne doit
+ * contenir que des caractères valides d'un email ou d'un code bureau. On retire notamment
+ * les métacaractères `, ( ) : *` qui permettraient d'injecter des conditions supplémentaires.
+ */
+function sanitizeIdentifier(raw: string): string {
+  return String(raw || '').trim().replace(/[^A-Za-z0-9._%+@-]/g, '');
+}
 
 const router = Router();
 
@@ -66,9 +76,9 @@ router.post('/auth/verify-otp', async (req: BureauRequest, res: Response) => {
  * POST /api/v2/bureau/auth/resend-otp — régénère et renvoie un OTP au bureau (étape 1 déjà passée).
  * Réplique le pipeline du login (generate_otp_code → send-otp-email) sans redemander le mot de passe.
  */
-router.post('/auth/resend-otp', async (req: BureauRequest, res: Response) => {
+router.post('/auth/resend-otp', authRateLimit, async (req: BureauRequest, res: Response) => {
   try {
-    const identifier = String(req.body?.identifier || '').trim();
+    const identifier = sanitizeIdentifier(req.body?.identifier);
     if (!identifier) { res.status(400).json({ success: false, error: 'identifier requis' }); return; }
 
     // Résoudre le bureau par email du président OU code bureau

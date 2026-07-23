@@ -82,6 +82,25 @@ async function ffprobeJson(file: string): Promise<any> {
   return JSON.parse(stdout);
 }
 
+// 🔒 GARDE ENVIRONNEMENT — le backend tourne dans PLUSIEURS déploiements (VPS EC2 avec
+// ffmpeg/ffprobe, Vercel serverless SANS binaires). Un environnement sans ffmpeg ne doit
+// JAMAIS « claim » un job vidéo : sinon il le tue en `spawn ffprobe ENOENT` (cause PROUVÉE
+// des échecs alternés en prod : ready sur VPS / failed sur Vercel selon qui claim en 1er).
+// Vérifié une fois par process, en cache ; log unique.
+let ffmpegOk: boolean | null = null;
+async function ffmpegAvailable(): Promise<boolean> {
+  if (ffmpegOk !== null) return ffmpegOk;
+  try {
+    await pexec('ffmpeg', ['-version'], { maxBuffer: 1 << 20 });
+    await pexec('ffprobe', ['-version'], { maxBuffer: 1 << 20 });
+    ffmpegOk = true;
+  } catch {
+    ffmpegOk = false;
+    logger.warn('[clips] ffmpeg/ffprobe absents de cet environnement — worker vidéo INACTIF ici (les jobs seront traités par le VPS)');
+  }
+  return ffmpegOk;
+}
+
 /** Échappe un texte pour drawtext (les ' : \ % cassent le filtre). */
 function esc(t: string): string {
   return String(t || '').replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "’").replace(/%/g, '\\%').slice(0, 80);
@@ -307,6 +326,7 @@ async function processClip(clip: ClipRow): Promise<void> {
 
 /** Récurrent : prend UN job serveur en attente et le traite entièrement (concurrence 1). */
 export async function processQueuedClips(): Promise<void> {
+  if (!(await ffmpegAvailable())) return; // env sans binaires (Vercel) : ne claim JAMAIS
   if (running) return;
   running = true;
   try {
@@ -338,6 +358,7 @@ export async function runClipWatchdog(): Promise<void> {
  */
 const transcodeFailures = new Map<string, number>();
 export async function processReplayTranscodes(): Promise<void> {
+  if (!(await ffmpegAvailable())) return; // env sans binaires : laisser le VPS traiter
   const { data } = await supabaseAdmin.from('live_streams')
     .select('id, replay_url').like('replay_url', '%.webm').limit(5);
   const rows = ((data as any[]) || []).filter((r) => (transcodeFailures.get(r.id) || 0) < 3);
@@ -374,6 +395,7 @@ export async function processReplayTranscodes(): Promise<void> {
  * pas de download complet) → JPEG → upload GCS → thumbnail_url. Traite un petit lot par tick.
  */
 export async function processReplayThumbnails(): Promise<void> {
+  if (!(await ffmpegAvailable())) return; // env sans binaires : laisser le VPS traiter
   const { data } = await supabaseAdmin.from('live_streams')
     .select('id, replay_url').not('replay_url', 'is', null).is('thumbnail_url', null).limit(5);
   const rows = (data as any[]) || [];

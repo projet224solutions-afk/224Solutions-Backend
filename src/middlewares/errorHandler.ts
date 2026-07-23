@@ -4,9 +4,9 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../config/logger.js';
-import { env } from '../config/env.js';
 
 export function errorHandler(err: any, req: Request, res: Response, _next: NextFunction): void {
+  // Détails COMPLETS (stack incluse) loggués côté serveur UNIQUEMENT.
   logger.error('Error occurred:', {
     error: err.message,
     stack: err.stack,
@@ -35,12 +35,20 @@ export function errorHandler(err: any, req: Request, res: Response, _next: NextF
     return;
   }
 
-  const statusCode = err.statusCode || 500;
-  const message = env.isProduction ? 'Internal server error' : err.message;
+  // A2 — Refus CORS : 403 Forbidden propre (jamais un 500 verbeux).
+  if (err.message === 'Not allowed by CORS') {
+    res.status(403).json({ success: false, error: 'Origin not allowed' });
+    return;
+  }
 
-  res.status(statusCode).json({
-    success: false,
-    error: message,
-    ...(!env.isProduction && { stack: err.stack })
-  });
+  // A1 — Fail-safe : NE JAMAIS renvoyer stack, chemins de fichiers ni détails internes
+  // au client, quelle que soit la valeur de NODE_ENV (le correctif ne dépend PAS d'un
+  // NODE_ENV=production correct sur l'EC2). Les erreurs serveur (5xx) reçoivent un message
+  // générique ; les erreurs client (4xx) applicatives gardent leur message métier (déjà sûr).
+  const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 500;
+  const message = statusCode >= 500
+    ? 'Internal server error'
+    : (typeof err.message === 'string' ? err.message : 'Request error');
+
+  res.status(statusCode).json({ success: false, error: message });
 }

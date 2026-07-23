@@ -1207,7 +1207,20 @@ router.post('/pin/reset', verifyJWT, async (req: AuthenticatedRequest, res: Resp
  * Auth : verifyJWT
  * Body : { amount, description?, reference?, idempotency_key? }
  */
-router.post('/deposit', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
+// 🔒 F1 (SECURITY_AUDIT.md) — CRÉDIT DIRECT SANS PREUVE DE PAIEMENT : réservé au rôle service.
+// Un dépôt self-service DOIT passer par un fournisseur de paiement vérifié serveur-à-serveur
+// (Stripe `confirm-stripe-deposit`, mobile money) qui appelle creditWallet APRÈS confirmation.
+// Sans cette garde, tout compte authentifié se créditait au montant de son choix (monnaie ex nihilo).
+// ⚠️ Le bouton « dépôt » du front (WalletOperationsPanel) doit être re-routé vers le flux de
+// paiement ; en l'état il recevra 403 (comportement CORRECT : pas de crédit gratuit).
+router.post(
+  '/deposit',
+  verifyJWT,
+  requirePermissionOrRole({
+    permissionKey: 'manage_wallet_transactions',
+    allowedRoles: ['admin', 'pdg', 'ceo'],
+  }),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const { amount, description, reference, idempotency_key } = req.body || {};

@@ -161,7 +161,8 @@ export const env = {
   },
 
   get corsOrigins(): string[] {
-    const defaults = [
+    // Origines de développement navigateur (loopback) : autorisées UNIQUEMENT hors production.
+    const devOnly = [
       'http://localhost',
       'http://localhost:3000',
       'http://localhost:5173',
@@ -173,6 +174,9 @@ export const env = {
       'http://[::1]:5173',
       'http://[::1]:8080',
       'https://localhost:5173',
+    ];
+    // Toujours autorisées : app mobile (Capacitor/Ionic) + domaines de production.
+    const always = [
       'capacitor://localhost',
       'ionic://localhost',
       'https://224solution.net',
@@ -180,10 +184,20 @@ export const env = {
       'https://*.224solution.net',
     ];
 
-    return [...new Set([
-      ...defaults,
+    const merged = [
+      ...always,
+      ...(this.isProduction ? [] : devOnly),
       ...this.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean),
-    ])];
+    ];
+
+    // Filet fail-safe : en production, retirer TOUTE origine loopback même si elle traîne
+    // dans CORS_ORIGINS (l'ancien défaut env en contenait). Ne casse jamais l'app mobile
+    // (capacitor:// / ionic:// ont un schéma custom, non filtré) ni les domaines de prod.
+    const isBrowserLoopback = (o: string) =>
+      /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(o);
+
+    const list = this.isProduction ? merged.filter(o => !isBrowserLoopback(o)) : merged;
+    return [...new Set(list)];
   },
 
   get oauthConfigured(): boolean {

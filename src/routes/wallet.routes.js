@@ -136,8 +136,9 @@ router.post('/initialize', verifyJWT, async (req, res) => {
  */
 router.post('/check', verifyJWT, async (req, res) => {
   try {
-    const { user_id } = req.body || {};
-    const currentUserId = user_id || req.user?.sub || req.user?.id;
+    // 🔒 Anti-IDOR : le wallet retourné est TOUJOURS celui de l'appelant (jeton), jamais un
+    // `user_id` fourni dans le body. Cet endpoint ne lit que le portefeuille de soi-même.
+    const currentUserId = req.user?.id || req.user?.sub;
 
     if (!currentUserId) {
       return res.status(400).json({

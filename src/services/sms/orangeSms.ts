@@ -179,8 +179,17 @@ async function postSms(cfg: CountryConfig, toFormatted: string, message: string,
   });
   if (!res.ok) {
     let detail = `${res.status}`;
-    try { const j: any = await res.json(); detail = j?.requestError?.serviceException?.text || j?.requestError?.policyException?.text || j?.message || detail; } catch { /* ignore */ }
-    return { ok: false, error: `Orange ${cfg.iso}: ${detail}`, code: 'ORANGE_SEND_FAILED' };
+    try {
+      const j: any = await res.json();
+      const ex = j?.requestError?.policyException || j?.requestError?.serviceException;
+      // `variables` porte le VRAI motif (ex. « Expired contract… ») ; `text` n'est qu'un
+      // gabarit à trous (« Error code is %1 ») inutile seul → on privilégie variables.
+      const vars = Array.isArray(ex?.variables) ? ex.variables.filter(Boolean).join(' ') : '';
+      detail = vars || ex?.text || j?.message || detail;
+    } catch { /* ignore */ }
+    // Contrat expiré = cas distinct (renouveler ≠ recharger) → code dédié pour l'alerte.
+    const expired = /expired contract|contrat expir/i.test(detail);
+    return { ok: false, error: `Orange ${cfg.iso}: ${detail}`, code: expired ? 'ORANGE_CONTRACT_EXPIRED' : 'ORANGE_SEND_FAILED' };
   }
   return { ok: true };
 }
@@ -248,16 +257,23 @@ export async function orangeBalance(iso: string): Promise<{ units: number; expir
       return iso3 ? c === iso3 : list.length === 1;
     });
     if (mine.length === 0) return { units: 0, expiresAt: null, status: 'none' };
-    let units = 0; let expiresAt: string | null = null; let status = 'pending';
+    let units = 0; let expiresAt: string | null = null;
+    let sawActive = false, sawExpired = false, sawPending = false;
     for (const item of mine) {
       const st = String(item?.status || '').toUpperCase();
       // On ne compte les unités que des contrats réellement actifs.
       if (st === 'ACTIVE' || st === 'ACTIVATED') {
         units += Number(item?.availableUnits ?? item?.balance ?? 0) || 0;
-        status = 'active';
+        sawActive = true;
+      } else if (st === 'EXPIRED') {
+        sawExpired = true; // unités présentes mais INUTILISABLES tant que non renouvelé
+      } else if (st === 'PENDING') {
+        sawPending = true; // souscription non encore approuvée
       }
       expiresAt = item?.expirationDate || item?.expires || expiresAt;
     }
+    // Un contrat ACTIF prime ; sinon on remonte la vraie raison (renouveler vs approuver).
+    const status = sawActive ? 'active' : sawExpired ? 'expired' : sawPending ? 'pending' : 'none';
     return { units, expiresAt, status };
   } catch {
     return null;

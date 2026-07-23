@@ -32,6 +32,10 @@ jobs:
           AGORA_CUSTOMER_SECRET: ${{ secrets.AGORA_CUSTOMER_SECRET }}
           GCS_HMAC_ACCESS_KEY: ${{ secrets.GCS_HMAC_ACCESS_KEY }}
           GCS_HMAC_SECRET: ${{ secrets.GCS_HMAC_SECRET }}
+          # Rotation clé Supabase (fuite historique git de la legacy service_role) :
+          # poser le secret GitHub SUPABASE_SERVICE_ROLE_KEY = nouvelle clé sb_secret_…
+          # → injectée dans le .env du VPS au prochain déploiement. Vide = no-op.
+          SUPABASE_SERVICE_ROLE_KEY_NEW: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           # Diagnostic /api/version : SHA + horodatage du commit réellement déployé (pas des secrets).
           GIT_SHA: ${{ github.sha }}
           GIT_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
@@ -68,6 +72,9 @@ jobs:
           if [ -n "${AGORA_CUSTOMER_SECRET}" ]; then sed -i '/^AGORA_CUSTOMER_SECRET=/d' .env; echo "AGORA_CUSTOMER_SECRET=${AGORA_CUSTOMER_SECRET}" >> .env; fi
           if [ -n "${GCS_HMAC_ACCESS_KEY}" ]; then sed -i '/^GCS_HMAC_ACCESS_KEY=/d' .env; echo "GCS_HMAC_ACCESS_KEY=${GCS_HMAC_ACCESS_KEY}" >> .env; fi
           if [ -n "${GCS_HMAC_SECRET}" ]; then sed -i '/^GCS_HMAC_SECRET=/d' .env; echo "GCS_HMAC_SECRET=${GCS_HMAC_SECRET}" >> .env; fi
+          # Rotation Supabase : remplace la clé service (legacy fuitée) par la sb_secret du
+          # secret GitHub SUPABASE_SERVICE_ROLE_KEY. Rien si secret vide. JAMAIS loguée.
+          if [ -n "${SUPABASE_SERVICE_ROLE_KEY_NEW}" ]; then sed -i '/^SUPABASE_SERVICE_ROLE_KEY=/d' .env; echo "SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY_NEW}" >> .env; fi
           git fetch origin main
           git reset --hard origin/main
           # Diagnostic : écrit le SHA/branche/horodatage du commit déployé dans .env → /api/version.

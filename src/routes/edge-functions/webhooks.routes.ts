@@ -135,19 +135,12 @@ router.post("/paypal", async (req: Request, res: Response) => {
     const eventType = payload.event_type;
     const resource = payload.resource || {};
 
-    if (eventType === "CHECKOUT.ORDER.COMPLETED") {
-      const orderId = resource?.metadata?.order_id || resource?.custom_id;
-      if (orderId) {
-        await supabaseAdmin
-          .from("orders")
-          .update({
-            payment_status: "paid",
-            status: "confirmed",
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", orderId);
-      }
-    }
+    // 🔒 F3 (SECURITY_AUDIT.md) — ce handler N'EST PAS signé : ne JAMAIS confirmer une commande
+    // sur la base d'un corps non vérifié (un attaquant pouvait forger CHECKOUT.ORDER.COMPLETED +
+    // un order_id pour passer n'importe quelle commande en « paid »). La confirmation PayPal
+    // RÉELLE passe UNIQUEMENT par le handler SIGNÉ /edge-functions/payments/paypal/webhook
+    // (verify-webhook-signature). Ici : on journalise l'événement pour audit, sans aucune écriture
+    // sur les commandes. ⚠️ Config PayPal : pointer le webhook vers le handler signé.
 
     await supabaseAdmin.from("webhook_events").insert({
       provider: "paypal",
@@ -169,17 +162,12 @@ router.post("/chapchappay", async (req: Request, res: Response) => {
   try {
     const payload = req.body || {};
     const txRef = payload?.reference || payload?.tx_ref || payload?.transaction_id || `chap-${Date.now()}`;
-    const status = (payload?.status || "").toLowerCase();
 
-    if (["success", "succeeded", "completed", "paid"].includes(status)) {
-      const orderId = payload?.metadata?.order_id || payload?.order_id;
-      if (orderId) {
-        await supabaseAdmin
-          .from("orders")
-          .update({ payment_status: "paid", status: "confirmed", updated_at: new Date().toISOString() })
-          .eq("id", orderId);
-      }
-    }
+    // 🔒 F4 (SECURITY_AUDIT.md) — webhook NON signé : ne JAMAIS confirmer une commande sur un
+    // `status` fourni par l'appelant (forgeable). Aucune vérification serveur-à-serveur ChapChap
+    // n'est disponible (aucun secret/API configuré). On journalise pour audit, SANS écriture sur
+    // les commandes. ⚠️ Pour réactiver la confirmation ChapChap : implémenter un webhook SIGNÉ
+    // (HMAC via CHAPCHAP_WEBHOOK_SECRET, ou vérification serveur-à-serveur du statut réel).
 
     await supabaseAdmin.from("webhook_events").insert({
       provider: "chapchappay",

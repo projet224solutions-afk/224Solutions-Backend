@@ -424,6 +424,12 @@ router.post('/secure/init', verifyJWT, async (req: AuthenticatedRequest, res: Re
       payload: { transaction_id: transactionId, total_amount: totalAmount },
     });
 
+    // 🔒 F2 (SECURITY_AUDIT.md) — NE PAS renvoyer `signature` au client. La signature HMAC est
+    // le secret d'authentification S2S de /secure/validate : la donner au client lui permettait
+    // de s'auto-créditer (init → validate {payment_status:'SUCCESS'} + signature reçue = crédit
+    // SANS paiement réel). Elle ne doit être connue QUE du serveur / d'un provider partageant le
+    // secret (computeSecureSignature). ⚠️ La confirmation d'un paiement mobile money DOIT venir
+    // d'un callback provider VÉRIFIÉ, jamais d'un statut auto-déclaré par le client.
     res.json({
       success: true,
       transaction_id: transactionId,
@@ -431,7 +437,6 @@ router.post('/secure/init', verifyJWT, async (req: AuthenticatedRequest, res: Re
       fee_amount: feeAmount,
       total_amount: totalAmount,
       net_amount: netAmount,
-      signature,
       payment_method,
       status: 'pending',
     });

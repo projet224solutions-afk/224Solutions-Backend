@@ -36,7 +36,15 @@ export const env = {
   // Supabase (required)
   SUPABASE_URL: requireEnv('SUPABASE_URL'),
   SUPABASE_SERVICE_ROLE_KEY: requireEnv('SUPABASE_SERVICE_ROLE_KEY'),
-  SUPABASE_ANON_KEY: optionalEnv('SUPABASE_ANON_KEY', ''),
+  // Clé côté « anon » (login RLS, clients jetables) : on force la clé PUBLISHABLE nouvelle
+  // génération (publique, sûre en dur). Si le .env porte encore l'anon JWT legacy (eyJ…) ou est
+  // vide, on retombe sur la publishable → le backend n'utilise JAMAIS la legacy comme credential,
+  // ce qui permet de DÉSACTIVER les clés legacy Supabase (rotation de la service_role fuitée)
+  // sans casser les connexions. Une valeur sb_publishable_… explicite en env reste prioritaire.
+  SUPABASE_ANON_KEY: (() => {
+    const v = optionalEnv('SUPABASE_ANON_KEY', '').trim();
+    return v.startsWith('sb_') ? v : 'sb_publishable_rh1u3OG1tR3dPSY3dwoJpw_3VDt1BY3';
+  })(),
 
   // Security
   INTERNAL_API_KEY: optionalEnv('INTERNAL_API_KEY', ''),

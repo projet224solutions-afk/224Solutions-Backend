@@ -107,5 +107,15 @@ Lacunes traitées (voir commits `security:`) :
 ## Ordre d'application (Partie C)
 1. ✅ Ce rapport (carte complète).
 2. ✅ Correctifs sûrs appliqués : A1, A2, B7 (SMS/bureau), B8 (bureau `.or()`), B10.
-3. ⏳ **En attente de validation humaine** : **F1, F2, F3, F4** (B2), **IDOR wallet** (B3), **SECURITY DEFINER/RLS** (B4), **SSRF audioUrl** (B6), durcissements JWT (B9). Ne PAS corriger avant feu vert.
-4. Action serveur (ops) : `NODE_ENV=production` sur PM2 (linchpin A1/B10) ; brancher Sentry backend.
+3. ✅ **Critiques monétaires/auth CORRIGÉS** (après validation « commence par le critique », 23/07) :
+   - **IDOR** wallet/check → `currentUserId = req.user.id` (commit `9186ce6`).
+   - **F1** `/deposit` → réservé rôle service `requirePermissionOrRole(admin/pdg/ceo)` (commit `044d157`).
+     ⚠️ Conséquence : le bouton « dépôt » self-service du front (WalletOperationsPanel) recevra 403 —
+     il DOIT être re-routé vers un vrai flux de paiement (Stripe/mobile money vérifié).
+   - **F2** `/secure/init` → ne renvoie plus la `signature` HMAC au client (commit `3479610`).
+     ⚠️ Conséquence : le flux « secure » client-piloté est neutralisé (il créditait sans paiement) ;
+     un callback provider mobile money VÉRIFIÉ est requis pour ré-activer ces dépôts.
+   - **F3/F4** webhooks PayPal/ChapChap non signés → ne confirment plus les commandes (commit `bf5c4ea`).
+4. ⏳ **Reste à valider** : SECURITY DEFINER/RLS (B4), SSRF audioUrl (B6), durcissements JWT (B9),
+   + re-router les dépôts front vers un paiement vérifié (conséquence F1/F2).
+5. Action serveur (ops) : `NODE_ENV=production` sur PM2 (linchpin A1/B10) ; brancher Sentry backend.

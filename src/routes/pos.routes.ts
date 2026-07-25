@@ -13,6 +13,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { posSyncRateLimit } from '../middlewares/routeRateLimiter.js';
+import { requireFeature } from '../middlewares/subscriptionFeature.middleware.js';
 import { z } from 'zod';
 import Stripe from 'stripe';
 
@@ -430,7 +431,7 @@ const PosOrderSchema = z.object({
   credit_items: z.array(z.record(z.any())).max(100).nullish(),
 });
 
-router.post('/order', verifyJWT, posSyncRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/order', verifyJWT, requireFeature('pos_system'), posSyncRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
     const requestedVendorId = (req.headers['x-vendor-id'] as string | undefined)?.trim() || null;

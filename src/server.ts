@@ -124,7 +124,10 @@ const app = express();
 // les utilisateurs partagent la même clé de rate-limit (global:127.0.0.1) → la
 // limite saute pour tout le monde (« Trop de requêtes »). Indispensable au bon
 // fonctionnement du rate-limiting par IP.
-app.set('trust proxy', true);
+// ⚠️ `true` = Express fait confiance à TOUT X-Forwarded-For (en-tête contrôlé par le client) →
+// il prend l'IP la plus à gauche, spoofable → rate-limit / blocage d'IP contournables. On borne
+// au nombre RÉEL de proxys devant l'app (nginx seul → 1 ; Vercel+nginx → 2), via env.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
 
 function originMatchesPattern(origin: string, pattern: string): boolean {
   if (!pattern) return false;

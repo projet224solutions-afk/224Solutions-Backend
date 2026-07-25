@@ -119,10 +119,11 @@ export function createRedisLimiter({ max, windowSeconds, keyPrefix, message, ski
 
 /**
  * Rate limiter global — par IP.
- * 10 000 requêtes/min par défaut (configurable via env).
+ * 1 200 requêtes/min par défaut (20 req/s ; 10 000 était > la capacité du serveur, donc inutile
+ * comme protection). Configurable via RATE_LIMIT_MAX_REQUESTS.
  */
 export const rateLimiter = createRedisLimiter({
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || 10000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || 1200,
   windowSeconds: Math.round((parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 60 * 1000) / 1000),
   keyPrefix: 'global',
   label: 'global',

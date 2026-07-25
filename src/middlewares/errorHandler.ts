@@ -4,7 +4,6 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../config/logger.js';
-import { env } from '../config/env.js';
 
 export function errorHandler(err: any, req: Request, res: Response, _next: NextFunction): void {
   logger.error('Error occurred:', {
@@ -36,11 +35,17 @@ export function errorHandler(err: any, req: Request, res: Response, _next: NextF
   }
 
   const statusCode = err.statusCode || 500;
-  const message = env.isProduction ? 'Internal server error' : err.message;
 
-  res.status(statusCode).json({
-    success: false,
-    error: message,
-    ...(!env.isProduction && { stack: err.stack })
-  });
+  // 🔒 Ne JAMAIS exposer err.message / err.stack au client (fuite de noms de tables, contraintes,
+  // colonnes PostgreSQL), quel que soit NODE_ENV — qui vaut 'development' par DÉFAUT, donc non
+  // fiable en prod. Le détail EST journalisé côté serveur (logger.error ci-dessus). Une route qui
+  // veut renvoyer un message sûr le fait EXPLICITEMENT via err.publicMessage. Codes HTTP conservés.
+  const publicMessage =
+    typeof err.publicMessage === 'string' && err.publicMessage.trim()
+      ? err.publicMessage
+      : statusCode >= 500
+        ? 'Internal server error'
+        : 'Request could not be processed';
+
+  res.status(statusCode).json({ success: false, error: publicMessage });
 }

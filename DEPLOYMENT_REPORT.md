@@ -51,22 +51,33 @@ sans session. Rollback = repasser `Content-Security-Policy-Report-Only` dans `ve
 
 ---
 
-## 🔴 LA SEULE DÉCISION EN ATTENTE — masquage rétroactif
+## Masquage rétroactif — DÉCISION « prévenir puis masquer » (implémentée)
 
-Le trigger `subscription_feature_gate` masque les produits **à la transition** actif→expiré. Les
-vendeurs **déjà expirés AVANT** l'existence du trigger n'ont donc **pas** été masqués rétroactivement.
+Le trigger `subscription_feature_gate` masque à la **transition** actif→expiré ; les vendeurs déjà
+expirés AVANT le trigger n'ont pas été masqués. Décision Thierno : **prévenir puis masquer**.
 
-**Mesure prod (2026-07-25)** :
-- **6 vendeurs** déjà `expired` ont **59 produits encore visibles** dans le marketplace.
-- **0 produit** actuellement masqué par abonnement (l'application de la migration n'a **rien** masqué
-  en masse — elle était sûre).
+### ⚠️ Correction importante des chiffres (bug de comptage détecté au test)
+La première mesure « 6 vendeurs / 59 produits » était **fausse**, pour deux raisons découvertes en
+testant la fonction avant de l'activer :
+1. **Abonnements expirés en double** : un vendeur avec 5 lignes `expired` voyait ses produits comptés
+   ×5 (25 au lieu de 5).
+2. **Clients payants comptés à tort** : 2 des 6 « expirés » (`c2c1e36f` = 29 produits, `fca38d2e` =
+   5 produits) ont en réalité un **abonnement payant ACTIF** en cours (une vieille ligne `expired`
+   coexiste). Ce sont des **clients à jour** — à ne surtout pas masquer ni notifier.
 
-**Décision commerciale (pas technique) — pour Thierno :** faut-il lancer un **backfill unique** qui
-masque ces 59 produits pour honorer la règle « à l'expiration, les produits disparaissent » ? Si oui,
-6 vendeurs perdent leur visibilité d'un coup — il voudra peut-être les prévenir avant. **Je n'exécute
-rien tant que ce n'est pas validé.** (Le backfill serait : `UPDATE products SET is_active=false,
-hidden_by_subscription=true WHERE is_active=true AND vendor_id IN (vendeurs expirés)` — atomique,
-réversible au renouvellement par le trigger existant.)
+**Chiffres réels : 4 vendeurs / 5 produits** (fff28e29=2, e400cee5=1, 6d2c8f2f=1, 68a15be9=1).
+
+### Ce qui a été fait
+- **Phase 1 (fait)** : notification in-app aux **4 vrais** vendeurs expirés (échéance **2026-07-28**).
+  Les 2 notifications parties à tort aux clients payants ont été **supprimées**.
+- **Phase 2 (planifiée)** : migration `20260725130000_retro_hide_pre_notified.sql` — fonction
+  `hide_pre_notified_expired_products()` (SECURITY DEFINER, service_role) + **job pg_cron quotidien**
+  `retro-hide-pre-notified-expired` (06:30 UTC). Le **28/07**, elle masquera les 5 produits des 4
+  vendeurs non renouvelés et les notifiera ; ensuite idempotente (no-op).
+- **Garde-fou clé** : la fonction **exclut** tout user ayant un abonnement payant actif
+  (`NOT EXISTS active/trialing, price>0, period_end>now`). Vérifié en simulation (échéance forcée,
+  rollback) : **4 vendeurs / 5 produits masqués, 0 produit de client payant touché**.
+- Un vendeur qui **renouvelle** avant le 28/07 sort automatiquement de la cible (plus `expired`).
 
 ---
 
@@ -93,7 +104,7 @@ Aucune de ces policies n'est corrigée dans ce lot (respect de l'interdit « ne 
 |---|---|
 | 6 migrations nommées | **APPLIQUÉ** (vérifié) |
 | Backend + Frontend | **DÉPLOYÉ** (healthz 200, CSP appliquée) |
-| Masquage rétroactif (6 vendeurs / 59 produits) | **EN ATTENTE VALIDATION Thierno** |
+| Masquage rétroactif (**4 vendeurs / 5 produits** ; 2 « clients payants » exclus) | **PLANIFIÉ 28/07** (notifiés + cron `retro-hide-pre-notified-expired`) |
 | Ops VPS (TRUST_PROXY_HOPS, RATE_LIMIT→1200, NODE_ENV) | **EN ATTENTE** (action serveur) |
 | CSP parcours interactifs | **EN ATTENTE** (clic humain) |
 | BLOC 3 (reviews/taxi_trips/pharmacy_orders/vides) | **EN ATTENTE DÉCISION** (fiches ci-dessus) |

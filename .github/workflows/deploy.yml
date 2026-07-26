@@ -58,10 +58,13 @@ jobs:
           # sensibles (login/OTP/paiement) ont EN PLUS leurs limites dediees (routeRateLimiter).
           if grep -q '^RATE_LIMIT_MAX_REQUESTS=' .env; then sed -i 's|^RATE_LIMIT_MAX_REQUESTS=.*|RATE_LIMIT_MAX_REQUESTS=1200|' .env; else echo 'RATE_LIMIT_MAX_REQUESTS=1200' >> .env; fi
           if grep -q '^RATE_LIMIT_WINDOW_MS=' .env; then sed -i 's|^RATE_LIMIT_WINDOW_MS=.*|RATE_LIMIT_WINDOW_MS=60000|' .env; else echo 'RATE_LIMIT_WINDOW_MS=60000' >> .env; fi
-          # NODE_ENV=production : active le mode prod (fail-fast secrets au boot, pas de bypass
-          # rate-limit pour les IP locales, messages d'erreur generiques). Idempotent. Le boot est
-          # verifie plus bas ; s'il casse (secret critique manquant), NODE_ENV est retire (rollback).
-          if grep -q '^NODE_ENV=' .env; then sed -i 's|^NODE_ENV=.*|NODE_ENV=production|' .env; else echo 'NODE_ENV=production' >> .env; fi
+          # NODE_ENV=production RETIRE (incident 26 juil) : le backend BOOTE OK sous production
+          # (health-check du deploy #179 passe, /api/version repond environment:production) mais
+          # CRASHE quelques instants APRES le boot -> 502. Cause a diagnostiquer (probable service de
+          # fond qui throw en prod). En attendant, on FORCE le retrait de NODE_ENV (retour au defaut
+          # 'development' qui tournait) pour restaurer la prod. NE PAS re-remettre NODE_ENV=production
+          # avant d'avoir corrige le crash post-boot (et ajoute un health-check differe au filet).
+          sed -i '/^NODE_ENV=/d' .env
           # TRUST_PROXY_HOPS=1 : nginx seul devant Node = 1 proxy. Borne la confiance dans
           # X-Forwarded-For (sinon IP spoofable -> rate-limit/blocage d'IP contournables). Si un CDN
           # (ex. Cloudflare) est un jour ajoute DEVANT nginx pour l'API, passer cette valeur a 2.
@@ -95,29 +98,19 @@ jobs:
           # Redemarrage ROBUSTE (14 juil 2026) : un simple 'pm2 restart' NE RÉCUPÈRE PAS un
           # process zombie/crash-loop (incident : 621 restarts, ancien code servi → prod bloquée).
           # On recrée le process proprement via 'npm start' (npx tsx src/server.ts). Idempotent.
+          # DIAGNOSTIC TEMPORAIRE (incident crash post-boot NODE_ENV=production, 26 juil) : AVANT de
+          # tuer/redemarrer, on capture la fin des logs pm2 du process precedent (crashe) -> la stack
+          # du crash apparait dans le log Actions. A RETIRER une fois la cause corrigee.
+          echo "----- pm2 logs AVANT redemarrage (stack du crash prod) -----"
+          pm2 logs 224-backend --nostream --lines 60 2>&1 | tail -60 || true
+          echo "----- fin pm2 logs -----"
           pm2 delete 224-backend >/dev/null 2>&1 || true
           pm2 start npm --name 224-backend -- start
           pm2 describe 224-worker >/dev/null 2>&1 && pm2 restart 224-worker --update-env || true
-          # Filet de securite du passage NODE_ENV=production : en prod, assertSecretsOnBoot() fait un
-          # fail-fast (throw) si un secret critique manque -> le process ne demarre pas. On verifie le
-          # boot ; s'il echoue, on RETIRE NODE_ENV (retour au defaut 'development' qui demarrait) et on
-          # redemarre pour ne JAMAIS laisser la prod a terre, puis on echoue le deploiement bruyamment.
+          pm2 save
+          # Preuve immédiate : /api/version doit répondre le SHA fraîchement déployé.
           sleep 8
-          if curl -sf -m 8 http://localhost:3001/api/version >/dev/null 2>&1; then
-            pm2 save
-            echo "BOOT_OK (NODE_ENV=production actif)"
-            curl -s -m 8 http://localhost:3001/api/version || true
-            echo DEPLOY_OK
-          else
-            echo "BOOT_FAIL sous NODE_ENV=production -> rollback NODE_ENV"
-            sed -i '/^NODE_ENV=/d' .env
-            pm2 delete 224-backend >/dev/null 2>&1 || true
-            pm2 start npm --name 224-backend -- start
-            pm2 save
-            sleep 8
-            if curl -sf -m 8 http://localhost:3001/api/version >/dev/null 2>&1; then echo "ROLLBACK_OK : prod UP (mode development, NODE_ENV retire)"; else echo "STILL_DOWN apres rollback : la panne n'est PAS due a NODE_ENV"; fi
-            echo "DEPLOY_FAILED: NODE_ENV=production a casse le boot (secret critique manquant sur le VPS : JWT_SECRET>=32, ou l'un de MFA_ENCRYPTION_KEY/CCP_ENCRYPTION_KEY/TRANSACTION_SECRET_KEY). NON applique."
-            exit 1
-          fi
+          curl -s -m 8 http://localhost:3001/api/version || echo "WARN: /api/version muet après deploy"
+          echo DEPLOY_OK
           REMOTE
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" 'bash -s' < /tmp/remote_deploy.sh

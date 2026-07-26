@@ -98,19 +98,29 @@ jobs:
           # Redemarrage ROBUSTE (14 juil 2026) : un simple 'pm2 restart' NE RÉCUPÈRE PAS un
           # process zombie/crash-loop (incident : 621 restarts, ancien code servi → prod bloquée).
           # On recrée le process proprement via 'npm start' (npx tsx src/server.ts). Idempotent.
-          # DIAGNOSTIC TEMPORAIRE (incident crash post-boot NODE_ENV=production, 26 juil) : AVANT de
-          # tuer/redemarrer, on capture la fin des logs pm2 du process precedent (crashe) -> la stack
-          # du crash apparait dans le log Actions. A RETIRER une fois la cause corrigee.
-          echo "----- pm2 logs AVANT redemarrage (stack du crash prod) -----"
-          pm2 logs 224-backend --nostream --lines 60 2>&1 | tail -60 || true
-          echo "----- fin pm2 logs -----"
+          # DIAGNOSTIC TEMPORAIRE (incident 502 post-deploy, 26 juil) : etat + logs (stdout ET stderr)
+          # + memoire du process ACTUEL (potentiellement mort) AVANT de le remplacer. A RETIRER apres.
+          echo "----- pm2 list (status + restarts) -----"; pm2 list 2>&1 || true
+          echo "----- memoire (OOM ?) -----"; free -m 2>&1 | head -3 || true
+          echo "----- pm2 logs STDOUT (40) -----"; pm2 logs 224-backend --nostream --lines 40 --out 2>&1 | tail -40 || true
+          echo "----- pm2 logs STDERR (60) (stack du crash) -----"; pm2 logs 224-backend --nostream --lines 60 --err 2>&1 | tail -60 || true
+          echo "----- fin diagnostic -----"
+          # Nettoyage orphelin eventuel sur :3001 : npm->tsx->node peut laisser un node qui garde le
+          # port apres 'pm2 delete' -> le nouveau process crashe en EADDRINUSE. fuser tue le tenant.
           pm2 delete 224-backend >/dev/null 2>&1 || true
+          fuser -k 3001/tcp >/dev/null 2>&1 || true
+          sleep 1
           pm2 start npm --name 224-backend -- start
           pm2 describe 224-worker >/dev/null 2>&1 && pm2 restart 224-worker --update-env || true
           pm2 save
-          # Preuve immédiate : /api/version doit répondre le SHA fraîchement déployé.
+          # Preuve : /api/version doit repondre. Verif a +8s ET a +45s (attrape un crash differe
+          # DANS le log du deploy -> on saura si et quand il meurt).
           sleep 8
-          curl -s -m 8 http://localhost:3001/api/version || echo "WARN: /api/version muet après deploy"
+          curl -s -m 8 http://localhost:3001/api/version || echo "WARN: /api/version muet a +8s"
+          sleep 37
+          echo "----- re-check a +45s -----"
+          curl -s -m 8 http://localhost:3001/api/version || echo "WARN: /api/version muet a +45s (crash differe)"
+          echo "----- pm2 list final -----"; pm2 list 2>&1 || true
           echo DEPLOY_OK
           REMOTE
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" 'bash -s' < /tmp/remote_deploy.sh

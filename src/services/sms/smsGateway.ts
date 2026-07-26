@@ -222,3 +222,42 @@ export async function recentSendCount(e164: string, usage: string, windowMinutes
     return 0; // fail-open : le rate-limit ne doit jamais bloquer sur une panne de comptage
   }
 }
+
+/**
+ * Nombre de SMS RÉUSSIS journalisés AUJOURD'HUI (UTC) pour ces usages — base d'un PLAFOND GLOBAL
+ * anti-abus de COÛT. Ni la limite par numéro ni celle par IP n'arrêtent un attaquant qui vise des
+ * centaines de numéros DIFFÉRENTS ; ce plafond, si. On compte les envois RÉUSSIS (= coût réel).
+ * Fail-open : ne bloque jamais sur une panne de comptage.
+ */
+export async function dailySmsCount(usageTypes: string[]): Promise<number> {
+  try {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const { count } = await supabaseAdmin.from('sms_send_log')
+      .select('id', { count: 'exact', head: true })
+      .in('usage_type', usageTypes)
+      .eq('success', true)
+      .gte('created_at', startOfDay.toISOString());
+    return count || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Alerte « plafond journalier OTP atteint » → system_alerts, throttle 1 h, jamais bloquante.
+let lastDailyCapAlertAt = 0;
+export async function alertSmsDailyCap(count: number, cap: number): Promise<void> {
+  const now = Date.now();
+  if (now - lastDailyCapAlertAt < 3600_000) return;
+  lastDailyCapAlertAt = now;
+  try {
+    await supabaseAdmin.from('system_alerts').insert({
+      title: `SMS : plafond journalier OTP atteint (${count}/${cap})`,
+      message: `Le nombre de SMS OTP réussis du jour (inscription + reset) a atteint ${count} (plafond ${cap}). Les envois OTP publics sont suspendus jusqu'à demain — possible abus de coût sur des numéros variés. Vérifier l'écran Passerelle SMS ; relever SMS_DAILY_OTP_CAP si le trafic est légitime.`,
+      severity: 'high',
+      module: 'sms_gateway',
+      status: 'active',
+      metadata: { count, cap, kind: 'otp_daily_cap' },
+    } as never);
+  } catch { /* l'alerte ne casse jamais le flux */ }
+}

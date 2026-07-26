@@ -213,7 +213,7 @@ async function clientPhone(userId: string): Promise<string | null> {
 
 // Émet un OTP client (réutilisé par /withdrawal/otp, la bascule AUTO et le fallback manuel).
 async function issueClientOtp(agentId: string, clientId: string, phone: string, amount: number | null): Promise<boolean> {
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  const otp = String(crypto.randomInt(100000, 1000000)); // OTP cryptographique (jamais Math.random)
   const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
   const { error } = await supabaseAdmin.from('agent_cash_otp').insert({
     agent_id: agentId, client_user_id: clientId, otp_hash: otpHash, amount,

@@ -16,30 +16,68 @@
  *
  * Routes PUBLIQUES (utilisateur pas encore créé) → déclarées dans isPublicEdgePath (index.ts).
  */
+import { randomInt } from 'node:crypto';
 import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase.js';
 import { logger } from '../../config/logger.js';
 import { sendSms } from '../../services/sms.service.js';
-import { recentSendCount, canDeliverTo } from '../../services/sms/smsGateway.js';
+import { recentSendCount, canDeliverTo, dailySmsCount, alertSmsDailyCap } from '../../services/sms/smsGateway.js';
 import { routeRateLimit } from '../../middlewares/routeRateLimiter.js';
 
 const router = Router();
 
 const MAX_VERIFY_ATTEMPTS = 3;
 
-// 3 demandes / 15 min / IP — fail-open (repli mémoire) : un limiteur ne bloque jamais tout.
+// Plafond GLOBAL de SMS OTP par jour (inscription + reset) — la VRAIE protection anti-abus de
+// coût : un attaquant visant des centaines de numéros DIFFÉRENTS n'est arrêté ni par la limite
+// par numéro ni par celle par IP. Réglable via SMS_DAILY_OTP_CAP (défaut 1000). Dépassement =
+// envois OTP publics suspendus + alerte Thierno (system_alerts).
+const SMS_DAILY_OTP_CAP = parseInt(process.env.SMS_DAILY_OTP_CAP || '', 10) || 1000;
+
+// Limite par IP RELEVÉE à 25 / 15 min (les opérateurs mobiles guinéens partagent une même IP
+// publique entre des milliers d'abonnés : 3/IP bloquait de vrais commerçants). Elle ne sert plus
+// qu'à freiner un script — la vraie protection par numéro (recentSendCount, lue en base) reste à 3.
+// fail-open : un limiteur ne bloque jamais tout (surtout pas fermé si Redis tousse).
 const otpRequestIpLimit = routeRateLimit({
-  maxRequests: 3, windowSeconds: 900, keyPrefix: 'phone-otp-ip', perUser: false, perIp: true, failClosed: false,
+  maxRequests: 25, windowSeconds: 900, keyPrefix: 'phone-otp-ip', perUser: false, perIp: true, failClosed: false,
 });
 
-/** Normalise en E.164 (le front envoie déjà de l'E.164 ; repli GN uniquement sur 9 chiffres nus). */
-function normalizePhone(raw: string): string {
-  const clean = String(raw || '').trim().replace(/[\s\-().]/g, '');
+/** Plafond global journalier dépassé ? (compte les SMS OTP réussis du jour, alerte au dépassement.) */
+async function otpDailyCapExceeded(): Promise<boolean> {
+  const n = await dailySmsCount(['signup', 'reset']);
+  if (n >= SMS_DAILY_OTP_CAP) {
+    await alertSmsDailyCap(n, SMS_DAILY_OTP_CAP);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalise en E.164 via LA fonction canonique en base `normalize_phone(p, default_country)` —
+ * EXACTEMENT le même normaliseur que la connexion (`resolve_user_id_by_phone` s'appuie dessus),
+ * donc plus aucune divergence inscription/connexion. L'ISO du pays (envoyé par le front dans
+ * `country_code`) est passé en `default_country` → un numéro LOCAL à 9 chiffres est rattaché au
+ * BON pays (SN→+221, ML→+223, CI→+225…), plus jamais forcé en GN. Repli GN UNIQUEMENT quand aucun
+ * ISO n'est fourni ET que le numéro est local (journalisé comme anomalie). Ne PAS créer un 3e
+ * normaliseur : cette fonction délègue.
+ */
+async function normalizePhone(raw: string, iso?: string): Promise<string> {
+  const input = String(raw || '').trim();
+  if (!iso && !input.startsWith('+')) {
+    logger.warn(`[phone] numéro local SANS country_code → repli défaut GN pour ${input.slice(0, 4)}*** (le client devrait envoyer l'ISO du pays).`);
+  }
+  const { data, error } = await supabaseAdmin.rpc('normalize_phone', { p: input, default_country: iso || 'GN' });
+  if (!error && typeof data === 'string' && data) return data as string;
+
+  // Repli (RPC indisponible) : cas NON AMBIGUS seulement — on ne PRÉSUME jamais un pays pour un
+  // numéro local si un ISO ≠ GN est fourni (c'est précisément le bug qu'on corrige).
+  const clean = input.replace(/[\s\-().]/g, '');
   const digits = clean.replace(/[^\d]/g, '');
   if (clean.startsWith('+')) return clean;
-  if (digits.startsWith('00') && digits.length >= 12) return '+' + digits.slice(2);
-  if (digits.length === 9) return '+224' + digits; // repli GN (le front envoie normalement l'indicatif)
-  return '+' + digits;
+  if (digits.startsWith('00') && digits.length >= 11) return '+' + digits.slice(2);
+  if (digits.length === 9 && (!iso || iso === 'GN')) return '+224' + digits;
+  logger.error(`[phone] normalize_phone indisponible et repli local impossible (iso=${iso || 'aucun'}) : ${error?.message || 'no data'}`);
+  throw new Error('phone_normalization_unavailable');
 }
 
 /** Réponse générique UNIQUE (anti-énumération) — identique que le numéro existe ou non. */
@@ -52,9 +90,8 @@ router.post('/phone-signup-send', otpRequestIpLimit, async (req: Request, res: R
     const { phone, country_code } = req.body || {};
     if (!phone) { res.status(400).json({ success: false, error: 'Numéro requis' }); return; }
 
-    const normalized = normalizePhone(String(phone));
-    const digits = normalized.replace(/[^\d]/g, '');
     const iso = typeof country_code === 'string' && country_code.length >= 2 ? country_code.toUpperCase() : undefined;
+    const normalized = await normalizePhone(String(phone), iso);
 
     // Rate-limit PAR NUMÉRO : 3 envois signup / 15 min (compté sur le journal passerelle).
     if ((await recentSendCount(normalized, 'signup')) >= 3) {
@@ -62,24 +99,33 @@ router.post('/phone-signup-send', otpRequestIpLimit, async (req: Request, res: R
       return;
     }
 
-    // Variantes (dont le format espacé « +224 624… » stocké à l'inscription email).
-    const spaceVariants: string[] = [];
-    for (let codeLen = 1; codeLen <= 4; codeLen++) {
-      if (digits.length > codeLen) spaceVariants.push('+' + digits.slice(0, codeLen) + ' ' + digits.slice(codeLen));
+    // PLAFOND GLOBAL journalier (anti-abus de coût) — gate AVANT tout envoi (OTP comme SMS
+    // d'avertissement), pour ne pas révéler l'existence d'un compte via ce chemin. Alerte Thierno.
+    if (await otpDailyCapExceeded()) {
+      res.status(429).json({ success: false, error: 'Service momentanément indisponible, réessayez plus tard.', error_code: 'SMS_DAILY_CAP' });
+      return;
     }
-    const variants = [...new Set([normalized, '+' + digits, digits, ...spaceVariants])];
 
-    // ANTI-ÉNUMÉRATION : si le numéro a déjà un compte, on répond EXACTEMENT comme si un code
-    // partait — et on prévient le vrai propriétaire par SMS (lui seul le voit).
-    const { data: existing } = await supabaseAdmin.from('profiles').select('id').in('phone', variants).maybeSingle();
-    if (existing) {
+    // ANTI-ÉNUMÉRATION : existence par la forme CANONIQUE `phone_e164` (même définition que la
+    // connexion) — fini les variantes fabriquées à la main. Erreur DB ⇒ 500, JAMAIS interprétée
+    // comme « numéro libre ».
+    const { data: existingRows, error: existErr } = await supabaseAdmin
+      .from('profiles').select('id').eq('phone_e164', normalized).limit(1);
+    if (existErr) {
+      logger.error(`[phone-signup-send] contrôle existence: ${existErr.message}`);
+      res.status(500).json({ success: false, error: 'Erreur serveur' });
+      return;
+    }
+    if (existingRows && existingRows.length > 0) {
+      // Numéro déjà pris : on répond EXACTEMENT comme si un code partait, et on prévient le VRAI
+      // propriétaire par SMS (lui seul le voit).
       sendSms(normalized, '224Solutions : un compte existe déjà avec ce numéro. Connectez-vous (ou « Mot de passe oublié »). Si ce n\'était pas vous, ignorez ce message.', iso, 'signup')
         .catch(() => { /* non bloquant */ });
       genericSent(res, normalized);
       return;
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = String(randomInt(100000, 1000000)); // OTP cryptographique (jamais Math.random)
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await supabaseAdmin.from('auth_otp_codes').delete()
@@ -133,7 +179,7 @@ router.post('/phone-signup-verify', async (req: Request, res: Response): Promise
     const {
       phone, otp, password,
       firstName, lastName, role,
-      city, country,
+      city, country, country_code,
       businessName, serviceType, customId,
     } = req.body || {};
 
@@ -141,7 +187,11 @@ router.post('/phone-signup-verify', async (req: Request, res: Response): Promise
       res.status(400).json({ success: false, error: 'Données incomplètes' });
       return;
     }
-    const normalized = normalizePhone(String(phone));
+    // Même normaliseur canonique qu'à l'envoi : le front renvoie l'E.164 (idempotent), et si un
+    // country_code est fourni il rattache un éventuel numéro local au bon pays → l'identifiant
+    // recherché est IDENTIQUE à celui stocké par /phone-signup-send.
+    const isoVerify = typeof country_code === 'string' && country_code.length >= 2 ? country_code.toUpperCase() : undefined;
+    const normalized = await normalizePhone(String(phone), isoVerify);
 
     // 1) OTP exact, non vérifié, du bon type
     const { data: otpRecord, error: otpError } = await supabaseAdmin
@@ -257,12 +307,18 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
     const { phone, country_code } = req.body || {};
     if (!phone) { res.status(400).json({ success: false, error: 'Numéro requis' }); return; }
     const iso = typeof country_code === 'string' && country_code.length >= 2 ? country_code.toUpperCase() : undefined;
-    const normalized = normalizePhone(String(phone));
+    const normalized = await normalizePhone(String(phone), iso);
 
     // Rate-limit PAR NUMÉRO **avant** toute résolution (le 429 ne doit pas être un oracle
     // d'existence : il se déclenche à l'identique que le compte existe ou non).
     if ((await recentSendCount(normalized, 'reset')) >= 3) {
       res.status(429).json({ success: false, error: 'Trop de demandes pour ce numéro. Réessayez dans quelques minutes.', error_code: 'RATE_LIMITED' });
+      return;
+    }
+
+    // PLAFOND GLOBAL journalier (anti-abus de coût) — état GLOBAL, donc pas un oracle d'existence.
+    if (await otpDailyCapExceeded()) {
+      res.status(429).json({ success: false, error: 'Service momentanément indisponible, réessayez plus tard.', error_code: 'SMS_DAILY_CAP' });
       return;
     }
 
@@ -295,7 +351,7 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
       .select('id, phone, phone_e164').eq('id', userId as string).single();
     const storedPhone: string = (profile?.phone_e164 || profile?.phone || normalized).trim();
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = String(randomInt(100000, 1000000)); // OTP cryptographique (jamais Math.random)
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await supabaseAdmin.from('auth_otp_codes').delete()

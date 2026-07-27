@@ -93,6 +93,19 @@ verify_jwt = true
 [functions.generate-unique-id]
 verify_jwt = false
 
+# Login institutionnel (agent / bureau syndical) : PUBLIC (l'utilisateur n'est pas encore
+# authentifié) → verify_jwt = false OBLIGATOIRE, sinon le login casse. Figé ici pour qu'un
+# futur deploy ne le repasse pas à true par défaut.
+[functions.auth-agent-login]
+verify_jwt = false
+
+[functions.auth-bureau-login]
+verify_jwt = false
+
+# Recherche visuelle : appelée avec la clé publishable (anon) → publique.
+[functions.visual-search]
+verify_jwt = false
+
 [functions.wallet-operations]
 verify_jwt = true
 

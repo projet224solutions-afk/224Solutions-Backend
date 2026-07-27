@@ -100,7 +100,7 @@ export function generateAgoraRtcToken(
 ): string {
   const uidStr = uid === '0' || uid === '' ? '' : String(uid);
   const ts = Math.floor(Date.now() / 1000) + 24 * 3600; // ts propre du token (24 h)
-  const salt = Math.floor(Math.random() * 0xffffffff);
+  const salt = crypto.randomInt(0, 0xffffffff); // sel cryptographique (jamais Math.random)
 
   const privileges: Record<number, number> = { [Privileges.kJoinChannel]: privilegeExpiredTs };
   if (role === AgoraRole.PUBLISHER) {

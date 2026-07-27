@@ -165,8 +165,8 @@ serve(async (req) => {
       })
       .eq('id', bureau.id);
 
-    // Générer OTP 6 chiffres
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // Générer OTP 6 chiffres — CRYPTOGRAPHIQUE (Web Crypto Deno), jamais Math.random (prédictible).
+    const otp = String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
     console.log(`[AUTH-BUREAU-LOGIN] OTP généré pour ${bureau.bureau_code}: ${otp}`);

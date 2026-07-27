@@ -53,8 +53,11 @@ serve(async (req) => {
             content: [
               {
                 type: 'text',
-                text: `Analyse cette image et identifie les produits ou objets visibles. 
-                
+                text: `Analyse cette image et identifie les produits ou objets visibles.
+
+⚠️ IMPORTANT : réponds ENTIÈREMENT EN FRANÇAIS (mots-clés, catégorie, couleurs, description) — le
+catalogue et les noms de produits sont en français ; des mots-clés anglais ne trouveraient RIEN.
+
 Retourne UNIQUEMENT un JSON valide avec cette structure exacte:
 {
   "products": ["mot-clé 1", "mot-clé 2", "mot-clé 3"],
@@ -64,8 +67,9 @@ Retourne UNIQUEMENT un JSON valide avec cette structure exacte:
 }
 
 Exemples de catégories: électronique, vêtements, chaussures, accessoires, maison, beauté, sport, alimentation, jouets, bijoux.
-Donne au maximum 5 mots-clés pertinents pour rechercher ce produit.
-Réponds UNIQUEMENT avec le JSON, sans texte avant ou après.`
+Donne au maximum 5 mots-clés SIMPLES et COURANTS = le nom usuel du produit en français
+(ex. "micro cravate", "clé usb", "ventilateur", "lampe led", "coque téléphone", "casque audio").
+Évite le jargon technique anglais. Réponds UNIQUEMENT avec le JSON, sans texte avant ou après.`
               },
               {
                 type: 'image_url',
@@ -123,12 +127,17 @@ Réponds UNIQUEMENT avec le JSON, sans texte avant ou après.`
     // Construire la requête de recherche
     let allProducts: any[] = [];
 
-    for (const keyword of searchKeywords.slice(0, 5)) {
+    // Recherche sur le NOM ET la DESCRIPTION (avant : nom seul → 40 % des photos sans résultat).
+    // Sanitise le mot-clé : les virgules/parenthèses/points cassent la syntaxe du filtre .or PostgREST.
+    const sanitize = (s: string) => s.replace(/[,()*%.]/g, ' ').trim();
+    for (const rawKeyword of searchKeywords.slice(0, 5)) {
+      const keyword = sanitize(rawKeyword);
+      if (keyword.length < 2) continue;
       const { data: products } = await supabase
         .from('products')
         .select('id, name, price, images, rating, reviews_count, vendor_id')
         .eq('is_active', true)
-        .ilike('name', `%${keyword}%`)
+        .or(`name.ilike.%${keyword}%,description.ilike.%${keyword}%`)
         .limit(10);
 
       if (products) {

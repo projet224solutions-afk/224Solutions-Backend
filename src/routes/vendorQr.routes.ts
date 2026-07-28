@@ -75,12 +75,21 @@ router.get('/pay-target/:code', paymentRateLimit, async (req: Request, res: Resp
 
   if (!userId) { res.json({ success: true, data: { found: false } }); return; }
 
+  // Nom de la BOUTIQUE en priorité (pas le nom du propriétaire) + logo + ville.
+  const { data: vendor } = await supabaseAdmin.from('vendors')
+    .select('business_name, logo_url, city').eq('user_id', userId).maybeSingle();
+  const v = (vendor ?? {}) as { business_name?: string; logo_url?: string; city?: string };
+  const displayName = (v.business_name && v.business_name.trim()) || name || code;
+
   const { data: wallets } = await supabaseAdmin.from('wallets')
     .select('currency').eq('user_id', userId);
   const curs = (wallets || []).map((w: any) => String(w.currency || 'GNF'));
   const currency = curs.includes('GNF') ? 'GNF' : (curs[0] || 'GNF');
 
-  res.json({ success: true, data: { found: true, code, name, currency } });
+  res.json({ success: true, data: {
+    found: true, code, name: displayName, owner_name: name,
+    logo: v.logo_url || null, city: v.city || null, currency,
+  } });
 });
 
 export default router;

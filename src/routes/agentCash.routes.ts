@@ -819,6 +819,39 @@ router.post('/pdg/unsuspend/:agentId', verifyJWT, async (req: AuthenticatedReque
   res.json({ success: true, data });
 });
 
+// ── Désactivation VOLONTAIRE (sortie propre du rôle cash) — DISTINCTE de la suspension ─
+// Solde de tout compte atomique (agent_cash_deactivate) : restitue float+commissions, paye les
+// pending (sinon bloque), garde les lots (option A), pose des drapeaux cash_deactivated_* distincts.
+router.post('/pdg/deactivate/:agentId', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const allowed = (await isPdg(req.user!.id)) || (await canActivateCashAgents(req.user!.id));
+  if (!allowed) { res.status(403).json({ success: false, error: 'Réservé au PDG et aux agents de gestion autorisés.' }); return; }
+  const reason = String(req.body?.reason || 'desactivation_pdg').trim();
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_deactivate', { p_agent_id: req.params.agentId, p_actor: req.user!.id, p_reason: reason });
+  if (error) { const e = mapRpcError(error.message); logger.warn(`[agent-cash/deactivate] ${error.message}`); res.status(e.code).json({ success: false, error: e.error }); return; }
+  logger.info(`[agent-cash] ${req.user!.id} a désactivé (sortie propre) l'agent ${req.params.agentId}`);
+  res.json({ success: true, data });
+});
+
+// Aperçu avant AUTO-désactivation : ce qui sera restitué / ce qui est perdu (écran de confirmation).
+router.get('/self/deactivate/preview', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_deactivate_preview', { p_agent_id: agent.id });
+  if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+  res.json({ success: true, data });
+});
+
+// L'agent lui-même se retire (« s'il ne veut plus »). MÊME fonction SQL. Confirmation forte exigée.
+router.post('/self/deactivate', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const agent = await getAgentForUser(req.user!.id);
+  if (!agent) { res.status(403).json({ success: false, error: 'Compte agent introuvable' }); return; }
+  if (req.body?.confirm !== true) { res.status(400).json({ success: false, error: 'Confirmation explicite requise' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('agent_cash_deactivate', { p_agent_id: agent.id, p_actor: req.user!.id, p_reason: 'auto_desactivation' });
+  if (error) { const e = mapRpcError(error.message); logger.warn(`[agent-cash/self-deactivate] ${error.message}`); res.status(e.code).json({ success: false, error: e.error }); return; }
+  logger.info(`[agent-cash] agent ${agent.id} s'est auto-désactivé`);
+  res.json({ success: true, data });
+});
+
 // ── Activateurs (PDG) : lister les agents de gestion + accorder/révoquer la permission ─
 router.get('/pdg/activators', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (!(await isPdg(req.user!.id))) { res.status(403).json({ success: false, error: 'PDG uniquement' }); return; }

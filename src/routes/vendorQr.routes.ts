@@ -10,6 +10,8 @@ import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { paymentRateLimit } from '../middlewares/routeRateLimiter.js';
+import { truncateRef } from '../utils/qrPayment.js';
+import { maskCivilName, isEnumBlocked, recordMiss, recordHit } from '../utils/payTargetGuard.js';
 
 const router = Router();
 
@@ -88,46 +90,90 @@ router.get('/resolve/:token', paymentRateLimit, async (req: Request, res: Respon
 });
 
 // GET /api/v2/vendor-qr/pay-target/:code — PUBLIC. Résout un code (agent_code ou public_id) →
-// destinataire du paiement (nom + devise), pour la page de scan /p/:code. Aucune donnée sensible.
-router.get('/pay-target/:code', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
-  const code = String(req.params.code || '').trim();
-  if (!/^[A-Za-z0-9-]{3,40}$/.test(code)) { res.json({ success: true, data: { found: false } }); return; }
+// destinataire du paiement (nom SELON le type + devise), pour la page de scan /p/:code.
+//
+// 🔒 Anti-annuaire : les `public_id` sont SÉQUENTIELS. On n'expose donc JAMAIS le nom civil complet
+// d'un particulier (→ « Prénom I. »), jamais d'email/téléphone/public_id/soldes. La réponse
+// « non trouvé » est à FORME et TEMPS constants (pas d'oracle de format) et un balayage bloque l'IP.
+const PAY_TARGET_FLOOR_MS = 160; // plancher de temps uniforme (miss ≈ hit, pas d'oracle)
 
-  let name: string | null = null;
+function clientIp(req: Request): string {
+  return String(req.ip || (req.socket && req.socket.remoteAddress) || 'unknown');
+}
+async function padTo(startedAt: number, floorMs: number): Promise<void> {
+  const elapsed = Date.now() - startedAt;
+  if (elapsed < floorMs) await new Promise((r) => setTimeout(r, floorMs - elapsed));
+}
+async function defaultCurrencyForUser(userId: string): Promise<string> {
+  // UNE seule devise (jamais la liste des wallets détenus).
+  const { data: wallets } = await supabaseAdmin.from('wallets').select('currency').eq('user_id', userId);
+  const curs = (wallets || []).map((w: { currency?: string }) => String(w.currency || 'GNF'));
+  return curs.includes('GNF') ? 'GNF' : (curs[0] || 'GNF');
+}
+
+router.get('/pay-target/:code', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
+  const startedAt = Date.now();
+  const ip = clientIp(req);
+  const rawCode = String(req.params.code || '').trim();
+
+  const respondNotFound = async (): Promise<void> => {
+    recordMiss(ip, Date.now());
+    logger.info(`[pay-target] miss ip=${ip} code=${truncateRef(rawCode)}`);
+    await padTo(startedAt, PAY_TARGET_FLOOR_MS);
+    res.json({ success: true, data: { found: false } });
+  };
+
+  // Balayage détecté → blocage temporaire de l'IP (même forme/temps qu'un « non trouvé »).
+  if (isEnumBlocked(ip, startedAt)) {
+    logger.warn(`[pay-target] IP bloquée (balayage suspecté) ip=${ip}`);
+    await padTo(startedAt, PAY_TARGET_FLOOR_MS);
+    res.status(429).json({ success: false, error: 'Trop de tentatives. Réessayez plus tard.' });
+    return;
+  }
+  if (!/^[A-Za-z0-9-]{3,40}$/.test(rawCode)) { await respondNotFound(); return; }
+
+  // Résolution : agent_code (fonction publique) puis public_id/custom_id (profil).
   let userId: string | null = null;
+  let agentName: string | null = null;
+  let firstName = ''; let lastName = '';
 
   const { data: agent } = await supabaseAdmin.from('agents_management')
-    .select('user_id, name').eq('agent_code', code.toUpperCase()).maybeSingle();
-  if (agent) { name = (agent as any).name; userId = (agent as any).user_id; }
+    .select('user_id, name').eq('agent_code', rawCode.toUpperCase()).maybeSingle();
+  if (agent) { agentName = (agent as { name?: string }).name || null; userId = (agent as { user_id?: string }).user_id || null; }
 
   if (!userId) {
     const { data: prof } = await supabaseAdmin.from('profiles')
-      .select('id, first_name, last_name, public_id')
-      .or(`public_id.eq.${code},custom_id.eq.${code}`).maybeSingle();
+      .select('id, first_name, last_name')
+      .or(`public_id.eq.${rawCode},custom_id.eq.${rawCode}`).maybeSingle();
     if (prof) {
-      const p = prof as any;
-      name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim() || p.public_id || code;
-      userId = p.id;
+      const p = prof as { id: string; first_name?: string; last_name?: string };
+      userId = p.id; firstName = p.first_name || ''; lastName = p.last_name || '';
     }
   }
 
-  if (!userId) { res.json({ success: true, data: { found: false } }); return; }
+  if (!userId) { await respondNotFound(); return; }
 
-  // Nom de la BOUTIQUE en priorité (pas le nom du propriétaire) + logo + ville.
   const { data: vendor } = await supabaseAdmin.from('vendors')
     .select('business_name, logo_url, city').eq('user_id', userId).maybeSingle();
   const v = (vendor ?? {}) as { business_name?: string; logo_url?: string; city?: string };
-  const displayName = (v.business_name && v.business_name.trim()) || name || code;
+  const currency = await defaultCurrencyForUser(userId);
 
-  const { data: wallets } = await supabaseAdmin.from('wallets')
-    .select('currency').eq('user_id', userId);
-  const curs = (wallets || []).map((w: any) => String(w.currency || 'GNF'));
-  const currency = curs.includes('GNF') ? 'GNF' : (curs[0] || 'GNF');
+  recordHit(ip, Date.now());
+  logger.info(`[pay-target] hit ip=${ip} code=${truncateRef(rawCode)}`);
+  await padTo(startedAt, PAY_TARGET_FLOOR_MS);
 
-  res.json({ success: true, data: {
-    found: true, code, name: displayName, owner_name: name,
-    logo: v.logo_url || null, city: v.city || null, currency,
-  } });
+  if (v.business_name && v.business_name.trim()) {
+    // VITRINE : boutique existante → nom + logo + ville en clair (donnée publique).
+    res.json({ success: true, data: { found: true, kind: 'vendor', name: v.business_name.trim(), logo: v.logo_url || null, city: v.city || null, currency } });
+    return;
+  }
+  if (agentName) {
+    // AGENT : nom de fonction publique en clair.
+    res.json({ success: true, data: { found: true, kind: 'agent', name: agentName, logo: null, city: null, currency } });
+    return;
+  }
+  // PARTICULIER : nom MASQUÉ « Prénom I. » — vérifier le bénéficiaire sans constituer d'annuaire.
+  res.json({ success: true, data: { found: true, kind: 'user', name: maskCivilName(firstName, lastName), logo: null, city: null, currency } });
 });
 
 export default router;

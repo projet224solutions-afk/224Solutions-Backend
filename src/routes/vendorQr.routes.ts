@@ -153,26 +153,20 @@ router.get('/pay-target/:code', paymentRateLimit, async (req: Request, res: Resp
 
   if (!userId) { await respondNotFound(); return; }
 
-  const { data: vendor } = await supabaseAdmin.from('vendors')
-    .select('business_name, logo_url, city').eq('user_id', userId).maybeSingle();
-  const v = (vendor ?? {}) as { business_name?: string; logo_url?: string; city?: string };
   const currency = await defaultCurrencyForUser(userId);
-
   recordHit(ip, Date.now());
   logger.info(`[pay-target] hit ip=${ip} code=${truncateRef(rawCode)}`);
   await padTo(startedAt, PAY_TARGET_FLOOR_MS);
 
-  if (v.business_name && v.business_name.trim()) {
-    // VITRINE : boutique existante → nom + logo + ville en clair (donnée publique).
-    res.json({ success: true, data: { found: true, kind: 'vendor', name: v.business_name.trim(), logo: v.logo_url || null, city: v.city || null, currency } });
-    return;
-  }
   if (agentName) {
     // AGENT : nom de fonction publique en clair.
     res.json({ success: true, data: { found: true, kind: 'agent', name: agentName, logo: null, city: null, currency } });
     return;
   }
-  // PARTICULIER : nom MASQUÉ « Prénom I. » — vérifier le bénéficiaire sans constituer d'annuaire.
+  // PARTICULIER (y compris le profil personnel d'un vendeur) : nom MASQUÉ « Prénom I. ».
+  // DÉCISION Thierno : la VITRINE d'un vendeur (nom de boutique) n'est exposée QUE par son token
+  // OPAQUE RÉVOCABLE /p/<reference> — jamais par un code devinable/permanent. Un code qui tombe sur
+  // un vendeur ne révèle donc PAS la boutique ; le paiement P2P vers la personne reste possible (masqué).
   res.json({ success: true, data: { found: true, kind: 'user', name: maskCivilName(firstName, lastName), logo: null, city: null, currency } });
 });
 

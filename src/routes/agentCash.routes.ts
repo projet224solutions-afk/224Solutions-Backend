@@ -701,8 +701,47 @@ router.get('/me/commissions', verifyJWT, async (req: AuthenticatedRequest, res: 
   const walletCurs = (aw || []).map((w: any) => String(w.currency || 'GNF'));
   const agentCurrency = walletCurs.includes('GNF') ? 'GNF' : (walletCurs[0] || 'GNF');
 
-  const { data: stats } = await supabaseAdmin.rpc('agent_cash_commission_stats', { p_agent_id: agent.id });
-  res.json({ success: true, data: { stats: stats || { today: 0, month: 0, total: 0 }, agent_currency: agentCurrency, items, page, has_more: hasMore } });
+  // Stats commissions PAR DEVISE (jamais un total additionnant des devises différentes — interdit).
+  // La RPC agent_cash_commission_stats fait un sum(amount) TOUTES DEVISES confondues → chiffre faux
+  // (ex. 250 GNF + 269 XOF = « 519 GNF »). On agrège ici par devise (volume agent-cash minime).
+  const { data: allLegs } = await supabaseAdmin.from('agent_cash_ledger')
+    .select('amount, currency, created_at')
+    .eq('agent_id', agent.id).eq('leg', 'agent_commission_credit').eq('status', 'completed')
+    .limit(10000);
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const monthStr = new Date().toISOString().slice(0, 7);
+  const byCur: Record<string, { currency: string; today: number; month: number; total: number }> = {};
+  for (const l of (allLegs || []) as any[]) {
+    const cur = String(l.currency || 'GNF');
+    const amt = Number(l.amount || 0);
+    const created = String(l.created_at || '');
+    if (!byCur[cur]) byCur[cur] = { currency: cur, today: 0, month: 0, total: 0 };
+    byCur[cur].total += amt;
+    if (created.slice(0, 7) === monthStr) byCur[cur].month += amt;
+    if (created.slice(0, 10) === todayStr) byCur[cur].today += amt;
+  }
+  const statsByCurrency = Object.values(byCur).sort((a, b) => a.currency.localeCompare(b.currency));
+
+  // Équivalent ≈ dans la devise ACTUELLE du wallet, calculé au taux du JOUR (marqué ≈ côté UI).
+  // Un taux par devise source (≤ quelques appels), puis multiplication.
+  const otherCurs = [...new Set(items.filter((i) => i.currency !== agentCurrency).map((i) => i.currency))];
+  const rateFor: Record<string, number> = {};
+  for (const cur of otherCurs) {
+    const { data: fx } = await supabaseAdmin.rpc('_acash_fx', { p_amount: 1_000_000, p_from: cur, p_to: agentCurrency });
+    const conv = Number((fx as any)?.converted || 0);
+    if (conv > 0) rateFor[cur] = conv / 1_000_000;
+  }
+  const itemsOut = items.map((i) => (
+    i.currency !== agentCurrency && rateFor[i.currency]
+      ? { ...i, approx_amount: Math.round(i.commission_amount * rateFor[i.currency]), approx_currency: agentCurrency }
+      : i
+  ));
+
+  res.json({ success: true, data: {
+    stats_by_currency: statsByCurrency,      // [{ currency, today, month, total }] — total par devise, JAMAIS additionné
+    agent_currency: agentCurrency,
+    items: itemsOut, page, has_more: hasMore,
+  } });
 });
 
 // ── SUPERVISION PDG ──────────────────────────────────────────────────────────

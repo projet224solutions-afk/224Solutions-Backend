@@ -49,4 +49,38 @@ router.get('/resolve/:token', paymentRateLimit, async (req: Request, res: Respon
   res.json({ success: true, data });
 });
 
+// GET /api/v2/vendor-qr/pay-target/:code — PUBLIC. Résout un code (agent_code ou public_id) →
+// destinataire du paiement (nom + devise), pour la page de scan /p/:code. Aucune donnée sensible.
+router.get('/pay-target/:code', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
+  const code = String(req.params.code || '').trim();
+  if (!/^[A-Za-z0-9-]{3,40}$/.test(code)) { res.json({ success: true, data: { found: false } }); return; }
+
+  let name: string | null = null;
+  let userId: string | null = null;
+
+  const { data: agent } = await supabaseAdmin.from('agents_management')
+    .select('user_id, name').eq('agent_code', code.toUpperCase()).maybeSingle();
+  if (agent) { name = (agent as any).name; userId = (agent as any).user_id; }
+
+  if (!userId) {
+    const { data: prof } = await supabaseAdmin.from('profiles')
+      .select('id, first_name, last_name, public_id')
+      .or(`public_id.eq.${code},custom_id.eq.${code}`).maybeSingle();
+    if (prof) {
+      const p = prof as any;
+      name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim() || p.public_id || code;
+      userId = p.id;
+    }
+  }
+
+  if (!userId) { res.json({ success: true, data: { found: false } }); return; }
+
+  const { data: wallets } = await supabaseAdmin.from('wallets')
+    .select('currency').eq('user_id', userId);
+  const curs = (wallets || []).map((w: any) => String(w.currency || 'GNF'));
+  const currency = curs.includes('GNF') ? 'GNF' : (curs[0] || 'GNF');
+
+  res.json({ success: true, data: { found: true, code, name, currency } });
+});
+
 export default router;

@@ -23,7 +23,10 @@ router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): P
   if (!vid) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
   const { data, error } = await supabaseAdmin.rpc('vendor_qr_get_or_create', { p_vendor_id: vid });
   if (error) { res.status(400).json({ success: false, error: error.message }); return; }
-  res.json({ success: true, data });
+  const { data: v } = await supabaseAdmin.from('vendors')
+    .select('business_name, city, logo_url, vendor_code').eq('id', vid).maybeSingle();
+  const info = (v ?? {}) as { business_name?: string; city?: string; logo_url?: string; vendor_code?: string };
+  res.json({ success: true, data: { ...(data as object), business_name: info.business_name, city: info.city, logo: info.logo_url, vendor_code: info.vendor_code } });
 });
 
 // POST /api/v2/vendor-qr/me/regenerate — révoque l'ancien token (autocollant inerte) + nouveau.

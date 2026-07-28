@@ -14,6 +14,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { paymentRateLimit, authRateLimit } from '../middlewares/routeRateLimiter.js';
 import { verifyWalletPin, isPinSchemaAvailableForMoney } from '../services/walletPin.service.js';
 import { createNotification } from '../services/notification.service.js';
+import { normalizeQrRef } from '../utils/qrPayment.js';
 
 const router = Router();
 const newKey = () => crypto.randomUUID();
@@ -63,8 +64,11 @@ router.post('/vendor-qr', verifyJWT, async (req: AuthenticatedRequest, res: Resp
 
 // ── Client : résoudre un QR scanné → écran de confirmation ──
 router.get('/resolve', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const ref = String(req.query?.ref || '');
-  if (!ref) { res.status(400).json({ success: false, error: 'Référence manquante' }); return; }
+  // CHANTIER 0 : normaliser (URL canonique /p/<ref> OU référence brute). Non-paiement → message clair.
+  const raw = String(req.query?.ref || '');
+  if (!raw) { res.status(400).json({ success: false, error: 'Référence manquante' }); return; }
+  const ref = normalizeQrRef(raw);
+  if (!ref) { res.status(422).json({ success: false, error: "Ce QR n'est pas un QR de paiement" }); return; }
   const { data: qr } = await supabaseAdmin.from('vendor_payment_qr').select('vendor_id, kind, amount, status, expires_at').eq('reference', ref).maybeSingle();
   if (!qr || (qr as any).status !== 'active') { res.status(404).json({ success: false, error: 'QR invalide' }); return; }
   if ((qr as any).expires_at && new Date((qr as any).expires_at).getTime() < Date.now()) { res.status(409).json({ success: false, error: 'QR expiré' }); return; }
@@ -80,7 +84,7 @@ router.get('/resolve', verifyJWT, authRateLimit, async (req: AuthenticatedReques
 // ── Client : payer (PIN wallet requis) ──
 router.post('/pay', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const clientId = req.user!.id;
-  const ref = String(req.body?.reference || '');
+  const ref = normalizeQrRef(String(req.body?.reference || ''));   // CHANTIER 0 : URL ou référence brute
   const amount = req.body?.amount != null ? Number(req.body.amount) : undefined;
   const pin = String(req.body?.pin || '');
   if (!ref) { res.status(400).json({ success: false, error: 'QR manquant' }); return; }
@@ -116,8 +120,9 @@ router.post('/pay', verifyJWT, paymentRateLimit, async (req: AuthenticatedReques
 
 // ── Client : payer via Orange Money / MTN MoMo → délégué au flux payment_links existant ──
 router.post('/om-momo', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const ref = String(req.body?.reference || '');
+  const ref = normalizeQrRef(String(req.body?.reference || ''));
   const method = req.body?.payment_method === 'mtn_momo' ? 'mtn_momo' : 'orange_money';
+  if (!ref) { res.status(422).json({ success: false, error: "Ce QR n'est pas un QR de paiement" }); return; }
   const { data: qr } = await supabaseAdmin.from('vendor_payment_qr').select('vendor_id, amount').eq('reference', ref).maybeSingle();
   if (!qr) { res.status(404).json({ success: false, error: 'QR invalide' }); return; }
   const amount = Number(qr && (qr as any).amount) || Number(req.body?.amount);

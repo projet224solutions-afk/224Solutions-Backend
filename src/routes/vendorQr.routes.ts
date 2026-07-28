@@ -4,7 +4,6 @@
  * puis la page /p/<token> crée un paiement standard. Le vendeur est résolu par req.user.id.
  */
 import { Router, Request, Response } from 'express';
-import crypto from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
@@ -20,44 +19,42 @@ async function getVendorId(userId: string): Promise<string | null> {
   return (data as { id?: string } | null)?.id ?? null;
 }
 
-// Référence STATIQUE canonique du vendeur = celle du circuit wallet-pay (vendor_payment_qr).
-// SOURCE UNIQUE du token de paiement — aucun second token propriétaire. Get-or-create.
-async function getOrCreateStaticRef(vendorId: string): Promise<string | null> {
-  const { data: existing } = await supabaseAdmin.from('vendor_payment_qr')
-    .select('reference').eq('vendor_id', vendorId).eq('kind', 'static').eq('status', 'active').maybeSingle();
-  if (existing) return (existing as { reference: string }).reference;
-  const reference = crypto.randomBytes(24).toString('base64url');
-  const { data, error } = await supabaseAdmin.from('vendor_payment_qr')
-    .insert({ vendor_id: vendorId, kind: 'static', reference }).select('reference').single();
-  if (error) { logger.error(`[vendor-qr] insert static failed: ${error.message}`); return null; }
-  return (data as { reference: string }).reference;
+// Nom commercial du prestataire (jamais le nom civil). Renvoie null si pas prestataire.
+async function providerName(userId: string): Promise<string | null> {
+  const { data } = await supabaseAdmin.from('professional_services')
+    .select('business_name').eq('user_id', userId).order('created_at', { ascending: true }).limit(1).maybeSingle();
+  return (data as { business_name?: string } | null)?.business_name ?? null;
 }
 
-// GET /api/v2/vendor-qr/me — token QR permanent du vendeur (= référence wallet-pay statique,
-// créée au 1er appel, stable ensuite) + profil boutique pour l'affichage/PDF.
+// GET /api/v2/vendor-qr/me — token QR permanent (= référence statique liée au WALLET du propriétaire,
+// via owner_user_id) + profil pour l'affichage/PDF. Vendeurs ET prestataires.
 router.get('/me', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const vid = await getVendorId(req.user!.id);
-  if (!vid) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
-  const token = await getOrCreateStaticRef(vid);
-  if (!token) { res.status(500).json({ success: false, error: 'QR indisponible' }); return; }
-  const { data: v } = await supabaseAdmin.from('vendors')
-    .select('business_name, city, logo_url, vendor_code').eq('id', vid).maybeSingle();
-  const info = (v ?? {}) as { business_name?: string; city?: string; logo_url?: string; vendor_code?: string };
-  res.json({ success: true, data: { token, business_name: info.business_name, city: info.city, logo: info.logo_url, vendor_code: info.vendor_code } });
+  const userId = req.user!.id;
+  const vid = await getVendorId(userId);
+  const provName = vid ? null : await providerName(userId);
+  if (!vid && !provName) { res.status(403).json({ success: false, error: 'Réservé aux comptes vendeur ou prestataire' }); return; }
+  const { data: token, error } = await supabaseAdmin.rpc('vendor_payment_qr_ensure', { p_owner_user_id: userId, p_vendor_id: vid });
+  if (error || !token) { res.status(500).json({ success: false, error: 'QR indisponible' }); return; }
+  let business_name: string | undefined = provName ?? undefined; let city: string | null = null; let logo: string | null = null; let vendor_code: string | undefined;
+  if (vid) {
+    const { data: v } = await supabaseAdmin.from('vendors')
+      .select('business_name, city, logo_url, vendor_code').eq('id', vid).maybeSingle();
+    const info = (v ?? {}) as { business_name?: string; city?: string; logo_url?: string; vendor_code?: string };
+    business_name = info.business_name; city = info.city ?? null; logo = info.logo_url ?? null; vendor_code = info.vendor_code;
+  }
+  res.json({ success: true, data: { token, business_name, city, logo, vendor_code } });
 });
 
-// POST /api/v2/vendor-qr/me/regenerate — expire l'ancienne référence (autocollant inerte) + nouvelle.
+// POST /api/v2/vendor-qr/me/regenerate — expire l'actif + crée un nouveau token, ATOMIQUE (RPC).
 router.post('/me/regenerate', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const vid = await getVendorId(req.user!.id);
-  if (!vid) { res.status(403).json({ success: false, error: 'Compte vendeur introuvable' }); return; }
-  await supabaseAdmin.from('vendor_payment_qr')
-    .update({ status: 'expired' }).eq('vendor_id', vid).eq('kind', 'static').eq('status', 'active');
-  const reference = crypto.randomBytes(24).toString('base64url');
-  const { data, error } = await supabaseAdmin.from('vendor_payment_qr')
-    .insert({ vendor_id: vid, kind: 'static', reference }).select('reference').single();
-  if (error) { res.status(500).json({ success: false, error: 'Échec de la régénération' }); return; }
-  logger.info(`[vendor-qr] ${req.user!.id} a régénéré son QR (vendor ${vid})`);
-  res.json({ success: true, data: { token: (data as { reference: string }).reference } });
+  const userId = req.user!.id;
+  const vid = await getVendorId(userId);
+  const provName = vid ? null : await providerName(userId);
+  if (!vid && !provName) { res.status(403).json({ success: false, error: 'Réservé aux comptes vendeur ou prestataire' }); return; }
+  const { data: token, error } = await supabaseAdmin.rpc('vendor_payment_qr_regenerate', { p_owner_user_id: userId });
+  if (error || !token) { res.status(500).json({ success: false, error: 'Échec de la régénération' }); return; }
+  logger.info(`[vendor-qr] ${userId} a régénéré son QR (owner)`);
+  res.json({ success: true, data: { token } });
 });
 
 // GET /api/v2/vendor-qr/resolve/:token — PUBLIC (page de scan, aucun compte requis). Rate-limité.

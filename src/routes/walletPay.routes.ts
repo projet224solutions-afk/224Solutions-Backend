@@ -31,7 +31,8 @@ function mapErr(msg: string): { code: number; error: string } {
   if (m.includes('QR_EXPIRE')) return { code: 409, error: 'QR expiré — demandez au vendeur d\'en régénérer un.' };
   if (m.includes('SOLDE_INSUFFISANT')) return { code: 409, error: 'Solde insuffisant.' };
   if (m.includes('MONTANT_INVALIDE')) return { code: 400, error: 'Montant invalide.' };
-  if (m.includes('WALLET_INTROUVABLE') || m.includes('VENDEUR_INTROUVABLE')) return { code: 404, error: 'Compte introuvable.' };
+  if (m.includes('WALLET_INTROUVABLE') || m.includes('VENDEUR_INTROUVABLE') || m.includes('BENEFICIAIRE_INTROUVABLE')) return { code: 404, error: 'Compte introuvable.' };
+  if (m.includes('FX_INDISPONIBLE')) return { code: 409, error: 'Conversion de devise momentanément indisponible — réessayez plus tard.' };
   return { code: 400, error: msg || 'Paiement refusé.' };
 }
 
@@ -79,6 +80,21 @@ router.get('/resolve', verifyJWT, authRateLimit, async (req: AuthenticatedReques
     kind: (qr as any).kind, amount: (qr as any).amount,
     client_fee_percent: (cfg as any)?.qr_wallet_client_fee_percent ?? 0,
   } });
+});
+
+// ── Client : DEVIS avant PIN (BLOC 5) — montant payeur + équivalent bénéficiaire + frais + total ──
+// Le payeur voit les DEUX montants (sa devise ≈ celle du vendeur), les frais, le total débité, et
+// si son solde suffit — AVANT de saisir le PIN. Taux malsain → FX_INDISPONIBLE (refus propre).
+router.get('/quote', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const ref = normalizeQrRef(String(req.query?.ref || ''));
+  if (!ref) { res.status(422).json({ success: false, error: "Ce QR n'est pas un QR de paiement" }); return; }
+  const amount = req.query?.amount != null ? Number(req.query.amount) : null;
+  if (amount != null && !posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+  const { data, error } = await supabaseAdmin.rpc('wallet_pay_quote', {
+    p_client_user_id: req.user!.id, p_qr_reference: ref, p_amount: amount,
+  });
+  if (error) { const e = mapErr(error.message); res.status(e.code).json({ success: false, error: e.error }); return; }
+  res.json({ success: true, data });
 });
 
 // ── Client : payer (PIN wallet requis) ──

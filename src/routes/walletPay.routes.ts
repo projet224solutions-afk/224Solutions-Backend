@@ -49,7 +49,7 @@ router.post('/vendor-qr', verifyJWT, async (req: AuthenticatedRequest, res: Resp
     if (existing) { res.json({ success: true, data: existing }); return; }
     const reference = crypto.randomBytes(24).toString('base64url');
     const { data, error } = await supabaseAdmin.from('vendor_payment_qr')
-      .insert({ vendor_id: vendor.id, kind: 'static', reference }).select('reference, kind, amount').single();
+      .insert({ vendor_id: vendor.id, owner_user_id: vendor.user_id, kind: 'static', reference }).select('reference, kind, amount').single();
     if (error) { res.status(500).json({ success: false, error: 'QR indisponible' }); return; }
     res.json({ success: true, data }); return;
   }
@@ -57,7 +57,7 @@ router.post('/vendor-qr', verifyJWT, async (req: AuthenticatedRequest, res: Resp
   if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
   const reference = crypto.randomBytes(24).toString('base64url');
   const { data, error } = await supabaseAdmin.from('vendor_payment_qr')
-    .insert({ vendor_id: vendor.id, kind: 'dynamic', amount, reference, expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString() })
+    .insert({ vendor_id: vendor.id, owner_user_id: vendor.user_id, kind: 'dynamic', amount, reference, expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString() })
     .select('reference, kind, amount, expires_at').single();
   if (error) { res.status(500).json({ success: false, error: 'QR indisponible' }); return; }
   res.json({ success: true, data });

@@ -130,6 +130,9 @@ router.post("/stripe", async (req: Request, res: Response) => {
 });
 
 router.post("/paypal", async (req: Request, res: Response) => {
+  // ⛔ GELÉ par décision du 29/07/2026 — PayPal retiré. Webhook neutralisé (503) ; code conservé (mort) en dessous.
+  return res.status(503).json({ success: false, error: "PayPal est gelé (décision 29/07/2026).", error_code: "PAYPAL_FROZEN" });
+  // eslint-disable-next-line no-unreachable
   try {
     const payload = req.body || {};
     const eventType = payload.event_type;

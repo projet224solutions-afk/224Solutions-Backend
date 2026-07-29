@@ -14,6 +14,8 @@ import './config/load-env.js';
  */
 
 import crypto from 'crypto';
+import { readFileSync } from 'node:fs';
+import { resolve as pathResolve } from 'node:path';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -65,6 +67,7 @@ import smsRoutes from './routes/sms.routes.js';
 import walletPayRoutes from './routes/walletPay.routes.js';
 import webhooksDjomyRoutes from './routes/webhooksDjomy.routes.js';
 import webhooksCinetpayRoutes from './routes/webhooksCinetpay.routes.js';
+import webhooksWaveRoutes from './routes/webhooksWave.routes.js';
 import documentsRoutes from './routes/documents.routes.js';
 import productRoutes from './routes/products.routes.js';
 import orderRoutes from './routes/orders.routes.js';
@@ -215,6 +218,8 @@ app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use('/edge-functions/webhooks/stripe', express.raw({ type: 'application/json' }));
 // Djomy (OM/MoMo) webhook needs raw body for HMAC signature verification
 app.use('/api/v2/webhooks/djomy', express.raw({ type: 'application/json' }));
+// Wave webhook needs raw body for HMAC signature verification (Wave-Signature)
+app.use('/api/v2/webhooks/wave', express.raw({ type: 'application/json' }));
 
 // Standard JSON parser for everything else
 app.use(express.json({ limit: '10mb' }));
@@ -264,23 +269,48 @@ app.use('/health', healthRoutes);
 app.use('/healthz', healthRoutes);
 app.use('/healthz.json', healthRoutes);
 
-// Version (public) — diagnostic « qu'est-ce qui tourne RÉELLEMENT en prod ».
+// Version (public) — diagnostic « qu'est-ce qui tourne RÉELLEMENT ».
 // Expose le SHA du commit déployé + l'heure de boot : permet de vérifier après un deploy
 // que le code servi correspond bien à main (fin des « rien ne change »). Aucun secret.
 const BOOTED_AT = new Date().toISOString();
-app.get('/api/version', (_req, res) => {
-  res.json({
+
+// Repli SHA lu depuis .git au boot : en local, les variables GIT_* ne sont pas posées ;
+// on lit alors HEAD (et la ref pointée) pour afficher un vrai SHA plutôt que « unknown ».
+// En prod, si le déploiement fournit GIT_COMMIT_SHA, il a la priorité (voir plus bas).
+function readGitShaFromDisk(): { commit: string | null; branch: string | null } {
+  try {
+    const head = readFileSync(pathResolve(process.cwd(), '.git/HEAD'), 'utf8').trim();
+    const refMatch = head.match(/^ref:\s*(.+)$/);
+    if (!refMatch) return { commit: head || null, branch: null }; // HEAD détaché = SHA direct
+    const ref = refMatch[1];
+    const branch = ref.replace(/^refs\/heads\//, '');
+    const sha = readFileSync(pathResolve(process.cwd(), '.git', ref), 'utf8').trim();
+    return { commit: sha || null, branch: branch || null };
+  } catch {
+    return { commit: null, branch: null }; // pas de .git (prod déployée sans dépôt) → on retombera sur env/unknown
+  }
+}
+const GIT_FROM_DISK = readGitShaFromDisk();
+
+function versionPayload() {
+  return {
     success: true,
     data: {
       commit: process.env.GIT_COMMIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_SHA
-        || process.env.COMMIT_SHA || process.env.SOURCE_VERSION || process.env.GIT_COMMIT || 'unknown',
-      branch: process.env.GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF || null,
+        || process.env.COMMIT_SHA || process.env.SOURCE_VERSION || process.env.GIT_COMMIT
+        || GIT_FROM_DISK.commit || 'unknown',
+      branch: process.env.GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF || GIT_FROM_DISK.branch || null,
       builtAt: process.env.BUILD_TIME || process.env.BUILD_TIMESTAMP || null,
       bootedAt: BOOTED_AT,
       environment: process.env.NODE_ENV || 'development',
       node: process.version,
     },
-  });
+  };
+}
+// /api/version (historique) + /api/v2/version (garde de version front↔back). Même charge utile.
+app.get('/api/version', (_req, res) => res.json(versionPayload()));
+app.get('/api/v2/version', (_req, res) => {
+  res.json(versionPayload());
 });
 
 // Migrations (admin, applies database changes)
@@ -324,6 +354,7 @@ app.use('/api/v2/sms', smsRoutes);
 app.use('/api/v2/wallet-pay', walletPayRoutes);
 app.use('/api/v2/webhooks/djomy', webhooksDjomyRoutes);
 app.use('/api/v2/webhooks/cinetpay', webhooksCinetpayRoutes);
+app.use('/api/v2/webhooks/wave', webhooksWaveRoutes);
 app.use('/api/auth/failover', authFailoverRoutes);
 app.use('/api/v2/realtime', realtimeRoutes);
 app.use('/api/v2/live', liveRoutes);

@@ -39,15 +39,10 @@ router.post("/chapchappay-status", (_req, res) => notConfigured(res, "CHAPCHAP_N
 router.post("/chapchappay-webhook", (_req, res) => notConfigured(res, "CHAPCHAP_WEBHOOK_NOT_CONFIGURED"));
 
 // ── PayPal ────────────────────────────────────────────────────────────────────
-// client-id : config PUBLIQUE (pas un secret). Renvoie la vraie valeur env ; 503 si absente
-// (jamais de "sandbox-client" bidon qui laisserait croire PayPal opérationnel).
-const handlePayPalClientId = (_req: Request, res: Response) => {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  if (!clientId) return notConfigured(res, "PAYPAL_NOT_CONFIGURED");
-  return res.json({ success: true, client_id: clientId });
-};
-router.get("/paypal-client-id", handlePayPalClientId);
-router.post("/paypal-client-id", handlePayPalClientId);
+// ⛔ GELÉ par décision du 29/07/2026 — PayPal retiré de tous les écrans. TOUTES les routes PayPal
+// répondent 503 (aucune ne doit fonctionner), y compris client-id (plus aucun écran ne le demande).
+router.get("/paypal-client-id", (_req, res) => notConfigured(res, "PAYPAL_FROZEN"));
+router.post("/paypal-client-id", (_req, res) => notConfigured(res, "PAYPAL_FROZEN"));
 
 router.post("/paypal-deposit", (_req, res) => notConfigured(res, "PAYPAL_NOT_CONFIGURED"));
 router.post("/paypal-withdrawal", (_req, res) => notConfigured(res, "PAYPAL_NOT_CONFIGURED"));

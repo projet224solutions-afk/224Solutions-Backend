@@ -19,6 +19,7 @@ import { normalizeQrRef } from '../utils/qrPayment.js';
 import { initiatePayin, djomyConfigured, type DjomyOperator } from '../services/djomy.service.js';
 import { resolveProvider, resolveZone, type PayMethod } from '../services/paymentRouter.service.js';
 import { cinetpayConfigured, initiatePayment as cinetpayInitiate } from '../services/cinetpay.service.js';
+import { waveConfigured, initiateCheckout as waveInitiate } from '../services/wave.service.js';
 
 const router = Router();
 const newKey = () => crypto.randomUUID();
@@ -221,6 +222,7 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
   const cardAvailable = zone === 'west' ? !!process.env.STRIPE_SECRET_KEY
     : zone === 'africa' ? cinetpayConfigured() : false;
   const momoAvailable = zone === 'africa' ? djomyConfigured() : false;
+  const waveAvailable = zone === 'africa' ? waveConfigured() : false; // Wave = Afrique uniquement, fail-closed sans clé
   res.json({ success: true, data: {
     name: r.name, city: r.city, logo: r.logo, currency: r.currency,
     kind: r.q.kind, amount: r.q.amount ?? null,
@@ -228,6 +230,7 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
     zone: zone ?? null,
     card_available: cardAvailable,
     momo_available: momoAvailable,   // Orange Money / MTN MoMo via Djomy (zone Afrique, sans compte)
+    wave_available: waveAvailable,   // Wave (zone Afrique, sans compte) — visible seulement si clé posée
   } });
 });
 
@@ -270,6 +273,34 @@ router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res:
       metadata: { qr_reference: ref, zone: decision.zone },
     });
     res.json({ success: true, data: { reference: merchantRef, status: 'pending', payment_url: init.paymentUrl, amount, currency: r.currency, vendor_name: r.name, method } });
+    return;
+  }
+
+  // ── Rail WAVE (Afrique de l'Ouest) — sans compte : session hébergée (redirection wave_launch_url).
+  //    Fail-closed : sans clé → 503, jamais de faux succès. NE CRÉDITE RIEN : crédit vendeur
+  //    UNIQUEMENT au webhook Wave vérifié (settle_qr_payment, helper unique des 3 rails). ──
+  if (decision.provider === 'wave') {
+    if (!waveConfigured()) { res.status(503).json({ success: false, error: 'Wave momentanément indisponible dans cette zone.', error_code: 'WAVE_NOT_CONFIGURED' }); return; }
+    const amount = r.q.kind === 'dynamic' ? Number(r.q.amount) : Number(req.body?.amount);
+    if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+    const merchantRef = `qr_${ref}_${Date.now()}`;
+    const apiBase = process.env.PUBLIC_API_URL?.trim() || 'https://224solution.net';
+    const webBase = process.env.PUBLIC_WEB_URL?.trim() || 'https://224solution.net';
+    const init = await waveInitiate({
+      clientReference: merchantRef, amount, currency: r.currency,
+      successUrl: `${webBase}/p/${encodeURIComponent(ref)}`, errorUrl: `${webBase}/p/${encodeURIComponent(ref)}`,
+    });
+    if (!init.success || !init.waveLaunchUrl) {
+      res.status(502).json({ success: false, error: init.error || "Échec de l'initiation du paiement Wave", error_code: 'WAVE_INIT_FAILED' }); return;
+    }
+    // Ligne de SUIVI (aucun crédit) : provider_ref = sessionId Wave (retrouvé au webhook + checkStatus).
+    await supabaseAdmin.from('payment_transactions').insert({
+      provider: 'wave', provider_ref: init.sessionId, user_id: r.owner,
+      amount, currency: r.currency, status: 'pending',
+      description: `QR Wave — ${r.name}`,
+      metadata: { qr_reference: ref, merchant_ref: merchantRef, zone: decision.zone },
+    });
+    res.json({ success: true, data: { reference: init.sessionId, status: 'pending', payment_url: init.waveLaunchUrl, amount, currency: r.currency, vendor_name: r.name, method } });
     return;
   }
 

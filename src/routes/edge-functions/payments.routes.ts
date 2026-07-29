@@ -589,6 +589,9 @@ async function verifyPayPalWebhookSignature(
 }
 
 router.post("/paypal/webhook", async (req: Request, res: Response) => {
+  // ⛔ GELÉ par décision du 29/07/2026 — PayPal retiré. Webhook neutralisé (503) ; code conservé (mort) en dessous.
+  return res.status(503).json({ success: false, error: "PayPal est gelé (décision 29/07/2026).", error_code: "PAYPAL_FROZEN" });
+  // eslint-disable-next-line no-unreachable
   try {
     // ── 1. Vérification de signature PayPal (sinon n'importe qui peut injecter un paiement) ──
     const webhookId = process.env.PAYPAL_WEBHOOK_ID;

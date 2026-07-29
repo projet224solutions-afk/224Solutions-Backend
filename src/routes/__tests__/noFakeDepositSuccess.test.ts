@@ -79,4 +79,24 @@ describe('Garde statique : aucun faux succès de dépôt', () => {
     }
     expect(offenders, `Routes d'encaissement renvoyant un succès fictif :\n${offenders.join('\n')}`).toEqual([]);
   });
+
+  // ⛔ GEL PAYPAL (décision 29/07/2026) : toute route dont le chemin contient "paypal" DOIT être
+  // neutralisée (503 / notConfigured). Aucune route PayPal ne doit répondre autrement — si l'une
+  // recommence à faire un vrai travail (créer un ordre, capturer, renvoyer un client-id), CE TEST
+  // ÉCHOUE et bloque le build. Réactivation = décision contraire explicite + retrait de cette garde.
+  const PAYPAL_PATH = /paypal/i;
+  const FROZEN_EVIDENCE = /(notConfigured|PAYPAL_FROZEN|status\(\s*503)/;
+
+  it('toute route PayPal est gelée (503 / notConfigured), jamais un vrai flux', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      const src = fs.readFileSync(file, 'utf8');
+      for (const block of splitRouteBlocks(src)) {
+        if (!PAYPAL_PATH.test(block.pathLiteral)) continue;
+        if (FROZEN_EVIDENCE.test(block.body)) continue; // route gelée → conforme
+        offenders.push(`${path.relative(process.cwd(), file)} → route "${block.pathLiteral}"`);
+      }
+    }
+    expect(offenders, `Routes PayPal NON gelées (doivent renvoyer 503) :\n${offenders.join('\n')}`).toEqual([]);
+  });
 });

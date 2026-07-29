@@ -203,7 +203,13 @@ const getPayPalAccessToken = async (): Promise<string> => {
 };
 
 // 1. Create PayPal Order
-router.post("/create-paypal-order", validateBearerToken, async (req: any, res: any) => {
+// ⛔ GELÉ par décision du 29/07/2026 — PayPal retiré de tous les écrans. Route neutralisée (503) ;
+// le code de création d'ordre PayPal reste conservé en dessous (mort) pour réactivation éventuelle.
+router.post("/create-paypal-order", validateBearerToken, async (_req: any, res: any) => {
+  return res.status(503).json({ success: false, error: "PayPal est gelé (décision 29/07/2026).", error_code: "PAYPAL_FROZEN" });
+});
+// eslint-disable-next-line no-unused-vars
+const _createPaypalOrderFrozen = async (req: any, res: any) => {
   try {
     const { amount, currency = "GNF", seller_id, order_id, service_id, product_id, metadata } = req.body;
 
@@ -305,7 +311,8 @@ router.post("/create-paypal-order", validateBearerToken, async (req: any, res: a
     logger.error("create-paypal-order error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
-});
+};
+void _createPaypalOrderFrozen; // référencé pour éviter l'avertissement "défini mais non utilisé"
 
 // 2. Marketplace Escrow Payment (Stripe)
 router.post("/marketplace-escrow-payment", validateBearerToken, async (req: any, res: any) => {

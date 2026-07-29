@@ -11,8 +11,8 @@ import { logger } from '../config/logger.js';
  * Ce MÊME service sert aussi la résolution des RETRAITS (cohérence in/out par zone).
  */
 
-export type PayMethod = 'card' | 'orange_money' | 'mtn_momo';
-export type Provider = 'stripe' | 'djomy' | 'cinetpay';
+export type PayMethod = 'card' | 'orange_money' | 'mtn_momo' | 'wave';
+export type Provider = 'stripe' | 'djomy' | 'cinetpay' | 'wave';
 export interface RouterDecision {
   ok: boolean;
   provider?: Provider;
@@ -88,6 +88,7 @@ export async function resolveProvider(params: {
   } else { // africa
     if (method === 'orange_money' || method === 'mtn_momo') { provider = 'djomy'; reason = 'africa→djomy(momo)'; }
     else if (method === 'card') { provider = 'cinetpay'; reason = 'africa→cinetpay(card)'; }
+    else if (method === 'wave') { provider = 'wave'; reason = 'africa→wave'; } // Wave = Afrique uniquement (jamais west)
   }
 
   await journal({ beneficiaryUserId, method, countryCode, zone, provider, reason: provider ? reason : `REFUS:${reason}` });

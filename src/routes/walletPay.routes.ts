@@ -17,10 +17,14 @@ import { verifyWalletPin, isPinSchemaAvailableForMoney } from '../services/walle
 import { createNotification } from '../services/notification.service.js';
 import { normalizeQrRef } from '../utils/qrPayment.js';
 import { initiatePayin, djomyConfigured, type DjomyOperator } from '../services/djomy.service.js';
+import { resolveProvider, resolveZone, type PayMethod } from '../services/paymentRouter.service.js';
 
 const router = Router();
 const newKey = () => crypto.randomUUID();
 const posInt = (v: any) => Number.isFinite(Number(v)) && Number(v) > 0 && Number.isInteger(Number(v));
+// Carte zone Afrique = CinetPay (BLOC 1 à venir). Tant que le service n'est pas branché → false
+// (fail-closed) pour rester cohérent avec la route /pay qui renvoie 503 CINETPAY_NOT_CONFIGURED.
+const cinetpayConfigured = () => false;
 
 async function vendorForUser(userId: string) {
   const { data } = await supabaseAdmin.from('vendors').select('id, user_id, business_name').eq('user_id', userId).maybeSingle();
@@ -214,12 +218,18 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
   const r = await resolvePublicQr(ref);
   if (!r) { res.status(404).json({ success: false, error: 'QR introuvable, inactif ou expiré' }); return; }
   const { data: cfg } = await supabaseAdmin.from('wallet_pay_config').select('qr_wallet_client_fee_percent').eq('is_active', true).maybeSingle();
+  // Rails proposés = ceux de la ZONE DU BÉNÉFICIAIRE (west→carte Stripe ; africa→momo Djomy + carte CinetPay).
+  const zone = await resolveZone(r.owner);
+  const cardAvailable = zone === 'west' ? !!process.env.STRIPE_SECRET_KEY
+    : zone === 'africa' ? cinetpayConfigured() : false;
+  const momoAvailable = zone === 'africa' ? djomyConfigured() : false;
   res.json({ success: true, data: {
     name: r.name, city: r.city, logo: r.logo, currency: r.currency,
     kind: r.q.kind, amount: r.q.amount ?? null,
     fee_percent: Number((cfg as { qr_wallet_client_fee_percent?: number } | null)?.qr_wallet_client_fee_percent ?? 0),
-    card_available: !!process.env.STRIPE_SECRET_KEY,
-    momo_available: djomyConfigured(),   // Orange Money / MTN MoMo via Djomy (sans compte)
+    zone: zone ?? null,
+    card_available: cardAvailable,
+    momo_available: momoAvailable,   // Orange Money / MTN MoMo via Djomy (zone Afrique, sans compte)
   } });
 });
 
@@ -227,13 +237,27 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
 router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
   const ref = normalizeQrRef(String(req.params.token || ''));
   if (!ref) { res.status(404).json({ success: false, error: 'QR introuvable' }); return; }
-  const method = String(req.body?.method || 'card');
+  const method = String(req.body?.method || 'card') as PayMethod;
   const r = await resolvePublicQr(ref);
   if (!r) { res.status(404).json({ success: false, error: 'QR invalide, inactif ou expiré' }); return; }
 
+  // ── ROUTEUR : le prestataire dépend de la ZONE DU BÉNÉFICIAIRE (r.owner), JAMAIS du payeur.
+  //    west→Stripe(carte) · africa→Djomy(momo)/CinetPay(carte). Chaque décision est journalisée. ──
+  const decision = await resolveProvider({ beneficiaryUserId: r.owner, method });
+  if (!decision.ok) {
+    res.status(decision.error_code === 'ZONE_INCONNUE' ? 409 : 400)
+       .json({ success: false, error: decision.reason || 'Méthode indisponible dans cette zone', error_code: decision.error_code });
+    return;
+  }
+  if (decision.provider === 'cinetpay') {
+    // Carte zone Afrique → CinetPay (intégration à venir, BLOC 1). Fail-closed : jamais de faux succès.
+    res.status(503).json({ success: false, error: 'Paiement carte momentanément indisponible dans cette zone.', error_code: 'CINETPAY_NOT_CONFIGURED' });
+    return;
+  }
+
   // ── Rail OM/MoMo (Djomy) — sans compte : initie un PAYIN (push USSD), NE CRÉDITE RIEN.
   //    Le crédit vendeur se fait UNIQUEMENT au webhook Djomy vérifié (settle_qr_payment). ──
-  if (method === 'orange_money' || method === 'mtn_momo') {
+  if (decision.provider === 'djomy') {
     if (!djomyConfigured()) { res.status(503).json({ success: false, error: 'Mobile money momentanément indisponible.', error_code: 'DJOMY_NOT_CONFIGURED' }); return; }
     const amount = r.q.kind === 'dynamic' ? Number(r.q.amount) : Number(req.body?.amount);
     if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
@@ -247,12 +271,12 @@ router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res:
     if (!payin.success || !payin.transactionId) {
       res.status(502).json({ success: false, error: payin.error || "Échec de l'initiation du paiement mobile money", error_code: 'DJOMY_INIT_FAILED' }); return;
     }
-    // Ligne de SUIVI (aucun crédit) : provider_ref = transactionId Djomy, qr_reference en metadata.
+    // Ligne de SUIVI (aucun crédit) : provider_ref = transactionId Djomy, zone+qr_reference en metadata.
     await supabaseAdmin.from('payment_transactions').insert({
       provider: 'djomy', provider_ref: payin.transactionId, user_id: r.owner,
       amount, currency: r.currency, status: 'pending',
       description: `QR ${method} — ${r.name}`,
-      metadata: { qr_reference: ref, operator: method, merchant_ref: merchantRef },
+      metadata: { qr_reference: ref, operator: method, merchant_ref: merchantRef, zone: decision.zone },
     });
     res.json({ success: true, data: { reference: payin.transactionId, status: 'pending', amount, currency: r.currency, vendor_name: r.name, method } });
     return;

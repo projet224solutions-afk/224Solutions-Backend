@@ -16,6 +16,7 @@ import { paymentRateLimit, authRateLimit } from '../middlewares/routeRateLimiter
 import { verifyWalletPin, isPinSchemaAvailableForMoney } from '../services/walletPin.service.js';
 import { createNotification } from '../services/notification.service.js';
 import { normalizeQrRef } from '../utils/qrPayment.js';
+import { initiatePayin, djomyConfigured, type DjomyOperator } from '../services/djomy.service.js';
 
 const router = Router();
 const newKey = () => crypto.randomUUID();
@@ -176,22 +177,9 @@ router.post('/pay', verifyJWT, paymentRateLimit, async (req: AuthenticatedReques
 });
 
 // ── Client : payer via Orange Money / MTN MoMo → délégué au flux payment_links existant ──
-router.post('/om-momo', verifyJWT, paymentRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const ref = normalizeQrRef(String(req.body?.reference || ''));
-  const method = req.body?.payment_method === 'mtn_momo' ? 'mtn_momo' : 'orange_money';
-  if (!ref) { res.status(422).json({ success: false, error: "Ce QR n'est pas un QR de paiement" }); return; }
-  const { data: qr } = await supabaseAdmin.from('vendor_payment_qr').select('vendor_id, amount').eq('reference', ref).maybeSingle();
-  if (!qr) { res.status(404).json({ success: false, error: 'QR invalide' }); return; }
-  const amount = Number(qr && (qr as any).amount) || Number(req.body?.amount);
-  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
-  const { data: vendor } = await supabaseAdmin.from('vendors').select('id, business_name').eq('id', (qr as any).vendor_id).maybeSingle();
-  // Le règlement OM/MoMo réutilise payment_links (pending_settlement). On renvoie le contexte au
-  // front qui ouvre le flux payment_links existant (aucune logique de règlement dupliquée ici).
-  res.json({ success: true, data: {
-    delegate: 'payment_links', payment_method: method, amount,
-    vendor_id: (vendor as any)?.id, vendor_name: (vendor as any)?.business_name || 'Vendeur',
-  } });
-});
+// (Ancienne route JWT `/om-momo` supprimée : OM/MoMo passe désormais par la route PUBLIQUE
+//  `/public/qr/:token/pay` avec method∈{orange_money,mtn_momo} → Djomy. Un seul chemin OM/MoMo,
+//  sans compte, avec règlement atomique au webhook — plus de délégation payment_links.)
 
 // ════════════════════════════════════════════════════════════════════════════
 // CHANTIER C — PAIEMENT PUBLIC SANS COMPTE (carte). OM/MoMo : à venir (provider externe requis).
@@ -231,6 +219,7 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
     kind: r.q.kind, amount: r.q.amount ?? null,
     fee_percent: Number((cfg as { qr_wallet_client_fee_percent?: number } | null)?.qr_wallet_client_fee_percent ?? 0),
     card_available: !!process.env.STRIPE_SECRET_KEY,
+    momo_available: djomyConfigured(),   // Orange Money / MTN MoMo via Djomy (sans compte)
   } });
 });
 
@@ -238,13 +227,40 @@ router.get('/public/qr/:token', paymentRateLimit, async (req: Request, res: Resp
 router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
   const ref = normalizeQrRef(String(req.params.token || ''));
   if (!ref) { res.status(404).json({ success: false, error: 'QR introuvable' }); return; }
-  if (String(req.body?.method || 'card') !== 'card') {
-    res.status(400).json({ success: false, error: "Sans compte : seule la carte est disponible pour l'instant (Orange Money / MTN MoMo bientôt)." }); return;
-  }
-  const stripeKey = process.env.STRIPE_SECRET_KEY?.trim();
-  if (!stripeKey) { res.status(503).json({ success: false, error: 'Paiement carte momentanément indisponible.', error_code: 'STRIPE_NOT_CONFIGURED' }); return; }
+  const method = String(req.body?.method || 'card');
   const r = await resolvePublicQr(ref);
   if (!r) { res.status(404).json({ success: false, error: 'QR invalide, inactif ou expiré' }); return; }
+
+  // ── Rail OM/MoMo (Djomy) — sans compte : initie un PAYIN (push USSD), NE CRÉDITE RIEN.
+  //    Le crédit vendeur se fait UNIQUEMENT au webhook Djomy vérifié (settle_qr_payment). ──
+  if (method === 'orange_money' || method === 'mtn_momo') {
+    if (!djomyConfigured()) { res.status(503).json({ success: false, error: 'Mobile money momentanément indisponible.', error_code: 'DJOMY_NOT_CONFIGURED' }); return; }
+    const amount = r.q.kind === 'dynamic' ? Number(r.q.amount) : Number(req.body?.amount);
+    if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+    const phone = String(req.body?.payer_phone || req.body?.phone || '').trim();
+    if (!phone) { res.status(400).json({ success: false, error: 'Numéro payeur requis', error_code: 'PHONE_REQUIRED' }); return; }
+    const merchantRef = `qr_${ref}_${Date.now()}`;
+    const payin = await initiatePayin({
+      amount, currency: r.currency, msisdn: phone, operator: method as DjomyOperator,
+      reference: merchantRef, description: `Paiement ${r.name}`,
+    });
+    if (!payin.success || !payin.transactionId) {
+      res.status(502).json({ success: false, error: payin.error || "Échec de l'initiation du paiement mobile money", error_code: 'DJOMY_INIT_FAILED' }); return;
+    }
+    // Ligne de SUIVI (aucun crédit) : provider_ref = transactionId Djomy, qr_reference en metadata.
+    await supabaseAdmin.from('payment_transactions').insert({
+      provider: 'djomy', provider_ref: payin.transactionId, user_id: r.owner,
+      amount, currency: r.currency, status: 'pending',
+      description: `QR ${method} — ${r.name}`,
+      metadata: { qr_reference: ref, operator: method, merchant_ref: merchantRef },
+    });
+    res.json({ success: true, data: { reference: payin.transactionId, status: 'pending', amount, currency: r.currency, vendor_name: r.name, method } });
+    return;
+  }
+
+  // ── Rail CARTE (Stripe) — INCHANGÉ ──
+  const stripeKey = process.env.STRIPE_SECRET_KEY?.trim();
+  if (!stripeKey) { res.status(503).json({ success: false, error: 'Paiement carte momentanément indisponible.', error_code: 'STRIPE_NOT_CONFIGURED' }); return; }
 
   const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' as any });
   const paymentIntentId = req.body?.paymentIntentId ? String(req.body.paymentIntentId) : null;
@@ -274,6 +290,18 @@ router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res:
     metadata: { qr_reference: ref, currency: r.currency, kind: r.q.kind },
   });
   res.json({ success: true, data: { clientSecret: pi.client_secret, paymentIntentId: pi.id, amount, currency: r.currency, vendor_name: r.name } });
+});
+
+// GET /public/qr/:token/status?ref=<djomyTxId> — poll PUBLIC (OM/MoMo). N'expose QUE le statut
+// simplifié (pending|paid|failed), jamais le montant/bénéficiaire/données du payeur.
+router.get('/public/qr/:token/status', paymentRateLimit, async (req: Request, res: Response): Promise<void> => {
+  const providerRef = String(req.query?.ref || '').trim();
+  if (!providerRef) { res.status(400).json({ success: false, error: 'ref requise' }); return; }
+  const { data: pt } = await supabaseAdmin.from('payment_transactions')
+    .select('status').eq('provider', 'djomy').eq('provider_ref', providerRef).maybeSingle();
+  const map: Record<string, string> = { completed: 'paid', pending: 'pending', failed: 'failed' };
+  const status = pt ? (map[String((pt as any).status)] || 'pending') : 'pending';
+  res.json({ success: true, data: { status } });
 });
 
 // ── Config frais QR wallet (GET agents/PDG, PUT PDG) ──

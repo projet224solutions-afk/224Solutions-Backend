@@ -63,6 +63,7 @@ import agentCashRoutes from './routes/agentCash.routes.js';
 import vendorQrRoutes from './routes/vendorQr.routes.js';
 import smsRoutes from './routes/sms.routes.js';
 import walletPayRoutes from './routes/walletPay.routes.js';
+import webhooksDjomyRoutes from './routes/webhooksDjomy.routes.js';
 import documentsRoutes from './routes/documents.routes.js';
 import productRoutes from './routes/products.routes.js';
 import orderRoutes from './routes/orders.routes.js';
@@ -211,6 +212,8 @@ app.use(compression());
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
 // Edge Functions Stripe webhooks also need raw body for signature verification
 app.use('/edge-functions/webhooks/stripe', express.raw({ type: 'application/json' }));
+// Djomy (OM/MoMo) webhook needs raw body for HMAC signature verification
+app.use('/api/v2/webhooks/djomy', express.raw({ type: 'application/json' }));
 
 // Standard JSON parser for everything else
 app.use(express.json({ limit: '10mb' }));
@@ -318,6 +321,7 @@ app.use('/api/v2/agent-cash', agentCashRoutes);
 app.use('/api/v2/vendor-qr', vendorQrRoutes);
 app.use('/api/v2/sms', smsRoutes);
 app.use('/api/v2/wallet-pay', walletPayRoutes);
+app.use('/api/v2/webhooks/djomy', webhooksDjomyRoutes);
 app.use('/api/auth/failover', authFailoverRoutes);
 app.use('/api/v2/realtime', realtimeRoutes);
 app.use('/api/v2/live', liveRoutes);

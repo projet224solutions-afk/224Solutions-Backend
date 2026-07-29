@@ -829,6 +829,62 @@ router.post('/withdrawals', verifyJWT, requireRole(PDG_ROLES), async (req: Authe
 });
 
 /**
+ * POST /api/admin/wallet-withdrawals  { action, withdrawalId?, payout_reference?, notes? }
+ * File PDG des retraits wallet (table `withdrawals`, canal momo/générique) — permet de RÉSOUDRE
+ * les retraits `pending` tant que le disbursement auto n'est pas branché : `mark_paid` (après avoir
+ * effectué le versement) ou `refund` (remboursement atomique). Transitions via les RPC verrouillées
+ * (machine à états : paid→refunded interdit). Réservé PDG.
+ */
+const WALLET_WD_ACTIONS = ['mark_paid', 'refund'];
+router.post('/wallet-withdrawals', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { action, withdrawalId, payout_reference, notes } = req.body || {};
+
+    if (action === 'list') {
+      const { data: rows, error } = await supabaseAdmin
+        .from('withdrawals')
+        .select('id, user_id, amount, fee, currency, destination_type, destination, status, payout_provider, payout_reference, failure_reason, created_at, updated_at')
+        .in('status', ['pending', 'processing'])
+        .order('created_at', { ascending: true });
+      if (error) return fail(res, 400, error.message);
+
+      const userIds = [...new Set((rows || []).map((r: any) => r.user_id).filter(Boolean))];
+      const profiles: Record<string, unknown> = {};
+      if (userIds.length) {
+        const { data: profs } = await supabaseAdmin
+          .from('profiles').select('id, first_name, last_name, email, phone').in('id', userIds);
+        for (const p of (profs || []) as Array<{ id: string }>) profiles[p.id] = p;
+      }
+      const withdrawals = (rows || []).map((r: any) => ({ ...r, requester: profiles[r.user_id] || null }));
+      return ok(res, { withdrawals });
+    }
+
+    if (!WALLET_WD_ACTIONS.includes(action)) return fail(res, 400, `Action invalide: ${action}`);
+    if (!withdrawalId || typeof withdrawalId !== 'string') return fail(res, 400, 'withdrawalId requis');
+
+    if (action === 'mark_paid') {
+      // Le PDG confirme un versement RÉEL déjà effectué → débit rendu définitif.
+      const ref = payout_reference && typeof payout_reference === 'string'
+        ? payout_reference : `pdg-manual-${withdrawalId}`;
+      const { data, error } = await supabaseAdmin.rpc('mark_withdrawal_paid', {
+        p_withdrawal_id: withdrawalId, p_payout_reference: ref,
+      });
+      if (error || !(data as any)?.success) return fail(res, 400, error?.message || (data as any)?.error || 'Echec mark_paid');
+      return ok(res, data);
+    }
+    // refund : remboursement atomique (l'argent revient au solde du client).
+    const { data, error } = await supabaseAdmin.rpc('refund_withdrawal', {
+      p_withdrawal_id: withdrawalId, p_reason: notes ? String(notes) : 'Remboursé par le PDG',
+    });
+    if (error || !(data as any)?.success) return fail(res, 400, error?.message || (data as any)?.error || 'Echec refund');
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[admin/wallet-withdrawals] ${e?.message}`);
+    return fail(res, 500, 'Erreur lors du traitement du retrait wallet');
+  }
+});
+
+/**
  * GET /api/admin/pdg/revenue?granularity=&from=&to=
  * Reporting du coffre PDG : total, ventilation par source, série temporelle, solde, redistribué.
  */

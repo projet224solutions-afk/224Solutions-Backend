@@ -18,13 +18,11 @@ import { createNotification } from '../services/notification.service.js';
 import { normalizeQrRef } from '../utils/qrPayment.js';
 import { initiatePayin, djomyConfigured, type DjomyOperator } from '../services/djomy.service.js';
 import { resolveProvider, resolveZone, type PayMethod } from '../services/paymentRouter.service.js';
+import { cinetpayConfigured, initiatePayment as cinetpayInitiate } from '../services/cinetpay.service.js';
 
 const router = Router();
 const newKey = () => crypto.randomUUID();
 const posInt = (v: any) => Number.isFinite(Number(v)) && Number(v) > 0 && Number.isInteger(Number(v));
-// Carte zone Afrique = CinetPay (BLOC 1 à venir). Tant que le service n'est pas branché → false
-// (fail-closed) pour rester cohérent avec la route /pay qui renvoie 503 CINETPAY_NOT_CONFIGURED.
-const cinetpayConfigured = () => false;
 
 async function vendorForUser(userId: string) {
   const { data } = await supabaseAdmin.from('vendors').select('id, user_id, business_name').eq('user_id', userId).maybeSingle();
@@ -250,8 +248,28 @@ router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res:
     return;
   }
   if (decision.provider === 'cinetpay') {
-    // Carte zone Afrique → CinetPay (intégration à venir, BLOC 1). Fail-closed : jamais de faux succès.
-    res.status(503).json({ success: false, error: 'Paiement carte momentanément indisponible dans cette zone.', error_code: 'CINETPAY_NOT_CONFIGURED' });
+    // Carte zone Afrique → CinetPay (paiement hébergé). Fail-closed : sans creds → 503, jamais de
+    // faux succès. NE CRÉDITE RIEN : crédit vendeur UNIQUEMENT au webhook vérifié (settle_qr_payment).
+    if (!cinetpayConfigured()) { res.status(503).json({ success: false, error: 'Paiement carte momentanément indisponible dans cette zone.', error_code: 'CINETPAY_NOT_CONFIGURED' }); return; }
+    const amount = r.q.kind === 'dynamic' ? Number(r.q.amount) : Number(req.body?.amount);
+    if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+    const merchantRef = `qr_${ref}_${Date.now()}`;
+    const apiBase = process.env.PUBLIC_API_URL?.trim() || 'https://224solution.net';
+    const webBase = process.env.PUBLIC_WEB_URL?.trim() || 'https://224solution.net';
+    const init = await cinetpayInitiate({
+      transactionId: merchantRef, amount, currency: r.currency, description: `Paiement ${r.name}`,
+      notifyUrl: `${apiBase}/api/v2/webhooks/cinetpay`, returnUrl: `${webBase}/p/${encodeURIComponent(ref)}`,
+    });
+    if (!init.success || !init.paymentUrl) {
+      res.status(502).json({ success: false, error: init.error || "Échec de l'initiation du paiement carte", error_code: 'CINETPAY_INIT_FAILED' }); return;
+    }
+    await supabaseAdmin.from('payment_transactions').insert({
+      provider: 'cinetpay', provider_ref: merchantRef, user_id: r.owner,
+      amount, currency: r.currency, status: 'pending',
+      description: `QR carte — ${r.name}`,
+      metadata: { qr_reference: ref, zone: decision.zone },
+    });
+    res.json({ success: true, data: { reference: merchantRef, status: 'pending', payment_url: init.paymentUrl, amount, currency: r.currency, vendor_name: r.name, method } });
     return;
   }
 

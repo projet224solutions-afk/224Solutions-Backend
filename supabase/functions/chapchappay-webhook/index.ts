@@ -42,9 +42,15 @@ async function hmacSha256(key: string, message: string): Promise<string> {
  */
 async function verifySignature(payload: string, signature: string, timestamp: string): Promise<boolean> {
   const secretKey = Deno.env.get("CCP_SECRET_KEY") || Deno.env.get("CCP_ENCRYPTION_KEY");
+  // 🔒 Fail-closed : sans clé de signature, on REJETTE (jamais de crédit sur webhook non
+  // vérifié). Le secret vit en env (jamais en base). Signature + timestamp obligatoires.
   if (!secretKey) {
-    logStep("⚠️ No secret key configured for webhook verification");
-    return true; // Allow if not configured (dev mode)
+    logStep("❌ CCP_SECRET_KEY absente — webhook REJETÉ (aucun crédit sur webhook non signé)");
+    return false;
+  }
+  if (!signature || !timestamp) {
+    logStep("❌ Signature ou timestamp manquant — webhook rejeté");
+    return false;
   }
 
   const data = `${timestamp}${payload}`;
@@ -69,8 +75,8 @@ serve(async (req) => {
     const bodyText = await req.text();
     logStep("Webhook payload", { bodyPreview: bodyText.substring(0, 200) });
 
-    // Verify signature
-    if (signature && !(await verifySignature(bodyText, signature, timestamp))) {
+    // Verify signature — TOUJOURS (plus de « si signature présente »). Fail-closed.
+    if (!(await verifySignature(bodyText, signature, timestamp))) {
       logStep("❌ Invalid webhook signature");
       return new Response(
         JSON.stringify({ success: false, error: "Invalid signature" }),
@@ -150,54 +156,28 @@ serve(async (req) => {
       status: internalStatus 
     });
 
-    // If payment completed, credit wallet for PULL payments
+    // If payment completed, credit wallet for PULL payments — via RPC ATOMIQUE
+    // execute_atomic_deposit (crédit + plafond AML + quarantaine + ledger, dans 1 transaction),
+    // IDEMPOTENT sur (source_type='deposit', source_txn_id='CCP-<txid>') → un rejeu du webhook
+    // ne re-crédite JAMAIS. Remplace l'UPDATE balance direct (contournait le plafond + rejouable).
     if (internalStatus === "completed" && transaction?.payment_type === "pull" && transaction?.user_id) {
-      logStep("Crediting wallet for completed PULL payment");
-      
-      // Get user's wallet
-      const { data: wallet } = await supabaseAdmin
-        .from("wallets")
-        .select("id, balance")
-        .eq("user_id", transaction.user_id)
-        .single();
-
-      if (wallet) {
-        const newBalance = wallet.balance + (paid_amount || amount);
-        
-        await supabaseAdmin
-          .from("wallets")
-          .update({
-            balance: newBalance,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", wallet.id);
-
-        // Create wallet transaction
-        await supabaseAdmin
-          .from("wallet_transactions")
-          .insert({
-            transaction_id: `CCP-${transaction_id}`,
-            transaction_type: "deposit",
-            amount: paid_amount || amount,
-            net_amount: (paid_amount || amount) - (fees || 0),
-            fee: fees || 0,
-            currency: "GNF",
-            status: "completed",
-            description: `Dépôt Mobile Money (${payment_method})`,
-            receiver_wallet_id: wallet.id,
-            metadata: {
-              provider: "chapchappay",
-              ccp_transaction_id: transaction_id,
-              payment_method,
-              customer_phone,
-            }
-          });
-
-        logStep("Wallet credited", { 
-          walletId: wallet.id, 
-          amount: paid_amount || amount,
-          newBalance 
+      const depositAmount = Number(paid_amount || amount) || 0;
+      if (depositAmount > 0) {
+        const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("execute_atomic_deposit", {
+          p_user_id: transaction.user_id,
+          p_amount: depositAmount,
+          p_description: `Dépôt Mobile Money (${payment_method})`,
+          p_reference: `CCP-${transaction_id}`,
+          p_source_type: "deposit",
         });
+        if (creditErr || !(creditRes as any)?.success) {
+          logStep("❌ Crédit wallet échoué", { error: creditErr?.message || (creditRes as any)?.error });
+        } else {
+          logStep("Wallet crédité (atomique, idempotent, plafond)", {
+            credited: (creditRes as any).credited,
+            quarantined: (creditRes as any).quarantined,
+          });
+        }
       }
     }
 

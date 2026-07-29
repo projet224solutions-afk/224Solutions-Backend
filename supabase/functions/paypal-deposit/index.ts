@@ -340,42 +340,31 @@ serve(async (req) => {
         creditedFeeAmount = Math.round(depositFee * rateUsed * 100) / 100;
       }
 
-      const newBalance = (wallet!.balance || 0) + creditedNetAmount;
-      const referenceNumber = `PP-DEP-${Date.now()}`;
+      // 🔒 Crédit via RPC ATOMIQUE execute_atomic_deposit (plafond AML + quarantaine + ledger
+      // wallet_transactions, dans 1 transaction), IDEMPOTENT sur
+      // (source_type='deposit', source_txn_id='PP-<capture_id>') → une re-capture OU un rejeu
+      // du webhook ne re-crédite JAMAIS. Remplace l'UPDATE balance direct (contournait le
+      // plafond + rejouable). Le montant est DÉJÀ converti dans la devise du wallet.
+      const captureId = captureData.purchase_units[0].payments.captures[0].id;
+      const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("execute_atomic_deposit", {
+        p_user_id: userId,
+        p_amount: creditedNetAmount,
+        p_description: `Dépôt PayPal - Order ${orderId}`,
+        p_reference: `PP-${captureId}`,
+        p_source_type: "deposit",
+      });
+      if (creditErr || !(creditRes as any)?.success) {
+        logStep("❌ Crédit wallet échoué", { error: creditErr?.message || (creditRes as any)?.error });
+        throw new Error("Crédit du wallet impossible après capture PayPal");
+      }
 
-      // Update balance + insert transaction
-      await supabaseAdmin.from("wallets").update({
-        balance: newBalance,
-        updated_at: new Date().toISOString(),
-      }).eq("id", wallet!.id);
-
-      await supabaseAdmin.from("wallet_transactions").insert({
-        transaction_id: referenceNumber,
-        transaction_type: "deposit",
-        wallet_id: wallet!.id,
-        amount: creditedNetAmount,
-        net_amount: creditedNetAmount,
-        fee: creditedFeeAmount,
-        currency: walletCurrency,
-        status: "completed",
-        description: `Dépôt PayPal - Order ${orderId}`,
-        receiver_wallet_id: wallet!.id,
-        receiver_user_id: userId,
-        metadata: {
-          paypal_order_id: orderId,
-          paypal_capture_id: captureData.purchase_units[0].payments.captures[0].id,
-          gross_amount_original: capturedAmount,
-          currency_original: capturedCurrency,
-          fee_original: depositFee,
-          net_amount_original: netAmount,
-          credited_amount: creditedNetAmount,
-          wallet_currency: walletCurrency,
-          fx_rate_used: rateUsed,
-          fee_rate: DEPOSIT_FEE_RATE,
-        },
-      } as any);
-
-      logStep("Wallet credited", { walletId: wallet!.id, walletCurrency, newBalance, creditedNetAmount, fxRate: rateUsed });
+      const { data: freshWallet } = await supabaseAdmin
+        .from("wallets").select("balance").eq("id", wallet!.id).maybeSingle();
+      const newBalance = (freshWallet as any)?.balance ?? ((wallet!.balance || 0) + creditedNetAmount);
+      logStep("Wallet credited (atomique, idempotent, plafond)", {
+        walletId: wallet!.id, walletCurrency, newBalance,
+        credited: (creditRes as any).credited, quarantined: (creditRes as any).quarantined, fxRate: rateUsed,
+      });
 
       return new Response(JSON.stringify({
         success: true,

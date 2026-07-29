@@ -401,34 +401,39 @@ serve(async (req) => {
     const rawBody = await req.text();
     logStep("Webhook body received", { bodyLength: rawBody.length });
 
-    // Verify signature if provided
-    let signatureValid = false;
-    if (webhookSignature && clientSecret) {
-      signatureValid = await verifyWebhookSignature(rawBody, webhookSignature, clientSecret);
-      if (!signatureValid) {
-        logStep("SECURITY: Invalid webhook signature - rejecting");
-        
-        const supabaseAdmin = createClient(
-          Deno.env.get("SUPABASE_URL") ?? "",
-          Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-          { auth: { persistSession: false } }
-        );
-        
-        await supabaseAdmin
-          .from("djomy_webhook_logs")
-          .insert({
-            event_type: "SIGNATURE_INVALID",
-            payload: { raw: rawBody.substring(0, 500) },
-            signature_valid: false,
-            ip_address: sourceIp,
-            error_message: "Invalid webhook signature",
-          });
+    // 🔒 Verify signature — OBLIGATOIRE (fail-closed). Auparavant la vérif était sautée si le
+    // header OU le secret manquait → un webhook NON signé passait et pouvait déclencher un
+    // crédit. Désormais : sans DJOMY_CLIENT_SECRET (env, jamais en base), sans header signé,
+    // ou signature invalide → rejet 401. Aucun crédit sur webhook non authentifié.
+    const signatureValid = !!(clientSecret && webhookSignature)
+      && await verifyWebhookSignature(rawBody, webhookSignature, clientSecret);
+    if (!signatureValid) {
+      logStep("SECURITY: signature manquante/invalide - rejet", {
+        hasSecret: !!clientSecret, hasSignature: !!webhookSignature,
+      });
 
-        return new Response(
-          JSON.stringify({ error: "Invalid signature" }),
-          { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 401 }
-        );
-      }
+      const supabaseAdmin = createClient(
+        Deno.env.get("SUPABASE_URL") ?? "",
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+        { auth: { persistSession: false } }
+      );
+
+      await supabaseAdmin
+        .from("djomy_webhook_logs")
+        .insert({
+          event_type: "SIGNATURE_INVALID",
+          payload: { raw: rawBody.substring(0, 500) },
+          signature_valid: false,
+          ip_address: sourceIp,
+          error_message: !clientSecret
+            ? "DJOMY_CLIENT_SECRET absent"
+            : (!webhookSignature ? "Signature header manquant" : "Invalid webhook signature"),
+        });
+
+      return new Response(
+        JSON.stringify({ error: "Invalid signature" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 401 }
+      );
     }
 
     const payload = JSON.parse(rawBody);

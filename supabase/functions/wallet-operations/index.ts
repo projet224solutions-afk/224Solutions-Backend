@@ -452,40 +452,16 @@ serve(async (req) => {
 
     switch (operation) {
       case 'deposit': {
-        const depositFee = await calculateFee(supabaseClient, 'deposit', amount, wallet.currency);
-        const netDeposit = amount - depositFee;
-        const newBalance = wallet.balance + netDeposit;
-
-        const { error: depositError } = await supabaseClient
-          .from('wallets')
-          .update({ balance: newBalance, updated_at: new Date().toISOString() })
-          .eq('user_id', user.id);
-        if (depositError) throw depositError;
-
-        const { data: depositTx, error: depositTxError } = await supabaseClient
-          .from('enhanced_transactions')
-          .insert({
-            sender_id: user.id,
-            receiver_id: user.id,
-            amount,
-            method: 'wallet',
-            status: 'completed',
-            currency: wallet.currency || 'GNF',
-            metadata: {
-              description: description || 'Dépôt',
-              fee: depositFee,
-              transaction_type: 'deposit'
-            }
-          })
-          .select('id')
-          .single();
-
-        if (depositTxError) throw depositTxError;
-
-        await syncAgentWallet(supabaseClient, user.id, newBalance, 'deposit', userRole);
-        await recordIdempotencyKey(supabaseClient, effectiveIdempotencyKey, user.id, 'deposit');
-        result = { success: true, new_balance: newBalance, operation: 'deposit', transaction_id: depositTx?.id || null };
-        break;
+        // 🔒 VERROU (audit « aucun crédit sans paiement réel encaissé ») : ce case créditait
+        // le wallet du porteur du JWT (wallet.balance + netDeposit) SANS aucune preuve de
+        // paiement mobile money/carte → argent gratuit. Un dépôt passe TOUJOURS par un
+        // prestataire : carte (Stripe : PaymentIntent → webhook signé → crédit atomique) ou
+        // mobile money. Refus immédiat, aucun mouvement de solde.
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Les dépôts passent par carte ou mobile money — le crédit direct est désactivé.',
+          error_code: 'WALLET_DIRECT_DEPOSIT_DISABLED',
+        }), { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
 
       case 'withdraw': {

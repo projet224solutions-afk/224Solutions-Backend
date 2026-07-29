@@ -129,6 +129,21 @@ export async function applyPaymentSucceeded(
 
   logger.info(`[${source}] payment succeeded — PI=${paymentIntent.id}, order=${orderId}`);
 
+  // 🧾 QR CARTE sans compte (metadata.qr_reference) → settlement vendeur ATOMIQUE idempotent.
+  // Filet si le client se déconnecte après avoir payé : le webhook crédite quand même. Idempotent
+  // sur l'id Stripe (p_provider_ref) → JAMAIS de double-crédit avec la confirmation côté client.
+  if (paymentIntent.metadata?.qr_reference) {
+    const currency = String(paymentIntent.metadata?.currency || paymentIntent.currency || 'GNF').toUpperCase();
+    const { error } = await supabaseAdmin.rpc('settle_qr_card_payment', {
+      p_qr_reference: paymentIntent.metadata.qr_reference,
+      p_amount: Number(paymentIntent.amount),
+      p_currency: currency,
+      p_provider_ref: paymentIntent.id,
+    });
+    if (error) logger.warn(`[${source}] settle_qr_card_payment ${paymentIntent.id}: ${error.message}`);
+    else logger.info(`[${source}] QR carte réglée (idempotent) PI=${paymentIntent.id}`);
+  }
+
   // If no order_id in metadata, try to find the order by payment_intent_id
   // (marketplace-escrow flow creates the order AFTER the PaymentIntent)
   if (!orderId) {

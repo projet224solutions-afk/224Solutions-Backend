@@ -206,7 +206,7 @@ router.post('/public/qr/:token/pay', paymentRateLimit, async (req: Request, res:
   const r = await resolvePublicQr(ref);
   if (!r) { res.status(404).json({ success: false, error: 'QR invalide, inactif ou expiré' }); return; }
 
-  const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' as unknown as Stripe.LatestApiVersion });
+  const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' as any });
   const paymentIntentId = req.body?.paymentIntentId ? String(req.body.paymentIntentId) : null;
 
   // ÉTAPE 2 — confirmation : Stripe a encaissé → crédit vendeur atomique (idempotent sur l'id Stripe).

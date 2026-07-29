@@ -1308,7 +1308,7 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     // JAMAIS de faux « payé »). markWithdrawalPaid / refundWithdrawal ne sont appelés que sur
     // confirmation/échec RÉEL du prestataire, à l'intérieur de attemptDisbursement.
     const disb = await attemptDisbursement({
-      withdrawalId: result.withdrawalId!, amount, currency: typeof currency === 'string' ? currency : 'GNF',
+      withdrawalId: result.withdrawalId!, userId, amount, currency: typeof currency === 'string' ? currency : 'GNF',
       destinationType: destType, destination: destDetails,
     });
 

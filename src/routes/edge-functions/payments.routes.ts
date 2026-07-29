@@ -888,14 +888,16 @@ router.post("/manual-credit-seller", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/mobile-money-withdrawal", async (req: Request, res: Response) => {
-  try {
-    const { user_id, amount, provider } = req.body as any;
-    await supabase.from("withdrawals").insert({ user_id, amount, provider, status: "pending", created_at: new Date().toISOString() });
-    return res.json({ success: true, status: "pending" });
-  } catch (error) {
-    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Withdrawal failed" });
-  }
+router.post("/mobile-money-withdrawal", async (_req: Request, res: Response) => {
+  // 🔒 Stub neutralisé (audit retraits) : répondait success:true/pending SANS aucune garde JWT,
+  // SANS débit et SANS payout (fausse promesse ; user_id venait même du body = IDOR). Un retrait
+  // mobile money passe par le flux canonique : débit → ligne withdrawals 'pending' (request_withdrawal)
+  // → payout prestataire confirmé → 'paid', ou remboursement atomique si échec.
+  return res.status(503).json({
+    success: false,
+    error: "Retrait mobile money non configuré sur ce point.",
+    error_code: "PAYOUT_PROVIDER_NOT_CONFIGURED",
+  });
 });
 
 router.post("/freight-payment", async (req: Request, res: Response) => {

@@ -14,21 +14,20 @@ import path from 'node:path';
  */
 const ROUTES_DIR = path.resolve(process.cwd(), 'src/routes');
 
-// Chemins de route « encaissement via prestataire » (ceux qui peuvent mentir un paiement).
-// On cible les noms de prestataire + les recharges wallet — PAS les « deposit/fund/refund »
-// métier (acompte artisan, jalon BTP, caution immobilière, remboursement commande).
-const RISKY_PATH = /(paypal|stripe|chapchap|djomy|momo|orange|mobile-?money|topup|top-?up|recharge)/i;
+// Chemins de route « mouvement d'argent via prestataire » : encaissement (deposit) OU
+// versement (payout/retrait). On cible les noms de prestataire + recharges + retraits —
+// PAS les « deposit/fund/refund » métier (acompte artisan, jalon BTP, caution, remboursement).
+const RISKY_PATH = /(paypal|stripe|chapchap|djomy|momo|orange|mobile-?money|topup|top-?up|recharge|withdraw|payout|cashout|disburse)/i;
 
 // Preuve d'INTERACTION réelle (au-delà du simple nom présent dans le chemin) : appel SDK,
-// vérif signature, ou passage par le helper de crédit vérrouillé, ou refus explicite 503.
-const PROVIDER_EVIDENCE = /(PaymentIntent|paymentIntent|client_secret|stripe\.|\.capture\(|PAYPAL_API|settle_deposit|settleDeposit|credit_user_wallet_safe|creditWallet|process_deposit_payment|verifyStripeSignature|verifySignature|notConfigured|status\(\s*503)/i;
+// vérif signature, passage par un helper de crédit/débit adossé, ou refus explicite 503.
+const PROVIDER_EVIDENCE = /(PaymentIntent|paymentIntent|client_secret|stripe\.|\.capture\(|PAYPAL_API|settle_deposit|settleDeposit|credit_user_wallet_safe|creditWallet|process_deposit_payment|verifyStripeSignature|verifySignature|notConfigured|status\(\s*503|debitWallet|execute_atomic_withdrawal|request_withdrawal|agent_cash_withdrawal|admin_process_withdrawal|request_bank_withdrawal|agent_commission_withdrawal_request|agent_commission_payout_execute|process_affiliate_payout|issueClientOtp)/i;
 
 const FAKE_SUCCESS = /success:\s*true/;
 
-// Exemptions légitimes : un accusé de réception de webhook (`received: true`, n'ajoute PAS
-// d'argent — le crédit se fait ailleurs, dans un handler vérifié) et les RETRAITS (argent
-// sortant, pas un crédit de dépôt). Ni l'un ni l'autre ne peut « mentir un paiement encaissé ».
-const EXEMPT = /(received:\s*true|withdraw)/i;
+// Exemption légitime : un accusé de réception de webhook (`received: true`) n'ajoute NI ne
+// retire d'argent — le mouvement réel se fait ailleurs, dans un handler vérifié.
+const EXEMPT = /received:\s*true/i;
 
 function collectRouteFiles(dir: string): string[] {
   const out: string[] = [];

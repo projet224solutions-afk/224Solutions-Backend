@@ -66,7 +66,23 @@ router.post('/', webhookRateLimit, async (req: Request, res: Response): Promise<
       const { data: settle, error: settleErr } = await supabaseAdmin.rpc('settle_qr_payment', {
         p_qr_reference: qrRef, p_amount: expected, p_currency: cur, p_provider: 'djomy', p_provider_ref: txId,
       });
-      if (settleErr) { logger.error(`[djomy-webhook] settle ${settleErr.message}`); res.status(400).json({ success: false, error: settleErr.message }); return; }
+      if (settleErr) {
+        // FX indisponible/périmé/hors bornes → PAS de crédit : fonds chez le prestataire, tracés en
+        // pending_fx (jamais un taux prestataire). Alerte PDG + relance par le job de réconciliation.
+        if (/FX_INDISPONIBLE/i.test(settleErr.message || '')) {
+          await supabaseAdmin.from('payment_transactions')
+            .update({ status: 'pending_fx', updated_at: new Date().toISOString() }).eq('id', (pt as any).id);
+          await supabaseAdmin.from('system_alerts').insert({
+            severity: 'warning', module: 'payment_fx', title: 'Règlement en attente FX (pending_fx)',
+            message: `Paiement ${txId} : conversion ${cur}→wallet indisponible. Fonds tracés, relance auto au retour des taux.`,
+            metadata: { provider: 'djomy', provider_ref: txId, currency: cur, amount: expected, qr_reference: qrRef },
+          }).then(() => {}, () => {});
+          logger.warn(`[djomy-webhook] pending_fx tx=${txId} (${settleErr.message})`);
+          res.status(200).json({ success: true, status: 'pending_fx' });
+          return;
+        }
+        logger.error(`[djomy-webhook] settle ${settleErr.message}`); res.status(400).json({ success: false, error: settleErr.message }); return;
+      }
 
       await supabaseAdmin.from('payment_transactions')
         .update({ status: 'completed', credited_at: new Date().toISOString(), updated_at: new Date().toISOString() })

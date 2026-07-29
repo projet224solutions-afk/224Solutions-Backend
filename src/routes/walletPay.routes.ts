@@ -83,6 +83,46 @@ router.get('/resolve', verifyJWT, authRateLimit, async (req: AuthenticatedReques
   } });
 });
 
+// ── Préview de split plafond AML pour tout initiateur (envoi P2P, dépôt agent) ──
+// Renvoie UNIQUEMENT la répartition du montant (disponible / en attente) — JAMAIS le solde ni le
+// plafond exact du destinataire (vie privée). Un seul helper serveur : wallet_cap_preview.
+router.post('/cap-preview', verifyJWT, authRateLimit, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const amount = Number(req.body?.amount);
+  if (!posInt(amount)) { res.status(400).json({ success: false, error: 'Montant invalide' }); return; }
+  // Destinataire : par user_id direct OU par identifiant (téléphone / public_id / custom_id).
+  let ownerId: string | null = req.body?.recipient_user_id ? String(req.body.recipient_user_id) : null;
+  const ident = req.body?.identifier ? String(req.body.identifier).trim() : null;
+  if (!ownerId && ident) {
+    const { data: prof } = await supabaseAdmin.from('profiles').select('id')
+      .or(`phone.eq.${ident},public_id.eq.${ident},custom_id.eq.${ident}`).maybeSingle();
+    ownerId = (prof as { id?: string } | null)?.id ?? null;
+  }
+  if (!ownerId) { res.json({ success: true, data: { will_quarantine: false, available: amount, quarantined: 0 } }); return; }
+
+  const { data: w } = await supabaseAdmin.from('wallets').select('balance, currency')
+    .eq('user_id', ownerId).order('created_at', { ascending: true }).limit(1).maybeSingle();
+  const wal = (w ?? {}) as { balance?: number; currency?: string };
+  const cur = wal.currency || 'GNF';
+  // Montant crédité au destinataire dans SA devise (conversion si l'initiateur envoie une autre devise).
+  let credit = amount;
+  const fromCur = req.body?.from_currency ? String(req.body.from_currency).toUpperCase() : cur;
+  if (fromCur !== cur) {
+    const { data: conv } = await supabaseAdmin.rpc('wallet_fx_resolve', { p_from_currency: fromCur, p_to_currency: cur, p_amount: amount }).then(
+      (r: { data: unknown }) => ({ data: Array.isArray(r.data) ? (r.data as Array<{ converted_amount?: number }>)[0] : r.data as { converted_amount?: number } }), () => ({ data: null }));
+    if ((conv as { converted_amount?: number } | null)?.converted_amount) credit = Number((conv as { converted_amount: number }).converted_amount);
+  }
+  const { data, error } = await supabaseAdmin.rpc('wallet_cap_preview', {
+    p_user_id: ownerId, p_current_balance: wal.balance ?? 0, p_credit: credit, p_currency: cur,
+  });
+  if (error) { res.json({ success: true, data: { will_quarantine: false, available: credit, quarantined: 0, currency: cur } }); return; }
+  const row = (Array.isArray(data) ? data[0] : data) as { available?: number; quarantined?: number } | null;
+  const q = Number(row?.quarantined ?? 0);
+  // On ne renvoie QUE le split + la devise du destinataire — ni solde, ni plafond.
+  res.json({ success: true, data: {
+    available: Number(row?.available ?? credit), quarantined: q, will_quarantine: q > 0, currency: cur,
+  } });
+});
+
 // ── Client : DEVIS avant PIN (BLOC 5) — montant payeur + équivalent bénéficiaire + frais + total ──
 // Le payeur voit les DEUX montants (sa devise ≈ celle du vendeur), les frais, le total débité, et
 // si son solde suffit — AVANT de saisir le PIN. Taux malsain → FX_INDISPONIBLE (refus propre).

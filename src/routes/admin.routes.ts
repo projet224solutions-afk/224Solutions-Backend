@@ -885,6 +885,38 @@ router.post('/wallet-withdrawals', verifyJWT, requireRole(PDG_ROLES), async (req
 });
 
 /**
+ * GET /api/admin/financial-health
+ * Dashboard « Santé financière » (surveillance) : dernier contrôle d'intégrité (vert/rouge par
+ * invariant), en-attente par circuit (quarantaine, pending_fx, retraits), volumes du jour,
+ * décisions du routeur (24 h), état FX. Un écran = l'état de tout l'argent. Réservé PDG.
+ */
+router.get('/financial-health', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin.rpc('financial_health_snapshot');
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[admin/financial-health] ${e?.message}`);
+    return fail(res, 500, 'Erreur santé financière');
+  }
+});
+
+/**
+ * POST /api/admin/financial-health/run-check
+ * Lance immédiatement le compteur de dérive (sinon horaire). Réservé PDG.
+ */
+router.post('/financial-health/run-check', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin.rpc('run_ledger_integrity_check');
+    if (error) return fail(res, 400, error.message);
+    return ok(res, data);
+  } catch (e: any) {
+    logger.error(`[admin/financial-health/run-check] ${e?.message}`);
+    return fail(res, 500, 'Erreur contrôle intégrité');
+  }
+});
+
+/**
  * GET /api/admin/pdg/revenue?granularity=&from=&to=
  * Reporting du coffre PDG : total, ventilation par source, série temporelle, solde, redistribué.
  */

@@ -1208,68 +1208,27 @@ router.post('/pin/reset', verifyJWT, async (req: AuthenticatedRequest, res: Resp
  * Body : { amount, description?, reference?, idempotency_key? }
  */
 router.post('/deposit', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const userId = req.user!.id;
-    const { amount, description, reference, idempotency_key } = req.body || {};
-
-    if (!amount || typeof amount !== 'number' || amount <= 0) {
-      res.status(400).json({ success: false, error: 'Montant invalide' });
-      return;
-    }
-    if (amount > 100000000) {
-      res.status(400).json({ success: false, error: 'Montant trop élevé' });
-      return;
-    }
-
-    const idemKey = idempotency_key || `deposit:${userId}:${amount}:${Math.floor(Date.now() / 60000)}`;
-    const ref = reference || `dep_${Date.now()}`;
-
-    const result = await creditWallet(userId, amount, description || 'Dépôt', ref, 'deposit', idemKey);
-
-    if (!result.success) {
-      await emitCoreFeatureEvent({
-        featureKey: 'wallet.deposit',
-        coreEngine: 'payment',
-        ownerModule: 'wallet',
-        criticality: 'high',
-        status: 'failure',
-        userId,
-        payload: { amount, error: result.error || 'deposit_failed' },
-      });
-      res.status(400).json({ success: false, error: result.error });
-      return;
-    }
-
-    // ❌ PAS de commission agent sur un DÉPÔT : c'est l'argent du client (pas un revenu
-    // plateforme), et la base passée était le montant TOTAL → 20% de chaque dépôt. Désormais
-    // la commission est PRÉLEVÉE SUR LE PDG (cf. fix moteur) → ponctionnerait le PDG à tort.
-    // Commission agent = uniquement sur les ACHATS en ligne (frais), pas les mouvements wallet.
-    // await triggerAffiliateCommission(userId, amount, 'deposit', ref);
-
-    logger.info(`[WalletV2] Deposit: user=${userId}, amount=${amount}`);
-    await emitCoreFeatureEvent({
-      featureKey: 'wallet.deposit',
-      coreEngine: 'payment',
-      ownerModule: 'wallet',
-      criticality: 'high',
-      status: 'success',
-      userId,
-      payload: { amount },
-    });
-    res.json({ success: true, new_balance: result.newBalance, operation: 'deposit' });
-  } catch (error: any) {
-    logger.error(`Wallet deposit error: ${error.message}`);
-    await emitCoreFeatureEvent({
-      featureKey: 'wallet.deposit',
-      coreEngine: 'payment',
-      ownerModule: 'wallet',
-      criticality: 'high',
-      status: 'failure',
-      userId: req.user?.id || null,
-      payload: { error: error.message },
-    });
-    res.status(500).json({ success: false, error: 'Erreur lors du dépôt' });
-  }
+  // 🔒 VERROU DÉPÔT (audit « aucun crédit sans paiement réel encaissé ») :
+  // cette route créditait le wallet du porteur du JWT via creditWallet() SANS aucune
+  // preuve de paiement mobile money/carte → argent gratuit. Un dépôt doit TOUJOURS passer
+  // par un prestataire : carte (Stripe : PaymentIntent → webhook signé → crédit) ou
+  // mobile money / cash agent. Ces chemins créditent, JAMAIS ce point.
+  const userId = req.user?.id || null;
+  logger.warn(`[WalletV2] /deposit refusé (crédit direct interdit) — user=${userId}`);
+  await emitCoreFeatureEvent({
+    featureKey: 'wallet.deposit',
+    coreEngine: 'payment',
+    ownerModule: 'wallet',
+    criticality: 'high',
+    status: 'failure',
+    userId,
+    payload: { amount: req.body?.amount, error: 'direct_deposit_disabled' },
+  });
+  res.status(503).json({
+    success: false,
+    error: 'Les dépôts passent par carte ou mobile money — le crédit direct est désactivé.',
+    error_code: 'WALLET_DIRECT_DEPOSIT_DISABLED',
+  });
 });
 
 /**

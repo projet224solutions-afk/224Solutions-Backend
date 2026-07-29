@@ -22,7 +22,8 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { AFRICAN_BANK_SOURCE_URLS, isAfricanBankSourceUrl } from '../constants/africanBankSources.js';
-import { creditWallet, debitWallet, transferBetweenWallets, selectSenderWallet, selectReceiverWallet } from '../services/wallet.service.js';
+import { creditWallet, requestWithdrawal, transferBetweenWallets, selectSenderWallet, selectReceiverWallet } from '../services/wallet.service.js';
+import { attemptDisbursement } from '../services/disbursement.service.js';
 import { isFxRateFresh } from '../services/fxFreshness.js';
 import { createNotification } from '../services/notification.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
@@ -1241,7 +1242,7 @@ router.post('/deposit', verifyJWT, async (req: AuthenticatedRequest, res: Respon
 router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { amount, description, idempotency_key, pin } = req.body || {};
+    const { amount, description, idempotency_key, pin, currency, destination_type, destination } = req.body || {};
 
     if (!amount || typeof amount !== 'number' || amount <= 0) {
       // error_code = démonstrateur i18n (docs/API_CONTRACT.md § Erreurs et i18n) :
@@ -1249,6 +1250,9 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       res.status(400).json({ success: false, error: 'Montant invalide', error_code: 'AMOUNT_INVALID' });
       return;
     }
+
+    const destType = typeof destination_type === 'string' ? destination_type : 'momo';
+    const destDetails = (destination && typeof destination === 'object') ? destination : {};
 
     const pinCheck = await requireValidTransactionPin(userId, pin, {
       operation: 'withdrawal', amountGnf: await approximateAmountGnf(userId, amount),
@@ -1270,7 +1274,14 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     // Fallback DÉTERMINISTE (fenêtre 30s) : double-clic retrait → même clé → dé-dupliqué.
     const idemKey = idempotency_key || `withdraw:${userId}:${amount}:${Math.floor(Date.now() / 30000)}`;
 
-    const result = await debitWallet(userId, amount, description || 'Retrait', idemKey);
+    // 🔒 VERROU RETRAIT : on ne fait plus un débit « sec » (l'argent disparaissait sans versement).
+    // request_withdrawal débite vers une ligne `withdrawals` status='pending' (argent immobilisé,
+    // remboursable, coordonnées conservées), atomique + idempotent. Le retrait ne devient définitif
+    // (`paid`) que sur confirmation d'un vrai versement ; sinon il est remboursé.
+    const result = await requestWithdrawal(
+      userId, amount, typeof currency === 'string' ? currency : 'GNF',
+      destType, destDetails, idemKey, 0, description || 'Retrait',
+    );
 
     if (!result.success) {
       await emitCoreFeatureEvent({
@@ -1286,15 +1297,22 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
         : result.error === 'Wallet bloqué' ? 403
           : result.error?.includes('activité suspecte') ? 403
             : 400;
-      // error_code machine (i18n frontend) — additif, le message FR reste le repli.
-      const errorCode = result.error === 'Solde insuffisant' ? 'INSUFFICIENT_BALANCE'
-        : result.error === 'Wallet bloqué' ? 'WALLET_BLOCKED'
-          : undefined;
+      const errorCode = result.error_code
+        || (result.error === 'Solde insuffisant' ? 'INSUFFICIENT_BALANCE'
+          : result.error === 'Wallet bloqué' ? 'WALLET_BLOCKED' : undefined);
       res.status(statusCode).json({ success: false, error: result.error, ...(errorCode ? { error_code: errorCode } : {}) });
       return;
     }
 
-    logger.info(`[WalletV2] Withdraw: user=${userId}, amount=${amount}`);
+    // Tentative de versement (fail-closed : reste `pending` si le prestataire n'est pas branché —
+    // JAMAIS de faux « payé »). markWithdrawalPaid / refundWithdrawal ne sont appelés que sur
+    // confirmation/échec RÉEL du prestataire, à l'intérieur de attemptDisbursement.
+    const disb = await attemptDisbursement({
+      withdrawalId: result.withdrawalId!, amount, currency: typeof currency === 'string' ? currency : 'GNF',
+      destinationType: destType, destination: destDetails,
+    });
+
+    logger.info(`[WalletV2] Withdraw requested: user=${userId}, amount=${amount}, wid=${result.withdrawalId}, status=${disb.status}`);
     await emitCoreFeatureEvent({
       featureKey: 'wallet.withdraw',
       coreEngine: 'payment',
@@ -1302,9 +1320,16 @@ router.post('/withdraw', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       criticality: 'critical',
       status: 'success',
       userId,
-      payload: { amount },
+      payload: { amount, withdrawal_id: result.withdrawalId, status: disb.status },
     });
-    res.json({ success: true, new_balance: result.newBalance, operation: 'withdraw' });
+    // Statut honnête : 'paid' seulement si un versement réel a été confirmé ; sinon 'pending'/'processing'.
+    res.json({
+      success: true,
+      operation: 'withdraw',
+      withdrawal_id: result.withdrawalId,
+      status: disb.status,
+      message: disb.status === 'paid' ? 'Retrait effectué.' : 'Retrait en cours de traitement.',
+    });
   } catch (error: any) {
     logger.error(`Wallet withdraw error: ${error.message}`);
     await emitCoreFeatureEvent({

@@ -524,6 +524,69 @@ export async function debitWallet(
 }
 
 // ─────────────────────────────────────────────────────────
+// RETRAIT — ledger + machine à états (verrou « aucun débit sans versement »)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Demande de retrait : débite le wallet vers une ligne `withdrawals` status='pending'
+ * (argent IMMOBILISÉ, pas détruit), dans UNE transaction atomique et idempotente.
+ * L'argent ne devient définitif (`paid`) que sur confirmation d'un vrai versement ;
+ * en cas d'échec il est remboursé (`refundWithdrawal`). Passe par la RPC service_role
+ * `request_withdrawal` (aucun débit possible hors d'une ligne withdrawals traçable).
+ */
+export async function requestWithdrawal(
+  userId: string,
+  amount: number,
+  currency: string,
+  destinationType: string,
+  destination: Record<string, unknown>,
+  idempotencyKey: string,
+  fee: number = 0,
+  description?: string,
+): Promise<{ success: boolean; withdrawalId?: string; status?: string; error?: string; error_code?: string }> {
+  const { data, error } = await supabaseAdmin.rpc('request_withdrawal', {
+    p_user_id: userId,
+    p_amount: amount,
+    p_currency: currency,
+    p_destination_type: destinationType,
+    p_destination: destination ?? {},
+    p_idempotency_key: idempotencyKey,
+    p_fee: fee,
+    p_description: description ?? null,
+  });
+  if (error || !(data as any)?.success) {
+    return {
+      success: false,
+      error: error?.message || (data as any)?.error || 'Retrait impossible',
+      error_code: (data as any)?.error_code,
+    };
+  }
+  return { success: true, withdrawalId: (data as any).withdrawal_id, status: (data as any).status };
+}
+
+/** Versement confirmé par le prestataire → débit définitif (payout_reference UNIQUE). */
+export async function markWithdrawalPaid(
+  withdrawalId: string, payoutReference: string,
+): Promise<{ success: boolean; status?: string; error?: string }> {
+  const { data, error } = await supabaseAdmin.rpc('mark_withdrawal_paid', {
+    p_withdrawal_id: withdrawalId, p_payout_reference: payoutReference,
+  });
+  if (error || !(data as any)?.success) return { success: false, error: error?.message || (data as any)?.error };
+  return { success: true, status: (data as any).status };
+}
+
+/** Payout refusé/échec/timeout → REMBOURSEMENT ATOMIQUE (l'argent revient au solde). */
+export async function refundWithdrawal(
+  withdrawalId: string, reason?: string,
+): Promise<{ success: boolean; status?: string; error?: string }> {
+  const { data, error } = await supabaseAdmin.rpc('refund_withdrawal', {
+    p_withdrawal_id: withdrawalId, p_reason: reason ?? null,
+  });
+  if (error || !(data as any)?.success) return { success: false, error: error?.message || (data as any)?.error };
+  return { success: true, status: (data as any).status };
+}
+
+// ─────────────────────────────────────────────────────────
 // TRANSFER P2P
 // ─────────────────────────────────────────────────────────
 

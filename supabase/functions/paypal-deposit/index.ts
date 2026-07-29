@@ -346,12 +346,15 @@ serve(async (req) => {
       // du webhook ne re-crédite JAMAIS. Remplace l'UPDATE balance direct (contournait le
       // plafond + rejouable). Le montant est DÉJÀ converti dans la devise du wallet.
       const captureId = captureData.purchase_units[0].payments.captures[0].id;
-      const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("execute_atomic_deposit", {
+      // Helper UNIQUE settle_deposit → verrou DB + plafond AML + idempotence sur le capture_id
+      // PayPal (anti-double-capture). Montant déjà converti dans la devise du wallet.
+      const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("settle_deposit", {
+        p_provider: "paypal",
+        p_provider_ref: String(captureId),
         p_user_id: userId,
         p_amount: creditedNetAmount,
+        p_currency: walletCurrency,
         p_description: `Dépôt PayPal - Order ${orderId}`,
-        p_reference: `PP-${captureId}`,
-        p_source_type: "deposit",
       });
       if (creditErr || !(creditRes as any)?.success) {
         logStep("❌ Crédit wallet échoué", { error: creditErr?.message || (creditRes as any)?.error });

@@ -434,6 +434,42 @@ export async function creditWallet(
   }
 }
 
+/**
+ * HELPER UNIQUE de crédit-après-paiement (dépôts). Partagé par TOUS les webhooks prestataire
+ * (Stripe / ChapChapPay / Djomy / PayPal). Passe par la RPC `settle_deposit` qui EXIGE une
+ * ligne `payment_transactions` completed non consommée (verrou DB) : impossible de créditer un
+ * dépôt sans paiement adossé. Idempotent (provider_ref), concordance montant vérifiée en base.
+ * À appeler UNIQUEMENT après vérif signature + statut prestataire = payé.
+ */
+export async function settleDeposit(
+  provider: string,
+  providerRef: string,
+  userId: string,
+  amount: number,
+  currency: string = 'GNF',
+  description?: string,
+): Promise<{ success: boolean; credited?: number; quarantined?: number; error?: string }> {
+  const { data, error } = await supabaseAdmin.rpc('settle_deposit', {
+    p_provider: provider,
+    p_provider_ref: providerRef,
+    p_user_id: userId,
+    p_amount: amount,
+    p_currency: currency,
+    p_description: description ?? null,
+  });
+  if (error || !(data as any)?.success) {
+    const msg = error?.message || (data as any)?.error || 'settle_deposit failed';
+    logger.error(`[Wallet] settleDeposit échoué: provider=${provider} ref=${providerRef}: ${msg}`);
+    return { success: false, error: msg };
+  }
+  logger.info(`[Wallet] Dépôt réglé (verrou): provider=${provider} ref=${providerRef} credited=${(data as any).credited} quarantined=${(data as any).quarantined}`);
+  return {
+    success: true,
+    credited: Number((data as any).credited || 0),
+    quarantined: Number((data as any).quarantined || 0),
+  };
+}
+
 // ─────────────────────────────────────────────────────────
 // DEBIT
 // ─────────────────────────────────────────────────────────

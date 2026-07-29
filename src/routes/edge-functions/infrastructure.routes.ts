@@ -177,9 +177,15 @@ router.post("/escrow-create", async (req: Request, res: Response) => {
   return res.json({ success: true, escrow_id: `escrow-${Date.now()}`, amount });
 });
 
-router.post("/escrow-create-stripe", async (req: Request, res: Response) => {
-  const { buyer_id, seller_id, amount } = req.body || {};
-  return res.json({ success: true, escrow_id: `escrow-stripe-${Date.now()}`, amount });
+router.post("/escrow-create-stripe", async (_req: Request, res: Response) => {
+  // 🔒 Stub neutralisé (audit dépôts) : renvoyait un escrow_id FABRIQUÉ sans créer aucun
+  // escrow ni contacter Stripe → faux succès. Un escrow réel passe par le paiement sécurisé /
+  // marketplace-escrow. Refus explicite plutôt qu'un mensonge.
+  return res.status(503).json({
+    success: false,
+    error: "Escrow Stripe non configuré sur ce point.",
+    error_code: "ESCROW_STRIPE_NOT_CONFIGURED",
+  });
 });
 
 router.post("/escrow-release", async (req: Request, res: Response) => {
@@ -187,9 +193,10 @@ router.post("/escrow-release", async (req: Request, res: Response) => {
   return res.json({ success: true, escrow_id, released: true });
 });
 
-router.post("/escrow-stripe-webhook", async (req: Request, res: Response) => {
-  const { event_type } = req.body || {};
-  return res.json({ success: true, webhook_processed: true });
+router.post("/escrow-stripe-webhook", async (_req: Request, res: Response) => {
+  // 🔒 Stub neutralisé (audit dépôts) : acquittait un webhook escrow Stripe sans vérifier
+  // signature ni traiter quoi que ce soit. Le webhook Stripe canonique signé = /webhooks/stripe.
+  return res.status(503).json({ success: false, error: "Webhook escrow Stripe non configuré.", error_code: "ESCROW_STRIPE_WEBHOOK_NOT_CONFIGURED" });
 });
 
 // Product Management

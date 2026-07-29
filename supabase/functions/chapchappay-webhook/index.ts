@@ -163,12 +163,15 @@ serve(async (req) => {
     if (internalStatus === "completed" && transaction?.payment_type === "pull" && transaction?.user_id) {
       const depositAmount = Number(paid_amount || amount) || 0;
       if (depositAmount > 0) {
-        const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("execute_atomic_deposit", {
+        // Helper UNIQUE settle_deposit → verrou DB (exige une ligne payment_transactions
+        // completed non consommée) + plafond AML + idempotence sur (provider,provider_ref).
+        const { data: creditRes, error: creditErr } = await supabaseAdmin.rpc("settle_deposit", {
+          p_provider: "chapchappay",
+          p_provider_ref: String(transaction_id),
           p_user_id: transaction.user_id,
           p_amount: depositAmount,
+          p_currency: "GNF",
           p_description: `Dépôt Mobile Money (${payment_method})`,
-          p_reference: `CCP-${transaction_id}`,
-          p_source_type: "deposit",
         });
         if (creditErr || !(creditRes as any)?.success) {
           logStep("❌ Crédit wallet échoué", { error: creditErr?.message || (creditRes as any)?.error });

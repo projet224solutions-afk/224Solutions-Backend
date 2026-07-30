@@ -68,6 +68,7 @@ import walletPayRoutes from './routes/walletPay.routes.js';
 import webhooksDjomyRoutes from './routes/webhooksDjomy.routes.js';
 import webhooksCinetpayRoutes from './routes/webhooksCinetpay.routes.js';
 import webhooksWaveRoutes from './routes/webhooksWave.routes.js';
+import serviceGeneratorRoutes from './routes/serviceGenerator.routes.js';
 import documentsRoutes from './routes/documents.routes.js';
 import productRoutes from './routes/products.routes.js';
 import orderRoutes from './routes/orders.routes.js';
@@ -355,6 +356,8 @@ app.use('/api/v2/wallet-pay', walletPayRoutes);
 app.use('/api/v2/webhooks/djomy', webhooksDjomyRoutes);
 app.use('/api/v2/webhooks/cinetpay', webhooksCinetpayRoutes);
 app.use('/api/v2/webhooks/wave', webhooksWaveRoutes);
+// Générateur de services de proximité no-code (PDG only : verifyJWT + requireRole dans les routes)
+app.use('/api/v2/pdg/services', serviceGeneratorRoutes);
 app.use('/api/auth/failover', authFailoverRoutes);
 app.use('/api/v2/realtime', realtimeRoutes);
 app.use('/api/v2/live', liveRoutes);

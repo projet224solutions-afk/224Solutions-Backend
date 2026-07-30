@@ -83,12 +83,16 @@ async function generateWithAI(userText: string, name: string, category: string):
   const key = process.env.ANTHROPIC_API_KEY?.trim();
   if (!key) return { success: false, code: 'AI_NOT_CONFIGURED', error: "Le fournisseur IA n'est pas configuré (ANTHROPIC_API_KEY absente)." };
   const userMsg = `Service : « ${name} » (catégorie : ${category || 'non précisée'}).\nFonctionnement souhaité par le PDG :\n${userText}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000); // B4 : timeout dur → jamais de blocage
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 900, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: userMsg }] }),
+      signal: controller.signal,
     });
+    clearTimeout(timer);
     if (!r.ok) return { success: false, code: 'AI_ERROR', error: `Fournisseur IA : ${r.status}` };
     const data: any = await r.json();
     const text = (data?.content?.find?.((c: any) => c.type === 'text')?.text || '').trim();
@@ -100,9 +104,35 @@ async function generateWithAI(userText: string, name: string, category: string):
     catch { return { success: false, code: 'AI_BAD_JSON', error: 'Sortie IA : JSON malformé.' }; }
     return { success: true, raw: parsed };
   } catch (e: any) {
-    logger.error(`[svcgen] IA: ${e?.message}`);
-    return { success: false, code: 'AI_ERROR', error: 'Appel IA échoué.' };
+    clearTimeout(timer);
+    const timedOut = e?.name === 'AbortError';
+    logger.error(`[svcgen] IA: ${timedOut ? 'timeout' : e?.message}`);
+    return { success: false, code: 'AI_ERROR', error: timedOut ? "Le fournisseur IA n'a pas répondu à temps." : 'Appel IA échoué.' };
   }
+}
+
+// ── B2 — Rate-limit génération IA (coût réel) : par PDG/jour + plafond GLOBAL/jour avec alerte. ──
+const GEN_PER_PDG_DAILY = 30;
+const GEN_GLOBAL_DAILY = 200;
+async function checkGenerationQuota(actorId?: string): Promise<{ ok: boolean; code?: string; error?: string }> {
+  const since = new Date(); since.setHours(0, 0, 0, 0);
+  const iso = since.toISOString();
+  const perPdg = await supabaseAdmin.from('service_type_generation_log')
+    .select('id', { count: 'exact', head: true }).eq('action', 'generate').eq('actor_user_id', actorId || '').gte('created_at', iso);
+  if ((perPdg.count ?? 0) >= GEN_PER_PDG_DAILY) {
+    return { ok: false, code: 'RATE_LIMIT', error: `Limite quotidienne de génération atteinte (${GEN_PER_PDG_DAILY}/jour). Réessayez demain.` };
+  }
+  const global = await supabaseAdmin.from('service_type_generation_log')
+    .select('id', { count: 'exact', head: true }).eq('action', 'generate').gte('created_at', iso);
+  if ((global.count ?? 0) >= GEN_GLOBAL_DAILY) {
+    await supabaseAdmin.from('system_alerts').insert({
+      severity: 'warning', module: 'service_generator', title: 'Plafond IA quotidien atteint',
+      message: `Le générateur de services a atteint ${GEN_GLOBAL_DAILY} générations aujourd'hui — appels IA suspendus jusqu'à demain.`,
+      metadata: { global_count: global.count },
+    }).then(() => {}, () => {});
+    return { ok: false, code: 'AI_DAILY_CAP', error: 'Plafond quotidien de génération IA atteint. Réessayez demain.' };
+  }
+  return { ok: true };
 }
 
 // ── BLOC 3 — POST /generate-config : IA → JSON → VALIDÉ serveur → renvoyé (éditable par le PDG) ──
@@ -111,6 +141,10 @@ router.post('/generate-config', verifyJWT, requireRole(PDG_ROLES), async (req: A
   const category = String(req.body?.category || '').trim();
   const text = String(req.body?.text || '').trim();
   if (!name || !text) return fail(res, 400, 'Nom et description requis.', 'MISSING_FIELDS');
+
+  // B2 : quota (par PDG + plafond global/jour) AVANT tout appel IA (coût réel).
+  const quota = await checkGenerationQuota(req.user?.id);
+  if (!quota.ok) return fail(res, 429, quota.error || 'Quota atteint.', quota.code || 'RATE_LIMIT');
 
   const gen = await generateWithAI(text, name, category);
   if (!gen.success) {
@@ -133,32 +167,56 @@ router.post('/generate-config', verifyJWT, requireRole(PDG_ROLES), async (req: A
 router.post('/create', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
   const name = String(req.body?.name || '').trim();
   const category = String(req.body?.category || '').trim();
-  const code = String(req.body?.code || name).trim();
+  const rawCode = String(req.body?.code || name).trim();
   const commission = Number(req.body?.commission_rate);
   const config = req.body?.config;
   if (!name) return fail(res, 400, 'Nom requis.', 'MISSING_NAME');
   if (!config || typeof config !== 'object') return fail(res, 400, 'Configuration invalide.', 'INVALID_CONFIG');
 
-  // Ceinture + bretelles : on ré-assainit ICI, et la RPC ré-assainit EN BASE (barrière ultime).
-  const clean = sanitizeConfig(config, config?.prompt_source || '');
+  // B6 : `code` = slug SÛR. Dérivé du nom si absent, slugifié, PUIS validé strictement → aucune injection.
+  const code = rawCode.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+  if (!/^[a-z0-9_-]{2,40}$/.test(code)) {
+    return fail(res, 400, 'Code de service invalide (2 à 40 caractères : lettres, chiffres, _ ou -).', 'INVALID_CODE');
+  }
+
+  // C2 : ALERTE si une capacité HORS whitelist a été soumise (signal de tentative d'élargissement).
+  const rawCaps = (config.capabilities && typeof config.capabilities === 'object') ? Object.keys(config.capabilities) : [];
+  const filtered = rawCaps.filter((c) => !(CAPABILITIES as readonly string[]).includes(c));
+  if (filtered.length) {
+    await supabaseAdmin.from('system_alerts').insert({
+      severity: 'warning', module: 'service_generator', title: 'Capacité hors whitelist filtrée',
+      message: `Création « ${name} » : capacité(s) hors whitelist ignorée(s) : ${filtered.join(', ')}.`,
+      metadata: { actor: req.user?.id, filtered },
+    }).then(() => {}, () => {});
+  }
+
+  // BLINDAGE : on passe la config ORIGINALE à la RPC — c'est la BASE (sanitize_service_config) qui
+  // est l'autorité finale : elle REJETTE les bornes dépassées et FILTRE le hors-whitelist, puis stocke
+  // la version nettoyée (jamais la version reçue telle quelle). La création + l'audit sont atomiques (1 RPC).
   const { data, error } = await supabaseAdmin.rpc('pdg_create_service_type', {
-    p_code: code, p_name: name, p_category: category, p_config: clean,
+    p_code: code, p_name: name, p_category: category, p_config: config,
     p_commission_rate: Number.isFinite(commission) ? commission : 5.0,
     p_actor: req.user?.id, p_raw_ai: req.body?.raw_ai_output ?? null,
   });
   if (error) {
-    const dup = /CODE_DEJA_UTILISE/.test(error.message || '');
-    return fail(res, dup ? 409 : 400, dup ? 'Ce code de service existe déjà.' : (error.message || 'Création refusée.'),
-      dup ? 'CODE_EXISTS' : 'CREATE_FAILED');
+    const msg = error.message || '';
+    if (/CODE_DEJA_UTILISE/.test(msg)) return fail(res, 409, 'Ce code de service existe déjà.', 'CODE_EXISTS');
+    if (/TROP_DE_CHAMPS|TROP_DE_CAPACITES|DESCRIPTION_TROP_LONGUE|CONFIG_INVALIDE/.test(msg)) {
+      await supabaseAdmin.from('system_alerts').insert({
+        severity: 'warning', module: 'service_generator', title: 'Config hors bornes rejetée',
+        message: `Création « ${name} » rejetée (bornes) : ${msg}`, metadata: { actor: req.user?.id },
+      }).then(() => {}, () => {});
+      return fail(res, 400, `Configuration hors limites : ${msg}`, 'CONFIG_OUT_OF_BOUNDS');
+    }
+    return fail(res, 400, msg || 'Création refusée.', 'CREATE_FAILED');
   }
   return ok(res, data);
 });
 
-// ── BLOC 4/5 — GET / : liste des services (dont générés) pour l'écran PDG ──
+// ── C3 — GET / : vue de supervision (services + créateur + actif + nb prestataires rattachés) ──
 router.get('/', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabaseAdmin.from('service_types')
-    .select('id, code, name, category, is_active, commission_rate, config, created_at')
-    .order('created_at', { ascending: false });
+  const { data, error } = await supabaseAdmin.rpc('pdg_service_types_overview');
   if (error) return fail(res, 500, error.message, 'LIST_FAILED');
   return ok(res, data);
 });

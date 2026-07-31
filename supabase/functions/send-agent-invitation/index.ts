@@ -44,6 +44,8 @@ const handler = async (req: Request): Promise<Response> => {
           <!DOCTYPE html>
           <html>
             <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
               <style>
                 body {
                   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;

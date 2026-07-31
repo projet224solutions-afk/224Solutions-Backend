@@ -230,7 +230,8 @@ async function hashCode(code: string): Promise<string> {
 function generateMfaEmail(code: string): string {
   return `
 <!DOCTYPE html>
-<html>
+<html lang="fr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f3f4f6;">
   <div style="max-width:600px;margin:40px auto;background:white;border-radius:16px;padding:40px 30px;box-shadow:0 4px 6px rgba(0,0,0,0.1);">
     <h1 style="color:#3b82f6;text-align:center;margin:0 0 8px;">224SOLUTIONS</h1>

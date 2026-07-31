@@ -82,6 +82,21 @@ export function getEmailHealth(): {
   return { configured: Boolean(env.RESEND_API_KEY), sent: emailSent, failures: emailFailures, lastError: lastEmailError };
 }
 
+/**
+ * Enveloppe TOUT HTML d'email dans un document complet avec <meta charset="utf-8">. SANS ça, le client
+ * mail (Gmail) devine l'encodage et lit l'UTF-8 comme du Latin-1 → « é » devient « Ã© », « ô » → « Ã´ ».
+ * IDEMPOTENT : si le HTML est déjà un document (<html>), on n'INJECTE que le charset manquant (jamais de
+ * double-document). Point unique : tout ce qui passe par sendEmail() en hérite.
+ */
+export function wrapEmailHtml(html: string, title = '224Solutions'): string {
+  if (/<html[\s>]/i.test(html)) {
+    if (/<meta[^>]+charset/i.test(html)) return html;
+    if (/<head[\s>]/i.test(html)) return html.replace(/<head([^>]*)>/i, '<head$1><meta charset="utf-8">');
+    return html.replace(/<html([^>]*)>/i, '<html$1><head><meta charset="utf-8"></head>');
+  }
+  return `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title></head><body style="margin:0;padding:0;background:#f7fafc;">${html}</body></html>`;
+}
+
 export async function sendEmail(email: string, subject: string, html: string): Promise<boolean> {
   // 📱 Comptes « téléphone seul » : l'email est une adresse TECHNIQUE interne
   // (p{numero}@phone.…) — aucune boîte derrière. On saute l'envoi (succès
@@ -103,14 +118,16 @@ export async function sendEmail(email: string, subject: string, html: string): P
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        // charset=utf-8 explicite (ceinture-bretelles) : le corps fetch est déjà encodé UTF-8, mais on
+        // le déclare pour qu'aucun intermédiaire ne réinterprète les accents du subject/html.
+        'Content-Type': 'application/json; charset=utf-8',
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         from: '224Solutions <no-reply@224solution.net>',
         to: [email],
         subject,
-        html,
+        html: wrapEmailHtml(html, subject),
       }),
     });
     if (!res.ok) {

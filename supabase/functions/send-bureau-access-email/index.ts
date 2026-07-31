@@ -36,6 +36,7 @@ serve(async (req: Request) => {
         to: [email],
         subject: type === 'bureau' ? `Votre bureau syndical ${bureau_code || ''} est prêt` : `Votre accès au bureau syndical`,
         html: `
+          <!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;padding:0;background:#f7fafc;">
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h1 style="color: #2563eb;">Bienvenue ${name}!</h1>
             ${type === 'bureau' ? `<p><strong>Votre bureau syndical ${bureau_code} est maintenant actif.</strong></p>` : ''}
@@ -44,6 +45,7 @@ serve(async (req: Request) => {
             <p style="color: #666; font-size: 14px;">Ou copiez ce lien : ${interfaceUrl}</p>
             ${permissions ? `<p style="color: #666; font-size: 14px; margin-top: 20px;">Vos permissions : ${Object.entries(permissions).filter(([k,v]) => v).map(([k]) => k).join(', ')}</p>` : ''}
           </div>
+          </body></html>
         `,
       }),
     });

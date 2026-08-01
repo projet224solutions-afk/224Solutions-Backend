@@ -475,6 +475,8 @@ if (isVercelRuntime) {
 } else {
   server = app.listen(env.PORT, async () => {
     logger.info(`🚀 Backend v3 (Phase 6) started on port ${env.PORT}`);
+    // Contrôle de config du canal WhatsApp OTP (UNE ligne, secrets masqués).
+    try { const { logWhatsAppConfig } = await import('./services/whatsappOtp.service.js'); logWhatsAppConfig(); } catch { /* noop */ }
     await bootstrapBackgroundServices();
   });
 }

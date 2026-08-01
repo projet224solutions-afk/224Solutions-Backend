@@ -21,6 +21,7 @@ import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase.js';
 import { logger } from '../../config/logger.js';
 import { sendSms } from '../../services/sms.service.js';
+import { sendOtpWhatsApp } from '../../services/whatsappOtp.service.js';
 import { recentSendCount, canDeliverTo, dailySmsCount, alertSmsDailyCap } from '../../services/sms/smsGateway.js';
 import { routeRateLimit } from '../../middlewares/routeRateLimiter.js';
 
@@ -147,17 +148,23 @@ router.post('/phone-signup-send', otpRequestIpLimit, async (req: Request, res: R
       return;
     }
 
-    // Envoi via LA passerelle (ordre des fournisseurs par pays configuré en base).
-    const message = `224Solutions - Code d'inscription : ${otp}\nValable 10 minutes.`;
-    const sent = await sendSms(normalized, message, iso, 'signup');
-    if (!sent.ok) {
-      // REPLI HONNÊTE : jamais un écran qui prétend avoir envoyé un code qui ne partira pas.
-      logger.warn(`[phone-signup-send] SMS échec ${normalized.slice(0, 6)}*** (${iso || 'auto'}): ${sent.error}`);
-      res.status(502).json({
-        success: false,
-        error: "SMS indisponible pour ce pays — utilisez l'inscription par email.",
-        sms_unavailable: true,
-      });
+    // Envoi de l'OTP par WHATSAPP (canal téléphone actif — décision 01/08/2026). Le code part dans le
+    // modèle d'authentification Meta (bouton « copier » natif). Le SMS est GELÉ ; le repli est l'EMAIL.
+    const wa = await sendOtpWhatsApp(normalized, otp);
+    if (!wa.success) {
+      logger.warn(`[phone-signup-send] WhatsApp ${wa.error_code} pour ${normalized.slice(0, 6)}***`);
+      if (wa.error_code === 'WHATSAPP_NO_ACCOUNT') {
+        // Numéro sans WhatsApp → bascule email (le numéro pourra être vérifié plus tard depuis le profil).
+        res.status(400).json({ success: false, error: "Ce numéro n'a pas WhatsApp. Inscrivez-vous avec votre adresse email.", error_code: 'NO_WHATSAPP', use_email: true });
+        return;
+      }
+      if (wa.error_code === 'WHATSAPP_NOT_CONFIGURED') {
+        // Compte Meta pas encore approuvé → fail-closed honnête (pas de faux « envoyé »).
+        res.status(503).json({ success: false, error: "L'inscription par téléphone (WhatsApp) sera bientôt disponible — utilisez votre adresse email.", error_code: 'WHATSAPP_NOT_CONFIGURED', use_email: true });
+        return;
+      }
+      // Token expiré / échec d'envoi → repli email honnête. AUCUN chemin ne tente le SMS.
+      res.status(502).json({ success: false, error: "Envoi WhatsApp indisponible pour l'instant — utilisez l'inscription par email.", error_code: wa.error_code, use_email: true });
       return;
     }
 

@@ -20,7 +20,8 @@ import { randomInt } from 'node:crypto';
 import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase.js';
 import { logger } from '../../config/logger.js';
-import { sendSms } from '../../services/sms.service.js';
+// ⛔ SMS gelé (décision 01/08/2026) : l'auth téléphone passe par WhatsApp (sendOtpWhatsApp), repli email.
+//    `sendSms` n'est plus importé ici — garde-fou du test statique anti-SMS (voir *.antiSms.test.ts).
 import { sendOtpWhatsApp } from '../../services/whatsappOtp.service.js';
 import { recentSendCount, canDeliverTo, dailySmsCount, alertSmsDailyCap } from '../../services/sms/smsGateway.js';
 import { routeRateLimit } from '../../middlewares/routeRateLimiter.js';
@@ -118,10 +119,9 @@ router.post('/phone-signup-send', otpRequestIpLimit, async (req: Request, res: R
       return;
     }
     if (existingRows && existingRows.length > 0) {
-      // Numéro déjà pris : on répond EXACTEMENT comme si un code partait, et on prévient le VRAI
-      // propriétaire par SMS (lui seul le voit).
-      sendSms(normalized, '224Solutions : un compte existe déjà avec ce numéro. Connectez-vous (ou « Mot de passe oublié »). Si ce n\'était pas vous, ignorez ce message.', iso, 'signup')
-        .catch(() => { /* non bloquant */ });
+      // Numéro déjà pris : on répond EXACTEMENT comme si un code partait (anti-énumération préservée).
+      // L'ancienne notification SMS au propriétaire est RETIRÉE (canal SMS gelé — décision 01/08/2026) ;
+      // elle pourra revenir via un modèle WhatsApp UTILITY approuvé si besoin. AUCUN SMS dans l'auth.
       genericSent(res, normalized);
       return;
     }
@@ -380,15 +380,16 @@ router.post('/phone-send-otp', otpRequestIpLimit, async (req: Request, res: Resp
       return;
     }
 
-    const sent = await sendSms(storedPhone, `224Solutions - Votre code de vérification : ${otp}\nValable 10 minutes.`, iso, 'reset');
-    if (!sent.ok) {
-      // Panne d'envoi HONNÊTE — même forme que la branche « inconnu + pays non couvert »
-      // (aucun drapeau d'existence, l'anti-énumération reste étanche).
-      logger.warn(`[phone-send-otp] SMS échec ${storedPhone.slice(0, 6)}***: ${sent.error}`);
-      res.status(502).json({
-        success: false,
-        error: "L'envoi par SMS est momentanément indisponible. Réessayez, ou utilisez votre adresse email.",
-        sms_unavailable: true,
+    // Connexion par téléphone : OTP par WHATSAPP (SMS gelé). Repli EMAIL honnête. Message NEUTRE pour
+    // ne pas révéler l'existence (anti-énumération étanche, même forme que la branche « aucun compte »).
+    const wa = await sendOtpWhatsApp(storedPhone, otp);
+    if (!wa.success) {
+      logger.warn(`[phone-send-otp] WhatsApp ${wa.error_code} pour ${storedPhone.slice(0, 6)}***`);
+      const msg = wa.error_code === 'WHATSAPP_NOT_CONFIGURED'
+        ? "La connexion par téléphone (WhatsApp) sera bientôt disponible — utilisez votre adresse email."
+        : "Impossible d'envoyer le code par WhatsApp — utilisez votre adresse email.";
+      res.status(wa.error_code === 'WHATSAPP_NOT_CONFIGURED' ? 503 : 502).json({
+        success: false, error: msg, error_code: wa.error_code, use_email: true,
       });
       return;
     }

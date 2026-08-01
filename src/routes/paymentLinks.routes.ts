@@ -16,6 +16,7 @@ import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { creditWallet } from '../services/wallet.service.js';
+import { createNotifications } from '../services/notification.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
 import { paymentRateLimit } from '../middlewares/routeRateLimiter.js';
 
@@ -524,6 +525,25 @@ router.post('/process', paymentRateLimit, optionalJWT, async (req: Authenticated
       }
 
       logger.info(`[PaymentLinks] Wallet payment completed: txId=${walletTxId}, net=${netAmount}`);
+
+      // 🔔 Notifie les DEUX parties (bénéficiaire crédité + payeur débité). Non bloquant.
+      const cur = link.devise || 'GNF';
+      await createNotifications([
+        {
+          userId: ownerUserId,
+          title: 'Paiement reçu',
+          message: `Vous avez reçu ${netAmount.toLocaleString('fr-FR')} ${cur} (${link.title || link.produit}).`,
+          type: 'payment',
+          metadata: { payment_link_id: link.id, transaction_id: walletTxId, amount: netAmount, direction: 'in' },
+        },
+        {
+          userId,
+          title: 'Paiement envoyé',
+          message: `Votre paiement de ${payAmount.toLocaleString('fr-FR')} ${cur} (${link.title || link.produit}) a été effectué.`,
+          type: 'payment',
+          metadata: { payment_link_id: link.id, transaction_id: walletTxId, amount: payAmount, direction: 'out' },
+        },
+      ]);
 
       res.json({
         success: true,

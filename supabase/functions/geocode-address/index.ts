@@ -56,8 +56,15 @@ serve(async (req) => {
 
     let url = '';
     if (type === 'geocode' && address) {
-      // Forward geocoding avec Mapbox
-      url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${MAPBOX_TOKEN}&language=fr&limit=5`;
+      // Forward geocoding avec Mapbox — BIAIS GUINÉE : country (extensible via env GEOCODE_COUNTRIES,
+      // défaut « gn », demain « gn,sn »), proximité (position client si fournie via lat/lng) et types utiles
+      // (on écarte pays/régions). Corrige « Madina → Bahreïn » : on ne renvoie plus de résultats hors périmètre.
+      const countries = (Deno.env.get('GEOCODE_COUNTRIES') || 'gn').trim();
+      const gTypes = 'address,poi,neighborhood,locality,place';
+      url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${MAPBOX_TOKEN}&language=fr&limit=5&country=${encodeURIComponent(countries)}&types=${encodeURIComponent(gTypes)}`;
+      if (isNumberLike(lng) && isNumberLike(lat)) {
+        url += `&proximity=${lng},${lat}`;
+      }
     } else if (type === 'reverse') {
       // Reverse geocoding avec Mapbox
       url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lng},${lat}.json?access_token=${MAPBOX_TOKEN}&language=fr&limit=1`;

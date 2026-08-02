@@ -258,7 +258,12 @@ router.post('/rides', verifyJWT, async (req: AuthenticatedRequest, res: Response
       p_payment_method: b.paymentMethod || 'cash',
       p_client_distance_km: b.clientDistanceKm ?? null,
       p_client_duration_min: b.clientDurationMin ?? null,
-      p_metadata: b.phoneNumber ? { orange_money_phone: b.phoneNumber } : {},
+      // scheduled_at / rider_note voyagent dans metadata → colonnes dédiées via trigger (aucun changement de signature RPC).
+      p_metadata: {
+        ...(b.phoneNumber ? { orange_money_phone: b.phoneNumber } : {}),
+        ...(b.scheduledAt ? { scheduled_at: b.scheduledAt } : {}),
+        ...(b.riderNote ? { rider_note: b.riderNote } : {}),
+      },
     });
     if (error) { res.status(500).json({ success: false, error: error.message }); return; }
     const r = data as any;

@@ -26,19 +26,38 @@ Date : 2026-08-03. Backend `1a0bb14`.
 
 ---
 
+## ✅ LIVRÉ (2ᵉ passe) — centre + préférences + découverte pipeline push
+
+- **Centre `/notifications` enrichi** : **filtres par CATÉGORIE** (Paiements/Courses/Messages/Système…, puces)
+  en plus de Toutes/Non-lues ; clic → **préfère la colonne `link`** (posée par `create_notification`) puis
+  `getNotificationLink`. « Tout marquer lu », suppression, badge non-lues temps réel = déjà là (préservés).
+  `useUserNotifications` expose désormais `category` + `link`.
+- **Préférences UI** : `NotificationPreferences` (Sheet, engrenage dans l'en-tête) → toggles par **catégorie ×
+  canal** (in-app/push/son) écrivant `notification_preferences` (RLS owner) ; **critiques (paiement) verrouillées
+  ON**. `tsc` 0 · `vitest` 274/274 · `build` OK.
+- **🔎 DÉCOUVERTE (l'audit sous-estimait l'existant)** : le **pipeline push existe déjà** —
+  table **`user_fcm_tokens`** (≈ 41 tokens RÉELS, upsert par `src/lib/firebaseMessaging.ts`) + backend
+  **`push.service.ts` → `sendPushToUser()`** qui délègue à l'**Edge Function `smart-notifications`** (la clé FCM
+  y vit) → FCM. **L'enregistrement du token (AMÉLIORATION 1.1) et l'envoi sont donc DÉJÀ en place** (utilisés
+  par appels/campagnes). → `push_tokens` que j'avais créée = **doublon**, **droppée** (`20260803190000`) ;
+  la vraie table = `user_fcm_tokens`.
+
 ## ⏳ RESTE — à câbler + tester en session dédiée (avec appareil + FCM)
 
-### AMÉLIORATION 1 — 🔴 PUSH app FERMÉE (priorité, test §1 sur appareil)
-- **Enregistrer le token** au login/permission (`useFirebaseMessaging`/`nativePush` existants) → **upsert dans
-  `push_tokens`** (table prête) ; nettoyer les tokens `messaging/registration-token-not-registered`.
-- **Service worker** `public/firebase-messaging-sw.js` : recevoir en arrière-plan, afficher (titre/corps/icône/
-  **badge**/`tag`), **clic → ouvrir `link`**. Web Push VAPID (navigateur) + FCM natif Capacitor (Android app
-  fermée) ; iOS = web push si PWA (limite documentée).
-- **Envoi serveur** : fonction `send_push(user, title, body, link, data)` (edge/backend Node) qui lit
-  `push_tokens` du user (si `notification_channel_enabled(user, category, 'push')`) et appelle FCM. **Brancher
-  dans `create_notification`** (le `TODO(send_push)` est déjà posé) → **le push suit la notif automatiquement**.
-  Fail-open (token mort/FCM down → la notif in-app reste, jamais de crash). **Clés serveur FCM = infra Thierno.**
-- **Test §1** : app fermée → notif de test → téléphone reçoit + sonne/vibre → clic → bon écran (`link`).
+### AMÉLIORATION 1 — 🔴 PUSH app FERMÉE (test §1 sur appareil) — le SEND existe, reste le CÂBLAGE
+- **L'envoi existe déjà** : `sendPushToUser(userId, {title, message, actionUrl, data})` → Edge `smart-notifications`
+  → FCM (tokens `user_fcm_tokens`). Fonctionne pour appels/campagnes. **À faire** : appeler ce chemin quand
+  N'IMPORTE QUELLE notif est créée (devis, paiement, livraison, message…), pas seulement les appels — idéalement
+  via l'Edge `smart-notifications` comme **point unique** (écrit la notif + pousse), en **respectant
+  `notification_channel_enabled(user, category, 'push')`**. (Côté SQL, `create_notification` écrit la ligne ; le
+  push doit partir d'un point qui peut appeler HTTP — Edge/Node ou Database Webhook sur `notifications` INSERT.)
+- **Service worker** `public/firebase-messaging-sw.js` (ABSENT) : réception web en arrière-plan (titre/corps/
+  icône/**badge**/`tag`), **clic → ouvrir `link`**. Natif Android via Capacitor (réveille app fermée) déjà en
+  place côté tokens ; iOS = web push si PWA (limite à documenter).
+- **Fail-open** : token mort/FCM down → la notif in-app reste (jamais de crash) — déjà le cas (`sendPushToUser`
+  best-effort).
+- **Test §1** (sur appareil, infra Thierno) : app fermée → notif de test → téléphone reçoit + sonne/vibre →
+  clic → bon écran (`link`).
 
 ### AMÉLIORATION 2.2 — Centre de notifications
 - `NotificationCenter` (depuis la cloche) : liste paginée, non-lues distinguées, **clic → marque lu + navigue

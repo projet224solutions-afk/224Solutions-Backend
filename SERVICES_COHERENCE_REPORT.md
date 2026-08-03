@@ -23,24 +23,35 @@ Date : 2026-08-03. Livraison **incrémentale** (chaque partie testée + poussée
 
 ---
 
-## PARTIE 2 — IMMOBILIER (édition complète + galerie photos) — ⏳ À VENIR
-Plan : `updateProperty(id, patch)` (RLS owner) + bouton « Modifier l'annonce » ; galerie photos via le
-pipeline `useStorageUpload` (couverture + galerie, réordonnancement, suppression) → table `property_images`
-(à vérifier/étendre) ; affichage fiche client + placeholder `<SafeImage>` si aucune photo. **Séquestre caution
-inchangé** (non-régression). Livré + prouvé en une passe.
+## PARTIE 2 — IMMOBILIER (édition complète + galerie photos) — ✅ LIVRÉ (frontend `7d55545da`)
+- **`updateProperty(id, patch)`** (RLS owner) : édite prix/description/surface/pièces/type/quartier…
+- **`NewPropertyDialog` réutilisé en ÉDITION** (prop `editProperty`) : pré-remplissage, titre/bouton adaptés,
+  + **galerie EXISTANTE** via `PropertyImageUpload` (couverture, ordre, suppression — table `property_images`,
+  déjà présente) + ajout rapide de photos.
+- **`PropertyCard`** : entrée menu **« Modifier l'annonce »** ; `RealEstateModule` route create vs update.
+- **Séquestre caution INCHANGÉ** (non-régression). `tsc` 0 · `vitest` 274/274 · `build` OK.
 
 ---
 
-## PARTIE 3 — TRANSITAIRE (opérationnel) — ⏳ À VENIR (le plus gros)
-Décision d'archi désormais **confirmée par le prompt** (créer/suivre). Plan :
-- Migration : rendre `international_shipments.order_id` **nullable** + champs pro (mode maritime/aérien,
-  villes origine/dest, expéditeur/destinataire, colis, valeur déclarée, incoterm, `client_user_id`,
-  référence auto `EXP-2026-xxxxxx`, machine à états).
-- `createShipment` (depuis le devis de fret, prix serveur figé) + `updateShipmentStatus`
-  (`booked→collecté→transit→douane→dédouané→livré`, horodaté dans `shipment_tracking`).
-- Timeline client (composant taxi/livraison) + notifications ; documents (`customs_documents` jsonb) ;
-  **escrow fret** calqué sur `pay_quote_atomic`/`release_quote_atomic` (0 nouveau chemin d'argent).
-- Onglets : Dashboard / Nouveau devis / Mes expéditions / Documents / Communication.
+## PARTIE 3 — TRANSITAIRE (opérationnel) — ✅ BACKBONE LIVRÉ (backend `f35a23b`, frontend `5accab15e`)
+- **Migration** `20260803130000` : `international_shipments.order_id` **nullable** + champs pro (mode,
+  villes, expéditeur/destinataire, colis, valeur déclarée, incoterm, `client_user_id`, `status` machine à
+  états, `reference` `EXP-…`, `quote_id`) ; **table `intl_shipment_events`** (le suivi ; ⚠️ `shipment_tracking`
+  est lié à `shipments` domestique) + RLS parties.
+- **RPC `create_freight_shipment`** : **PRIX SERVEUR recalculé** via `calculate_freight_quote` (jamais le
+  client), réf auto, statut `booked`, 1ᵉʳ événement, notif client. REVOKE anon.
+- **RPC `advance_shipment_status`** : machine à états horodatée + notif client + **garde transitaire owner**.
+  **Preuve (rollback)** : advance → `delivered` + `actual_delivery` + **3 événements** ; non-owner **REFUSÉ**.
+- **Frontend** : `useTransitaireShipments.createShipment/updateShipmentStatus` + **sélecteur « Faire avancer »**
+  par expédition dans le dashboard (statut courant + progression).
+- **Escrow fret** = circuit EXISTANT (`service_quotes` + `pay_quote_atomic`/`release_quote_atomic`) via
+  `quote_id` — **0 nouveau chemin d'argent** (colonne posée ; création du quote à câbler côté UI).
+
+### ⏳ Reste PARTIE 3 (UI, prochaine passe — backbone prouvé prêt) :
+- **« Créer l'expédition »** depuis `FreightQuoteCalculator` (formulaire expéditeur/destinataire → `createShipment`).
+- **Timeline client** (composant taxi/livraison sur `intl_shipment_events`) sur la fiche expédition client.
+- **Documents** (`customs_documents` jsonb, pipeline fichiers) + onglets Documents/Mes expéditions.
+- **Câblage escrow** : créer le `service_quote` du fret (payable) + release à `delivered`.
 
 ---
 

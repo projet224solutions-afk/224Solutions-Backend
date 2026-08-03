@@ -10,7 +10,7 @@ import { Router, Response } from 'express';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { copilotRateLimit } from '../middlewares/routeRateLimiter.js';
-import { requireFeature } from '../middlewares/subscriptionFeature.middleware.js';
+// (requireFeature retiré du copilote — gratuit pour tous les connectés ; encore utilisé par POS/stock ailleurs.)
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
@@ -1335,7 +1335,10 @@ async function prepareCopilotTurn(req: AuthenticatedRequest): Promise<{ error?: 
   } };
 }
 
-router.post('/', verifyJWT, requireFeature('copilot_ai'), copilotRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+// 🆓 Copilote IA GRATUIT pour tous les utilisateurs CONNECTÉS (décision PDG) : plus de verrou
+// d'abonnement (`requireFeature('copilot_ai')` retiré). On garde verifyJWT (réservé aux connectés)
+// ET copilotRateLimit (garde-fou anti-abus/anti-boucle = protection de la facture IA). POS/stock inchangés.
+router.post('/', verifyJWT, copilotRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const prep = await prepareCopilotTurn(req);
     if (prep.error) { fail(res, prep.error.status, prep.error.msg); return; }
@@ -1421,7 +1424,8 @@ router.post('/', verifyJWT, requireFeature('copilot_ai'), copilotRateLimit, asyn
 // products/actions/sources. Si le streaming n'est pas possible (pas de clé Anthropic, image,
 // flux vide, erreur AVANT le 1er delta) → event `fallback` : le FRONT rappelle alors la route
 // non-streamée POST '/' de façon TRANSPARENTE. La voix (TTS) est jouée côté front à la fin.
-router.post('/stream', verifyJWT, requireFeature('copilot_ai'), copilotRateLimit, async (req: AuthenticatedRequest, res: Response) => {
+// 🆓 Idem /stream : copilote gratuit pour tous les connectés (verrou d'abonnement retiré), rate-limit conservé.
+router.post('/stream', verifyJWT, copilotRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   const prep = await prepareCopilotTurn(req);
   if (prep.error) { fail(res, prep.error.status, prep.error.msg); return; }
   const t = prep.turn!;

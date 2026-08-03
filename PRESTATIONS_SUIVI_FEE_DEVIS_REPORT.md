@@ -48,14 +48,21 @@ PDG             = +2 500    (1 %)                                ✓
 
 ---
 
-## CORRECTION 1 — Espace client « Mes services commandés » ⏳ À CONSTRUIRE (le plus gros)
-Non livré ce passage (page/section entière). Plan :
-- Section depuis le profil client listant les `service_quotes` où `client_user_id = auth.uid()` (statut clair,
-  montant, prestataire, date).
-- Actions par état : payé+livré → **« J'ai reçu — Libérer »** (`release_quote_atomic`) + **« Signaler un
-  problème »** (litige) ; sur devis → payer/refuser.
-- Le prestataire marque **« Prestation livrée »** (démarre le compteur).
-- **Libération auto 7 j** (pg_cron) + rappels J+3/J+6 ; timeline + PDF devis.
+## CORRECTION 1 — Espace client « Mes services commandés » ✅ CŒUR LIVRÉ (frontend `60b7b6223`)
+- **`useMyServiceQuotes`** : liste les `service_quotes` du client (RLS `quotes_client_read` =
+  `client_user_id = auth.uid()`) + nom du prestataire.
+- **Page `/mes-services`** (`MyServiceOrders`) : par commande — titre, **prestataire**, montant, **statut clair**
+  (En attente du devis / En attente de paiement / Payé — en cours (séquestre) / Terminé / Annulé), date.
+- **Actions** : **« J'ai reçu — Libérer »** (`releaseQuote` → `/api/v2/quotes/:id/release`, circuit backend
+  atomique existant) quand séquestre `held` ; **« Payer »** (→ `/devis/:id`) si devis chiffré en attente ;
+  **« Détail »**. → Le client peut **toujours revenir** suivre + finaliser (le trou est comblé).
+- **Entrée dans le profil client** (menu « Mes services commandés », à côté de « Mes commandes »/« Mes achats »).
+
+### ⏳ Reste CORRECTION 1 (non bloquant pour le cœur) :
+- Prestataire **« marquer Prestation livrée »** (démarre le compteur) — nécessite une RPC dédiée
+  (Bloc 0 verrouille l'owner sur les champs sensibles ; un champ `delivered_at` non verrouillé + RPC).
+- **Libération auto 7 j** (pg_cron) + rappels J+3/J+6 ; **« Signaler un problème »** (litige, PDG tranche) ;
+  timeline détaillée + PDF devis.
 
 ---
 

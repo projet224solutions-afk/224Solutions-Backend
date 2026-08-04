@@ -58,6 +58,28 @@ router.post('/', webhookRateLimit, async (req: Request, res: Response): Promise<
         logger.warn(`[djomy-webhook] montant discordant tx=${txId} attendu=${expected} reçu=${paid}`);
         res.status(409).json({ success: false, error: 'Montant discordant' }); return;
       }
+      // 4bis) BILLETTERIE — paiement d'un BILLET d'événement (OM/MoMo confirmé) : délivrance via le
+      //       MÊME RPC atomique que le wallet (buy_event_ticket), idempotent sur 'agg-'+txId.
+      //       Jamais de billet avant CE point (paiement re-vérifié à l'API + montant concordant).
+      if ((pt as any).metadata?.purpose === 'event_ticket') {
+        const ttId = String((pt as any).metadata?.ticket_type_id || '');
+        const buyer = String((pt as any).metadata?.buyer_user_id || (pt as any).user_id || '');
+        if (!ttId || !buyer) { res.status(400).json({ success: false, error: 'metadata billet incomplète' }); return; }
+        const { data: deliver, error: dErr } = await supabaseAdmin.rpc('buy_event_ticket', {
+          p_ticket_type_id: ttId, p_idempotency: 'agg-' + txId, p_buyer: buyer,
+        });
+        if (dErr || !(deliver as any)?.success) {
+          logger.error(`[djomy-webhook] billet non délivré tx=${txId}: ${dErr?.message || (deliver as any)?.error}`);
+          res.status(400).json({ success: false, error: dErr?.message || (deliver as any)?.error || 'Délivrance billet impossible' });
+          return;
+        }
+        await supabaseAdmin.from('payment_transactions')
+          .update({ status: 'completed', credited_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('id', (pt as any).id);
+        res.status(200).json({ success: true, settled: true, purpose: 'event_ticket', ticket_id: (deliver as any).ticket_id });
+        return;
+      }
+
       const qrRef = String((pt as any).metadata?.qr_reference || '');
       if (!qrRef) { res.status(400).json({ success: false, error: 'qr_reference manquante' }); return; }
 

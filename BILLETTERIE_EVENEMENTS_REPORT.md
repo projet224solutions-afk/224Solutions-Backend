@@ -44,15 +44,46 @@ Tous : `REVOKE anon`, `GRANT authenticated + service_role`.
 6. **Retrait** : 150000 > solde 100000 → `INSUFFICIENT_BALANCE` · 60000 → ok, `new_balance=40000`, ledger `pending`.
 7. **Archivage** : event `archived` + organisateur `is_active=false` (données conservées).
 
-## ⏳ PHASE 2 (session dédiée) — scopé, non déclaré fait
-- **Création du compte organisateur** : route backend Node (auth admin `createUser` + rôle organisateur) —
-  `attach_event_organizer` est prêt à recevoir l'uid créé.
-- **Rail agrégateur** (achat OM/MoMo/carte + retrait réel) : init → webhook signé → `buy_event_ticket(p_buyer)`
-  via service_role — **INTERDIT de déclarer fait sans test sandbox webhook** (même bloqueur que les devis).
-- **Livraison billet** : email Resend + **PDF billet** (pipeline jsPDF, QR haute résolution) + page `/billet/:token`
-  (privée) et `/evenement/:id` (publique, OG dynamique).
-- **UIs** : espace prestataire « Billetterie » (N×X affiché avant paiement), tableau de bord organisateur
-  (Vendus/Restants/Scannés temps réel + scanner caméra + Retirer), item « Événement » marketplace (promotion vidéo).
+## ✅ PHASE 2 — LIVRÉE (backend + frontend complets)
 
-**« Billetterie événements (prépayé commission + wallet temporaire retrait-only + scan QR) — socle backend prouvé
-le 2026-08-04 ; comptes organisateur, agrégateur, billets PDF/email et UIs = phase 2. »**
+### 1) Compte organisateur (backend Node — `events.routes.ts`, monté `/api/v2/events`)
+`POST /organizer` : verifyJWT + **ownership prestataire re-vérifié** → `auth.admin.createUser` (email confirmé,
+identifiants remis en main propre) → rattachement `events.organizer_user_id` + portefeuille temporaire.
+
+### 2) Rail agrégateur OM/MoMo + carte (fail-closed, AUCUN billet avant confirmation)
+- `POST /tickets/pay-init` : **prix lu côté serveur**, init payin Djomy (push USSD), ligne de suivi
+  `payment_transactions` (`metadata.purpose='event_ticket'`) — **zéro billet à l'init**.
+- **Webhook Djomy** (branche `event_ticket` ajoutée) : signature HMAC + **re-vérification statut à l'API** +
+  concordance montant → délivrance par le **MÊME RPC** `buy_event_ticket(p_buyer)` (service_role), idempotent
+  `agg-<txId>` (rejeu → même billet). `GET /tickets/pay-status` : poll → billet à la confirmation.
+- `POST /tickets/pay-card` : Stripe 2 temps (init PaymentIntent prix serveur → confirm `succeeded` → billet,
+  idempotent `card-<pi.id>`).
+- `POST /tickets/buy` : rail **wallet** (immédiat) + **email billet** best-effort.
+- ⚠️ **Test sandbox agrégateur NON exécuté ici** (creds Djomy/Stripe = env prod, webhook réel requis) — le code
+  suit exactement le chemin QR public déjà éprouvé ; test réel = même session que les devis (creds Thierno).
+
+### 3) Livraison du billet (in-app + email + PDF)
+- **Notif in-app cliquable** (RPC, déjà prouvée) → `/billet/:token`.
+- **Email Resend** (gabarit wrapEmailHtml UTF-8) avec bouton vers le billet.
+- **PDF** `lib/eventTicketPdf.ts` (jsPDF + QR 512px, n° billet, mentions anti-fraude).
+- **Pages** : `/evenement/:id` (publique — vidéo promo, infos, achat wallet/OM/MoMo, partage OG),
+  `/billet/:token` (privée — jeton aléatoire, QR plein écran, badge Déjà utilisé, PDF), `/mes-billets`
+  (billets jamais perdus).
+
+### 4) UIs
+- **Prestataire `/billetterie`** : événements + types de billets + **génération prépayée avec N × X affiché
+  AVANT paiement** (+ mention non remboursable) + création du compte organisateur + lien public + archivage.
+- **Organisateur `/organisateur`** : **3 compteurs temps réel 🎟️ Vendus / 🎫 Restants / ✅ Scannés**
+  (safeSubscribe) + **scanner caméra** (QrScannerDialog → `scan_event_ticket`, ALREADY_USED affiché) +
+  **portefeuille (SEULE action : Retirer** OM/carte/virement) + **Promouvoir** (vidéo ≤ 60 s + accroche).
+- **Marketplace** : `loadPromotedEvents` — item « Événement » (**uniquement `active` + `is_promoted`** =
+  modération légère), prix « à partir de » = min des billets DISPONIBLES (stock réel), CTA → `/evenement/:id`.
+
+### Vérifications Phase 2
+Backend `tsc` 0 · Front `tsc` 0 · `vitest` 274/274 (garde no-raw-img respectée via SafeImage) · `vite build` OK ·
+i18n **25/25** (88 clés `ticketing.*`). Flux argent : prouvés en Phase 1 (rollback) — les routes n'introduisent
+**aucun chemin d'argent nouveau** (elles appellent les RPC prouvées).
+
+**« Billetterie événements COMPLÈTE (prépayé commission + comptes organisateur + achat wallet/OM/MoMo/carte
+fail-closed + billets QR/PDF/email + dashboards + marketplace) le 2026-08-04 ; test sandbox agrégateur = à
+exécuter avec les creds (même session que les devis). »**

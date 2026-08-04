@@ -82,6 +82,26 @@ router.post('/organizer', verifyJWT, async (req: AuthenticatedRequest, res: Resp
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// POST /organizer/reset-password — le PRESTATAIRE réinitialise l'accès de SON organisateur
+// (oubli du mot de passe). L'organisateur garde aussi le « Mot de passe oublié » standard (email).
+// ═══════════════════════════════════════════════════════════════════════════
+router.post('/organizer/reset-password', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const actor = req.user!.id;
+  const { event_id, new_password } = req.body || {};
+  if (!event_id || !new_password) { fail(res, 400, 'event_id et new_password requis', 'MISSING_FIELDS'); return; }
+  if (String(new_password).length < 8) { fail(res, 400, 'Mot de passe trop court (8 caractères minimum)', 'WEAK_PASSWORD'); return; }
+  const { data: ev } = await supabaseAdmin.from('events')
+    .select('provider_user_id, organizer_user_id').eq('id', event_id).maybeSingle();
+  if (!ev) { fail(res, 404, 'Événement introuvable', 'EVENT_NOT_FOUND'); return; }
+  if ((ev as any).provider_user_id !== actor) { fail(res, 403, 'Vous n\'êtes pas le prestataire de cet événement', 'NOT_PROVIDER'); return; }
+  if (!(ev as any).organizer_user_id) { fail(res, 404, 'Aucun organisateur rattaché', 'NO_ORGANIZER'); return; }
+  const { error } = await supabaseAdmin.auth.admin.updateUserById((ev as any).organizer_user_id, { password: String(new_password) });
+  if (error) { fail(res, 500, error.message, 'RESET_FAILED'); return; }
+  logger.info(`[events] reset mdp organisateur ${(ev as any).organizer_user_id} par ${actor}`);
+  ok(res, { reset: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // POST /tickets/buy — rail WALLET (immédiat). Le RPC débite + crédite + assigne, atomique.
 // ═══════════════════════════════════════════════════════════════════════════
 router.post('/tickets/buy', verifyJWT, async (req: AuthenticatedRequest, res: Response): Promise<void> => {

@@ -104,3 +104,29 @@ devise d'affichage de l'utilisateur (singleton `lib/displayCurrency` alimenté p
   tout futur écran l'est PAR DÉFAUT. Les hardcodes JSX restants (hors i18n) suivent le balayage par
   vagues déjà en cours (voir sections précédentes) — la substitution t() couvre l'immense majorité
   du visible dès maintenant.
+
+## TRAITEMENT DÉFINITIF À LA SOURCE (06/08/2026) — plus AUCUNE clé ne dépend du filet t()
+
+**Cas témoin (2e capture SLE, « Prix barré (GNF) »/« Prix de revient (GNF) » résistants)** — traité :
+- `productManagement.prixBarreGnf/prixDeRevientGnf/prixDuCartonGnf` **SUPPRIMÉES des 26 locales**,
+  remplacées par `prixBarre`/`prixDeRevient`/`prixDuCarton` (valeurs SANS devise) **composées au point
+  d'appel** avec la devise réelle : `` `${t('productManagement.prixBarre')} (${uc})` `` (même patron que
+  le champ « Prix de vente » déjà corrigé). Un compte SLE verra « Prix barré (SLE) » dans la BUILD,
+  indépendamment du filet runtime. Idem dropshipping/import Chine (3 écrans, + `selling_currency`
+  qui était ENREGISTRÉ 'GNF' en dur → devise réelle du vendeur), POS (« GNF/unité » → `${devise}/unité`).
+- **Purge scriptée des VALEURS** : 41 clés-étiquettes (« Montant (GNF) * », « Prix (GNF) »…) → le token
+  « (GNF) » retiré dans les **26 locales** (416 lignes touchées) — libellés neutres, zéro GNF à la source.
+- **8 clés reformulées** (« GNF gagnés »→« Gains », « Afficher en GNF »→« Afficher dans ma devise »,
+  « portefeuille GNF »→« portefeuille », tranches BTP 50M/500M sans devise…) — fr/en réécrites,
+  24 langues retraduites.
+- **Conservées SCIEMMENT (GNF légitime)** : écrans PDG/admin (trésorerie plateforme GNF :
+  walletAdminPanel, pDGFinance, pDGTransferLimits, pDGConfig, affiliationPdg, countryPricingManagement,
+  walletProvenancePanel, prix de référence des plans), `currencyIndicator.francGuineenGnf` (nom de la
+  devise), `vendorSubscriptionPlanSelector.tarifGnfFallback` (message qui ASSUME le repli GNF).
+- La substitution runtime t() **reste en filet** pour les oublis futurs + la **garde montants chiffrés**
+  (substitution refusée + warn) reste active.
+- **Version déployée** : commits front jusqu'à ce fix inclus poussés sur main (Vercel auto-deploy) ;
+  build locale vérifiée SW v1785967867371. Si le device montre encore l'ancien texte → build pas
+  encore rafraîchie sur l'appareil (/?resetSw).
+- ⚠️ Capture de vérité (compte SLE, formulaire produit « Prix de vente (SLE) / Prix barré (SLE) /
+  Prix de revient (SLE) ») : à faire par Thierno sur device après déploiement.

@@ -44,6 +44,7 @@ async function recordSubscriptionRevenue(
   amountGnf: number,
   transactionId: string | undefined | null,
   userId: string,
+  currency = 'GNF',  // 🌍 grille par pays : la devise RÉELLE du montant (jamais « GNF » menti)
 ): Promise<void> {
   try {
     if (!amountGnf || amountGnf <= 0 || !transactionId) return;
@@ -53,7 +54,7 @@ async function recordSubscriptionRevenue(
       p_percentage: 100,
       p_transaction_id: transactionId,
       p_user_id: userId,
-      p_currency: 'GNF',
+      p_currency: currency,
     });
     if (error) logger.warn(`[treasury] record_pdg_revenue(${source}) échoué: ${error.message}`);
   } catch (e: any) {
@@ -367,11 +368,42 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
       return;
     }
 
-    // 2. Prix selon le cycle
-    const monthly = Number(plan.monthly_price_gnf) || 0;
-    const price = cycle === 'yearly'
-      ? (Number(plan.yearly_price_gnf) || monthly * 12)
-      : cycle === 'quarterly' ? monthly * 3 : monthly;
+    // 2. Prix selon le cycle — 🌍 GRILLE PAR PAYS (décision Thierno 05/08/2026) :
+    //    le prix vient de subscription_prices (devise LOCALE du pays de l'utilisateur = devise de
+    //    son wallet, verrouillée) quand la grille existe ; sinon repli sur les prix GNF des plans
+    //    (assumé, jamais un mélange silencieux) + warn pour que le PDG crée la grille manquante.
+    const gnfMonthly = Number(plan.monthly_price_gnf) || 0;
+    let monthly = gnfMonthly;
+    let pricingCurrency: string | null = null;   // null = repli GNF
+    let pricingCountry: string | null = null;
+    try {
+      const { data: prof } = await supabaseAdmin.from('profiles')
+        .select('country_code').eq('id', userId).maybeSingle();
+      const cc = String((prof as any)?.country_code || '').toUpperCase();
+      if (cc) {
+        pricingCountry = cc;
+        const { data: grid } = await supabaseAdmin.from('subscription_prices')
+          .select('price, currency_code')
+          .eq('country_code', cc).eq('service_type', 'vendor')
+          .eq('plan_code', plan.name).eq('billing_cycle', 'monthly').eq('is_active', true)
+          .maybeSingle();
+        if (grid) {
+          monthly = Number((grid as any).price) || 0;
+          pricingCurrency = String((grid as any).currency_code || '').toUpperCase() || null;
+        } else if (gnfMonthly > 0) {
+          logger.warn(`[subscriptions/purchase] grille pays MANQUANTE (${cc}, plan=${plan.name}) → repli GNF`);
+        }
+      }
+    } catch { /* repli GNF assumé */ }
+    // Annuel : ligne yearly inexistante en grille → 12 × mensuel avec le MÊME rabais % que le plan.
+    const yearlyDiscountPct = gnfMonthly > 0 && Number(plan.yearly_price_gnf) > 0
+      ? Math.max(0, 1 - Number(plan.yearly_price_gnf) / (gnfMonthly * 12)) : 0;
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const price = pricingCurrency
+      ? round2(cycle === 'yearly' ? monthly * 12 * (1 - yearlyDiscountPct)
+        : cycle === 'quarterly' ? monthly * 3 : monthly)
+      : (cycle === 'yearly' ? (Number(plan.yearly_price_gnf) || monthly * 12)
+        : cycle === 'quarterly' ? monthly * 3 : monthly);
 
     // 3. Période (calendaire)
     const now = new Date();
@@ -436,6 +468,8 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
       const switchMetadata = {
         ...((currentSub.metadata as any) || {}),
         idempotency_key: idempotencyKey,
+        pricing_source: pricingCurrency ? 'country_grid' : 'gnf_fallback',
+        pricing_country: pricingCountry, pricing_currency: pricingCurrency || 'GNF',
         plan_changed_from: currentSub.plan_id,
         plan_changed_at: now.toISOString(),
         switch_charge_gnf: switchCharge,
@@ -471,7 +505,7 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
       }
 
       if (switchCharge > 0) {
-        await recordSubscriptionRevenue('abonnement_vendeur', switchCharge, currentSub.id, userId); // 🏦 revenu AVANT commission
+        await recordSubscriptionRevenue('abonnement_vendeur', switchCharge, currentSub.id, userId, pricingCurrency || 'GNF'); // 🏦 revenu AVANT commission
         const commission = await triggerAffiliateCommission(userId, switchCharge, 'abonnement', currentSub.id);
         if (!commission.success) {
           logger.warn(`[subscriptions/purchase] commission switch non créée pour ${currentSub.id}: ${commission.error || 'unknown'}`);
@@ -505,7 +539,7 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
       p_period_start: now.toISOString(),
       p_period_end: periodEnd.toISOString(),
       p_auto_renew: !isFree,
-      p_metadata: { initiated_from: 'backend_purchase', plan_name: plan.name, idempotency_key: idempotencyKey },
+      p_metadata: { initiated_from: 'backend_purchase', plan_name: plan.name, idempotency_key: idempotencyKey, pricing_source: pricingCurrency ? 'country_grid' : 'gnf_fallback', pricing_country: pricingCountry, pricing_currency: pricingCurrency || 'GNF' },
       p_current_sub_id: null,
     });
     if (newRpcErr) {
@@ -523,7 +557,7 @@ router.post('/purchase', verifyJWT, subscriptionRateLimit, async (req: Authentic
 
     // Commission d'affiliation (plans payants) — best-effort, hors transaction critique
     if (!isFree) {
-      await recordSubscriptionRevenue('abonnement_vendeur', price, newResult.subscription_id!, userId); // 🏦 revenu AVANT commission
+      await recordSubscriptionRevenue('abonnement_vendeur', price, newResult.subscription_id!, userId, pricingCurrency || 'GNF'); // 🏦 revenu AVANT commission
       const commission = await triggerAffiliateCommission(userId, price, 'abonnement', newResult.subscription_id!);
       if (!commission.success) {
         logger.warn(`[subscriptions/purchase] commission non créée pour ${newResult.subscription_id}: ${commission.error || 'unknown'}`);

@@ -64,3 +64,20 @@ fallback natif sans FX), le 2026-08-05 — déploiement par rôle en cours. »**
 - **Design224 (3)** : page de démo design. — **Marketplace « dès X GNF » (2)** : phase audit `currency` par
   table (produits modules) — planifiée.
 Vérifs : tsc 0 · vitest 274/274 · build OK.
+
+---
+## DÉCISION VALIDÉE Thierno (2026-08-05) : plans d'abonnement = GRILLES PAR PAYS
+- **Backend `/api/subscriptions/purchase`** (source de vérité du débit) : le prix vient de
+  `subscription_prices` (grille du pays de `profiles.country_code`, service_type='vendor',
+  plan_code=plan.name) en **devise LOCALE** (= devise du wallet, verrouillée → débit direct juste).
+  Annuel = 12 × mensuel grille avec le MÊME rabais % que le plan. Prorata upgrade/downgrade inchangé
+  (les deux montants sont dans la devise de l'utilisateur). Métadonnées : `pricing_source`
+  (country_grid|gnf_fallback), `pricing_country`, `pricing_currency`.
+- **Revenu coffre PDG** : journalisé avec la **devise réelle** du montant (fini `p_currency: 'GNF'`
+  menti pour un paiement EUR/XOF).
+- **Repli fail-honest** : pays sans grille → prix GNF assumé + `logger.warn` « grille manquante »
+  (le PDG crée la grille via son écran Country Pricing existant) + mention UI « Tarif en GNF ».
+- **Front `VendorSubscriptionPlanSelector`** : affiche la grille NATIVEMENT (`formatCountryPrice`,
+  zéro FX) avec la MÊME règle de calcul que le backend ; repli `<Money from='GNF'>` sinon.
+- **État des grilles (prod)** : 4331 lignes, 7 pays (GN, SN, CI, ML, MA, FR, US) — **⚠️ Sierra Leone
+  ABSENTE : grille SL à créer par le PDG** (sinon les vendeurs SL voient le repli GNF assumé).

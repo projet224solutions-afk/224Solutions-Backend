@@ -41,3 +41,26 @@ from=devise_d_origine>` (conversion + fallback natif).
 Vérifs : tsc 0 · vitest 274/274 · build OK · i18n 25/25.
 **« Chaque pays a sa devise et sa langue partout (socle posé + écrans vendeur des captures corrigés,
 fallback natif sans FX), le 2026-08-05 — déploiement par rôle en cours. »**
+
+---
+## VAGUE 2-3 (2026-08-05, suite) — rôles déroulés
+**Patron appliqué (montant DE l'utilisateur → SA devise, natif via `useUserCurrency`)** :
+- **VENDEUR** : `POSSystem` (19 hits — devise de BASE du POS = celle du vendeur : annotations « (X GNF) »
+  et bascule de devise recalculées sur `baseCur`), `AffiliateManagement` (CA 30j + prix), `DirectSaleForm`
+  (suffixes devise), `PaymentProcessor` (libellés de frais gabarit `{cur}`), `PurchaseEditor` (B2B),
+  `VendorDeliveryPricing` (bornes /km).
+- **PRESTATAIRE** : `quoteForms` artisan (vitrerie/métal/plomberie/menuiserie — catalogues affichés dans SA
+  devise), `ServiceAnalytics` (formateur paramétré ; le composant utilisait déjà userCurrency),
+  `DeliveryModule` (grille indicative).
+- **LIVREUR** : `DriverPriceSettings` (bornes tarif/km).
+- **CLIENT** : `MyBeautyAppointments` (remboursement), `CashConfirm` + `ClientCashConfirm` (dépôt/retrait cash
+  agent), `StripeWalletTopup` (recharge), `CardPaymentDialog` + `CardTransactionsHistory` (carte virtuelle),
+  `AffiliationHub` (gains), `B2BQuickSendBar`, `QuickPaymentLinkButton`.
+
+**Reliquat (81 lignes, ASSUMÉ — pas des bugs)** :
+- **PDG/admin (28)** : trésorerie/limites/rapports = devise PLATEFORME GNF (coffre PDG) — correct ; agrégats
+  multi-devises PAR devise = évolution PDG à trancher.
+- **Dropshipping/import Chine (4+)** : flux d'achat réellement facturés en GNF (clés i18n dédiées conservées).
+- **Design224 (3)** : page de démo design. — **Marketplace « dès X GNF » (2)** : phase audit `currency` par
+  table (produits modules) — planifiée.
+Vérifs : tsc 0 · vitest 274/274 · build OK.

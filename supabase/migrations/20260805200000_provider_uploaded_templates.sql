@@ -52,7 +52,8 @@ SET search_path = public
 AS $$
 DECLARE
   v_total bigint;
-  v_quota constant bigint := 2 * 1024 * 1024 * 1024; -- 2 Go
+  -- ⚠️ 2*1024*1024*1024 en littéraux int4 DÉBORDE (integer out of range) → cast bigint AVANT.
+  v_quota constant bigint := 2::bigint * 1024 * 1024 * 1024; -- 2 Go
 BEGIN
   SELECT COALESCE(SUM(size_bytes), 0) INTO v_total
   FROM public.provider_uploaded_templates

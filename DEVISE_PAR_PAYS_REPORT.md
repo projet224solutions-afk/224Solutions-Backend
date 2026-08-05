@@ -91,9 +91,15 @@ devise d'affichage de l'utilisateur (singleton `lib/displayCurrency` alimenté p
 - Utilisateur GNF (Guinée) → identité TOTALE (zéro régression).
 - Utilisateur SLE/XOF/NGN… → TOUTES les étiquettes traduites mentionnant « GNF » (labels, placeholders,
   aides, toasts) affichent SA devise — dans les 25 langues d'un coup, y compris les écrans pas encore
-  balayés. **Sûr** : vérifié qu'AUCUNE valeur i18n ne contient de montant chiffré en GNF (grep = 0) —
-  la substitution ne touche que des étiquettes de devise (qui désignent la devise de saisie de
-  l'utilisateur → sémantiquement correcte).
+  balayés.
+- ~~**Sûr** : vérifié qu'AUCUNE valeur i18n ne contient de montant chiffré en GNF (grep = 0)~~
+  **❌ CORRECTION 05/08/2026 : cette affirmation était FAUSSE** — la vérification initiale était
+  défectueuse : 8 clés contenaient des MONTANTS CHIFFRÉS (« 10,000 GNF de bienvenue », « Limite
+  journalière : 1 000 000 GNF », minimum Stripe, exemples de grille de frais…) que la substitution
+  transformait en montants MENSONGERS (« 10,000 XOF ») pour les non-Guinéens. Corrigé : montants
+  sortis des traductions (paramétrés au point d'appel avec la vraie valeur/devise) + GARDE dans la
+  substitution (montant chiffré + GNF → substitution refusée + warn). Détail complet :
+  `vista-flows/FIX_MONTANTS_I18N_REPORT.md`.
 → Le formulaire produit complet (vente/barré/revient) est cohérent dans la devise de l'utilisateur, et
   tout futur écran l'est PAR DÉFAUT. Les hardcodes JSX restants (hors i18n) suivent le balayage par
   vagues déjà en cours (voir sections précédentes) — la substitution t() couvre l'immense majorité

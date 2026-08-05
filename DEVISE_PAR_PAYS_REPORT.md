@@ -81,3 +81,20 @@ Vérifs : tsc 0 · vitest 274/274 · build OK.
   zéro FX) avec la MÊME règle de calcul que le backend ; repli `<Money from='GNF'>` sinon.
 - **État des grilles (prod)** : 4331 lignes, 7 pays (GN, SN, CI, ML, MA, FR, US) — **⚠️ Sierra Leone
   ABSENTE : grille SL à créer par le PDG** (sinon les vendeurs SL voient le repli GNF assumé).
+
+---
+## RÈGLE RENFORCÉE (2026-08-05) — fini les fixes partiels : « GNF » substitué AU NIVEAU DE t()
+**Constat capture XOF** : « Prix de vente (XOF) » corrigé mais « Prix barré (GNF) » / « Prix de revient
+(GNF) » restés — car le « GNF » vit dans les VALEURS i18n (~86 clés × 25 langues).
+**Solution structurelle (un point, pas 86×25 retouches)** : `t()` substitue désormais `\bGNF\b` par la
+devise d'affichage de l'utilisateur (singleton `lib/displayCurrency` alimenté par CurrencyContext) :
+- Utilisateur GNF (Guinée) → identité TOTALE (zéro régression).
+- Utilisateur SLE/XOF/NGN… → TOUTES les étiquettes traduites mentionnant « GNF » (labels, placeholders,
+  aides, toasts) affichent SA devise — dans les 25 langues d'un coup, y compris les écrans pas encore
+  balayés. **Sûr** : vérifié qu'AUCUNE valeur i18n ne contient de montant chiffré en GNF (grep = 0) —
+  la substitution ne touche que des étiquettes de devise (qui désignent la devise de saisie de
+  l'utilisateur → sémantiquement correcte).
+→ Le formulaire produit complet (vente/barré/revient) est cohérent dans la devise de l'utilisateur, et
+  tout futur écran l'est PAR DÉFAUT. Les hardcodes JSX restants (hors i18n) suivent le balayage par
+  vagues déjà en cours (voir sections précédentes) — la substitution t() couvre l'immense majorité
+  du visible dès maintenant.

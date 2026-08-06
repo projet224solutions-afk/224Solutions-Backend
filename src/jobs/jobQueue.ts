@@ -83,6 +83,13 @@ async function createFxAlert(params: {
       metadata: params.metadata || {},
     })
   ).catch(() => {});
+  // ALERTE CRITIQUE → le PDG la VOIT (cloche) — fini les alertes dans le vide.
+  if (params.severity === 'critical') {
+    try {
+      const { notifyPdgFx } = await import('../services/fxRates.service.js');
+      await notifyPdgFx(`👻 Fatome : ${params.title}`, params.description);
+    } catch { /* best-effort */ }
+  }
 }
 
 // ==================== JOB REGISTRY ====================

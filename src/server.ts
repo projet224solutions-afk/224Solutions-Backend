@@ -69,6 +69,7 @@ import webhooksDjomyRoutes from './routes/webhooksDjomy.routes.js';
 import eventsRoutes from './routes/events.routes.js';
 import scannerRoutes from './routes/scanner.routes.js';
 import studioRoutes from './routes/studio.routes.js';
+import fxRoutes from './routes/fx.routes.js';
 import webhooksCinetpayRoutes from './routes/webhooksCinetpay.routes.js';
 import webhooksWaveRoutes from './routes/webhooksWave.routes.js';
 import serviceGeneratorRoutes from './routes/serviceGenerator.routes.js';
@@ -319,6 +320,7 @@ app.get('/api/v2/version', (_req, res) => {
 
 // Migrations (admin, applies database changes)
 app.use('/api/migrations', migrationsRoutes);
+app.use('/api/fx', fxRoutes);
 
 // 🎬 Studio Clips (vendeur : création/suivi/suppression de clips promo)
 app.use('/api/clips', clipsRoutes);

@@ -118,6 +118,7 @@ const AFRICAN_CURRENCIES: Record<string, CurrencyConfig> = {
   SCR: { country: 'Seychelles', fallbackReason: 'CBS : cbs.sc pas de HTML structuré' },
   GMD: { country: 'Gambie', fallbackReason: 'CBG : cbg.gm pas de tableau HTML' },
   SLL: { country: 'Sierra Leone', fallbackReason: 'BSL : bsl.gov.sl site instable' },
+  SLE: { country: 'Sierra Leone (nouveau leone)', fallbackReason: 'BSL : bsl.gov.sl site instable — SLE (redénomination 2022) via API de secours' },
   LRD: { country: 'Liberia', fallbackReason: 'CBL : cbl.org.lr pas de publication web' },
   BWP: { country: 'Botswana', fallbackReason: 'BOB : bankofbotswana.bw en JS' },
   MWK: { country: 'Malawi', fallbackReason: 'RBM : rbm.mw en JS dynamique' },
@@ -460,28 +461,65 @@ async function fetchFallbackRates(): Promise<{
   eur: Record<string, number>;
   eurUsd: number;
 } | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+  // Retry ×2 avec backoff (1 s puis 3 s) — un hoquet réseau ne doit pas coûter une heure de fraîcheur.
+  const FALLBACK_URL = process.env.FX_FALLBACK_API_BASE || 'https://open.er-api.com/v6/latest';
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const [usdRes, eurRes] = await Promise.all([
-        fetch('https://open.er-api.com/v6/latest/USD', { headers: { accept: 'application/json' }, signal: controller.signal }),
-        fetch('https://open.er-api.com/v6/latest/EUR', { headers: { accept: 'application/json' }, signal: controller.signal }),
-      ]);
-      const usdJson = await usdRes.json();
-      const eurJson = await eurRes.json();
-      if (usdJson?.result !== 'success' || eurJson?.result !== 'success') {
-        logger.error('[FALLBACK] API returned error');
-        return null;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const [usdRes, eurRes] = await Promise.all([
+          fetch(`${FALLBACK_URL}/USD`, { headers: { accept: 'application/json' }, signal: controller.signal }),
+          fetch(`${FALLBACK_URL}/EUR`, { headers: { accept: 'application/json' }, signal: controller.signal }),
+        ]);
+        const usdJson = await usdRes.json();
+        const eurJson = await eurRes.json();
+        if (usdJson?.result !== 'success' || eurJson?.result !== 'success') {
+          throw new Error('API returned error');
+        }
+        const eurUsd = usdJson.rates?.EUR ? 1 / usdJson.rates.EUR : 1.08;
+        return { usd: usdJson.rates, eur: eurJson.rates, eurUsd };
+      } finally {
+        clearTimeout(timeout);
       }
-      const eurUsd = usdJson.rates?.EUR ? 1 / usdJson.rates.EUR : 1.08;
-      return { usd: usdJson.rates, eur: eurJson.rates, eurUsd };
-    } finally {
-      clearTimeout(timeout);
+    } catch (e: any) {
+      logger.error(`[FALLBACK] Fetch failed (tentative ${attempt}/3): ${e.message}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, attempt === 1 ? 1000 : 3000));
+    }
+  }
+  return null;
+}
+
+/** Alerte fx_rate_anomaly + notification PDG réelle (cloche). Best-effort. */
+async function raiseFxAnomalyAlert(code: string, newRate: number, prevRate: number, deviation: number, source: string): Promise<void> {
+  try {
+    await supabaseAdmin.from('financial_security_alerts').insert({
+      alert_type: 'fx_rate_anomaly',
+      severity: 'critical',
+      title: `Taux aberrant rejeté (${code})`,
+      description: `USD→${code} : ${newRate} vs dernier connu ${prevRate} (écart ${(deviation * 100).toFixed(1)} % > 20 %) — source ${source}. Taux REJETÉ, dernier taux conservé.`,
+      metadata: { currency: code, new_rate: newRate, prev_rate: prevRate, deviation, source },
+      is_resolved: false,
+    });
+    await notifyPdgFx(`👻 Fatome : taux aberrant rejeté (${code})`,
+      `USD→${code} a sauté de ${(deviation * 100).toFixed(1)} % — rejeté, dernier taux conservé.`);
+  } catch (e: any) {
+    logger.warn(`[FX] Alerte anomalie non écrite: ${e.message}`);
+  }
+}
+
+/** Notification réelle aux comptes PDG/admin (la cloche unifiée). */
+export async function notifyPdgFx(title: string, message: string): Promise<void> {
+  try {
+    const { data: pdgs } = await supabaseAdmin.from('profiles').select('id').in('role', ['pdg', 'admin', 'ceo']).limit(5);
+    for (const p of pdgs || []) {
+      await supabaseAdmin.from('notifications').insert({
+        user_id: p.id, title, message, type: 'fx_alert',
+        metadata: { link: '/pdg' },
+      });
     }
   } catch (e: any) {
-    logger.error(`[FALLBACK] Fetch failed: ${e.message}`);
-    return null;
+    logger.warn(`[FX] Notification PDG non envoyée: ${e.message}`);
   }
 }
 
@@ -498,6 +536,31 @@ async function upsertRateAndLog(
   extraFields: Record<string, unknown> = {},
 ): Promise<void> {
   const { rateUsd, rateEur, source, sourceUrl, sourceType } = collected;
+
+  // BORNE DE SANITÉ : ±20 % vs le dernier taux connu FRAIS (< 30 j). Un HTML qui change ou une
+  // API foireuse ne doit JAMAIS écrire un taux aberrant — rejet + alerte, dernier taux conservé.
+  // (Au-delà de 30 j sans référence, on accepte : une devise peut réellement avoir bougé.)
+  try {
+    const { data: prevRow } = await supabaseAdmin.from('currency_exchange_rates')
+      .select('rate, retrieved_at').eq('from_currency', 'USD').eq('to_currency', code).maybeSingle();
+    const prevRate = Number(prevRow?.rate || 0);
+    const prevAgeDays = prevRow?.retrieved_at ? (Date.now() - new Date(prevRow.retrieved_at).getTime()) / 86400000 : Infinity;
+    if (prevRate > 0 && rateUsd > 0 && prevAgeDays < 30) {
+      const deviation = Math.abs(rateUsd - prevRate) / prevRate;
+      if (deviation > 0.2) {
+        await supabaseAdmin.from('fx_collection_log').insert({
+          currency_code: code, rate_usd: rateUsd, rate_eur: rateEur, source, source_url: sourceUrl,
+          source_type: sourceType, status: 'RATE_ANOMALY',
+          error_message: `écart ${(deviation * 100).toFixed(1)} % vs dernier taux connu — REJETÉ`,
+        });
+        await raiseFxAnomalyAlert(code, rateUsd, prevRate, deviation, source);
+        return;
+      }
+    }
+  } catch (e: any) {
+    logger.warn(`[FX] Sanity check indisponible pour ${code}: ${e.message}`);
+  }
+
   const finalRateUsd = rateUsd * (1 + margin);
   const finalRateEur = rateEur * (1 + margin);
   const invFinalRateUsd = rateUsd > 0 ? 1 / finalRateUsd : 0;
@@ -993,7 +1056,74 @@ export async function collectAfricanRates(): Promise<{
 
   logger.info(`[FX] Collecte terminée — OK: ${ok}, NO_CHANGE: ${results.filter(r => r.status === 'NO_CHANGE').length}, BCRG_CACHED: ${results.filter(r => r.status === 'BCRG_CACHED').length}, FALLBACK: ${fallback}, durée: ${durationMs}ms`);
 
+  // ── 4. TAUX CROISÉS (le pont manquant) : matérialiser A→B via le pivot USD ──
+  try {
+    const crosses = await materializeCrossRates();
+    logger.info(`[FX] Croisés matérialisés: ${crosses} paires (pivot USD)`);
+  } catch (e: any) {
+    logger.error(`[FX] Échec matérialisation des croisés: ${e.message}`);
+  }
+
   return { results, ok, fallback, cached, failed, durationMs };
+}
+
+// ═══════════════════════════════════════════════════════════
+// TAUX CROISÉS — pivot USD, matérialisés en base
+// ═══════════════════════════════════════════════════════════
+
+/** Devises des pays ACTIFS de la plateforme : chaque paire A↔B doit exister. */
+const ACTIVE_CROSS_CURRENCIES = (process.env.FX_CROSS_CURRENCIES || 'GNF,SLE,SLL,XOF,NGN,GHS,LRD,GMD,USD,EUR')
+  .split(',').map((c) => c.trim().toUpperCase()).filter(Boolean);
+
+/**
+ * Matérialise en base les paires croisées A→B = (USD→B) / (USD→A) pour toutes les
+ * devises actives, avec source='cross_usd'. Le frontend reste simple : il lit des
+ * paires directes. RÈGLES : ne JAMAIS écraser une paire directe non-croisée fraîche
+ * (< 48 h) ; ne JAMAIS fabriquer un croisé depuis un pivot périmé (> 48 h).
+ */
+export async function materializeCrossRates(): Promise<number> {
+  const now = new Date().toISOString();
+  const today = now.slice(0, 10);
+  const FRESH_MS = 48 * 3600 * 1000;
+
+  const { data: rows } = await supabaseAdmin
+    .from('currency_exchange_rates')
+    .select('from_currency, to_currency, rate, source_type, retrieved_at')
+    .eq('is_active', true);
+
+  const usdTo = new Map<string, number>();   // USD→X frais uniquement
+  const direct = new Map<string, { sourceType: string; fresh: boolean }>();
+  for (const r of rows || []) {
+    const key = `${r.from_currency}->${r.to_currency}`;
+    const fresh = r.retrieved_at ? (Date.now() - new Date(r.retrieved_at).getTime()) < FRESH_MS : false;
+    direct.set(key, { sourceType: r.source_type || '', fresh });
+    if (r.from_currency === 'USD' && fresh && Number(r.rate) > 0) usdTo.set(r.to_currency, Number(r.rate));
+  }
+  usdTo.set('USD', 1);
+
+  const upserts: any[] = [];
+  for (const a of ACTIVE_CROSS_CURRENCIES) {
+    for (const b of ACTIVE_CROSS_CURRENCIES) {
+      if (a === b) continue;
+      const existing = direct.get(`${a}->${b}`);
+      // Une paire directe NON-croisée et fraîche (BCRG, BCEAO, peg, API) reste maîtresse.
+      if (existing && existing.fresh && existing.sourceType !== 'cross') continue;
+      const usdA = usdTo.get(a);
+      const usdB = usdTo.get(b);
+      if (!usdA || !usdB || usdA <= 0 || usdB <= 0) continue; // pivot périmé/absent → pas de croisé fabriqué
+      upserts.push({
+        from_currency: a, to_currency: b, rate: usdB / usdA,
+        rate_usd: usdB / usdA, rate_eur: usdB / usdA,
+        source: 'cross_usd', source_url: 'pivot:USD', source_type: 'cross',
+        effective_date: today, retrieved_at: now, status: 'OK', is_active: true,
+      });
+    }
+  }
+  if (upserts.length > 0) {
+    await supabaseAdmin.from('currency_exchange_rates')
+      .upsert(upserts, { onConflict: 'from_currency,to_currency', ignoreDuplicates: false });
+  }
+  return upserts.length;
 }
 
 // ═══════════════════════════════════════════════════════════

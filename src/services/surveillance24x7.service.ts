@@ -116,6 +116,28 @@ class Surveillance24x7Service {
         logger.warn(`[Surveillance24x7] platform monitor failed: ${e?.message || e}`);
       }
 
+      // 📊 COMPTA — rollup PDG (leader-gardé, jamais dans le chemin d'une requête user) :
+      // rafraîchit J et J-1 régulièrement (idempotent) + rattrapage 7 j moins souvent (les
+      // saisies tardives de dépenses existent) + balayage de rapprochement (échantillon).
+      // Gaté sur le compteur de cycles pour ne pas recalculer à chaque tick de 60 s.
+      try {
+        const every60 = this.cycleCount === 1 || this.cycleCount % 60 === 0;      // ~1×/h
+        const every720 = this.cycleCount === 1 || this.cycleCount % 720 === 0;    // ~1×/12h (rattrapage 7j + sweep)
+        if (every60) {
+          const to = new Date().toISOString().slice(0, 10);
+          const from = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // J-1
+          await supabaseAdmin.rpc('accounting_rollup_refresh' as any, { p_from: from, p_to: to });
+        }
+        if (every720) {
+          const to = new Date().toISOString().slice(0, 10);
+          const from7 = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+          await supabaseAdmin.rpc('accounting_rollup_refresh' as any, { p_from: from7, p_to: to });
+          await supabaseAdmin.rpc('pdg_accounting_reconcile_sweep' as any, { p_from: from7, p_to: to, p_sample: 50 });
+        }
+      } catch (e: any) {
+        logger.warn(`[Surveillance24x7] accounting rollup failed: ${e?.message || e}`);
+      }
+
       // 👻 FATOME SENTINELLE — Étage B (balayage croisé, leader-gardé via surveillance) :
       // les gardiens de commission (wallet + non-wallet) → escalade en anomalies fatome si écart.
       try {

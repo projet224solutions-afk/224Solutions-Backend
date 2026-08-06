@@ -563,23 +563,25 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
     currency = summary.sellerCurrency;
     walletDebitParams.p_seller_commission_amount = summary.platformFeeAmount;
 
-    if (payment_method === 'wallet') {
-      // COMMISSION ACHETEUR (purchase_fee_percent, gérée par le PDG) — prélevée EN PLUS sur
-      // l'acheteur et gardée par la plateforme. Calculée ICI (backend, autoritaire) sur le
-      // montant payé converti, dans la devise du wallet acheteur, puis débitée + créditée au PDG
-      // atomiquement par create_order_core. Avant : seulement affichée par le frontend → jamais
-      // prélevée pour les paiements wallet.
-      const NO_DEC = new Set(['GNF', 'XOF', 'XAF', 'JPY', 'KRW', 'VND', 'CLP']);
-      let buyerFeePercent = 0;
-      try {
-        const { data: feeSetting } = await supabaseAdmin
-          .from('system_settings').select('setting_value').eq('setting_key', 'purchase_fee_percent').maybeSingle();
-        buyerFeePercent = Math.max(0, Math.min(50, Number(feeSetting?.setting_value ?? 0)));
-      } catch { buyerFeePercent = 0; }
-      const rawFee = summary.totalPaidAmount * (buyerFeePercent / 100);
-      const buyerFee = NO_DEC.has(summary.buyerCurrency.toUpperCase())
+    // COMMISSION ACHETEUR (purchase_fee_percent, PDG) — calculée AUTORITAIREMENT côté backend
+    // pour TOUS les moyens de paiement (avant : dans la branche wallet uniquement → carte/mobile
+    // money n'avaient AUCUN fee backend et le frontend le journalisait, ce qui a cassé après le
+    // REVOKE de record_pdg_revenue). Base = montant payé converti, devise acheteur.
+    const NO_DEC = new Set(['GNF', 'XOF', 'XAF', 'JPY', 'KRW', 'VND', 'CLP']);
+    let buyerFeeAmount = 0;
+    try {
+      const { data: feeSetting } = await supabaseAdmin
+        .from('system_settings').select('setting_value').eq('setting_key', 'purchase_fee_percent').maybeSingle();
+      const pct = Math.max(0, Math.min(50, Number(feeSetting?.setting_value ?? 0)));
+      const rawFee = summary.totalPaidAmount * (pct / 100);
+      buyerFeeAmount = NO_DEC.has(String(summary.buyerCurrency).toUpperCase())
         ? Math.round(rawFee) : Math.round(rawFee * 100) / 100;
-      buyerFeePercentForLog = buyerFeePercent;
+      buyerFeePercentForLog = pct;
+    } catch { buyerFeeAmount = 0; }
+
+    if (payment_method === 'wallet') {
+      // Pour le wallet, le fee est DÉBITÉ + crédité au PDG atomiquement par create_order_core.
+      const buyerFee = buyerFeeAmount;
 
       walletDebitParams = {
         p_buyer_user_id: userId,
@@ -701,15 +703,20 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
       logger.error(`order finalization non bloquant (commande ${result.order_id} déjà créée): ${orderUpdateError.message}`);
     }
 
-    // 📊 REVENUS PDG — logger la commission acheteur dans revenus_pdg pour TOUTES les commandes wallet
-    // (avant : seul ProductPaymentModal le faisait côté frontend → seules les commandes "reco"
-    // apparaissaient dans le tableau de revenus du PDG ; Payment.tsx ne loggait rien). Désormais
-    // centralisé ici → cohérent pour tous les chemins. best-effort (ne bloque jamais la commande).
-    if (payment_method === 'wallet' && walletDebitParams.p_buyer_fee_amount > 0) {
+    // 📊 REVENUS PDG — commission acheteur dans revenus_pdg pour TOUS les moyens de paiement
+    // (wallet, carte, mobile money, COD) — plus seulement wallet. C'est le POINT D'ÉCRITURE UNIQUE
+    // du flux « commande » (source_type `frais_achat_commande`, clé = order_id) : la double
+    // écriture est impossible car l'index UNIQUE partiel `uniq_revenus_pdg_source_txn`
+    // (source_type, transaction_id) rend record_pdg_revenue idempotent → un retour/retry ne double
+    // pas le revenu. Le webhook Stripe Connect écrit sur un AUTRE flux (source_type
+    // `frais_achat_marketplace`, clé = marketplace_transaction.id) → aucun chevauchement.
+    // Le CLIENT n'écrit plus JAMAIS de revenu (appels rpc retirés de ProductPaymentModal).
+    // best-effort (ne bloque jamais la commande) — le gardien `commission_revenue_gap` rattrape.
+    if (buyerFeeAmount > 0) {
       try {
         await supabaseAdmin.rpc('record_pdg_revenue', {
           p_source_type: 'frais_achat_commande',
-          p_amount: walletDebitParams.p_buyer_fee_amount,
+          p_amount: buyerFeeAmount,
           p_percentage: buyerFeePercentForLog,
           p_transaction_id: result.order_id,
           p_user_id: userId,
@@ -717,7 +724,8 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
             order_id: result.order_id,
             order_number: orderNumber,
             vendor_id,
-            currency: walletDebitParams.p_buyer_wallet_currency,
+            currency: walletDebitParams.p_buyer_wallet_currency || summary.buyerCurrency,
+            payment_method,
             source: 'create_order_core_backend',
           },
         });

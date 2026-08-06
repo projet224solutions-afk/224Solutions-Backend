@@ -320,8 +320,17 @@ async function getFxMaxAgeHours(): Promise<number> {
 }
 
 const DEFAULT_FX_COMMISSION = 0.05;
-async function getFxCommissionRate(): Promise<number> {
-  // 1) Source PDG officielle : margin_config.default_margin (PDGFinance — déjà une FRACTION).
+async function getFxCommissionRate(pair?: string): Promise<number> {
+  // FATOME V2 : SOURCE UNIQUE = fx_pair_config via le résolveur fx_effective_margin_fraction
+  // (marge par paire → défaut global '*' → margin_config → 3 %). Non-régressif : sans override
+  // de paire, le résolveur rend margin_config.default_margin — valeur identique à avant.
+  try {
+    const { data } = await supabaseAdmin.rpc('fx_effective_margin_fraction', { p_pair: pair || '*' });
+    const v = Number(data);
+    if (Number.isFinite(v) && v >= 0 && v <= 0.3) return v;
+  } catch {
+    // repli legacy ci-dessous (résolveur indisponible → on relit directement margin_config)
+  }
   try {
     const { data } = await supabaseAdmin
       .from('margin_config')

@@ -537,6 +537,28 @@ async function upsertRateAndLog(
 ): Promise<void> {
   const { rateUsd, rateEur, source, sourceUrl, sourceType } = collected;
 
+  // FATOME V2 (C2) : DÉTECTION STATISTIQUE — le taux observé est enregistré à l'historique
+  // (fx_record_and_check) et comparé à la moyenne mobile 7 j de la paire ; écart > seuil PDG
+  // (défaut ±10 %) → ANOMALIE → taux REJETÉ (le dernier taux sain reste) + alerte + notif PDG.
+  // Pur code déterministe, zéro IA. La borne dure ±20 % ci-dessous reste un filet supplémentaire.
+  try {
+    const { data: chk } = await supabaseAdmin.rpc('fx_record_and_check', {
+      p_from: 'USD', p_to: code, p_rate: rateUsd, p_source: source,
+    });
+    if ((chk as any)?.anomaly === true) {
+      const dev = Number((chk as any)?.deviation || 0);
+      await supabaseAdmin.from('fx_collection_log').insert({
+        currency_code: code, rate_usd: rateUsd, rate_eur: rateEur, source, source_url: sourceUrl,
+        source_type: sourceType, status: 'RATE_ANOMALY',
+        error_message: `anomalie 7j : écart ${(dev * 100).toFixed(1)} % vs moyenne mobile — REJETÉ`,
+      });
+      await raiseFxAnomalyAlert(code, rateUsd, Number((chk as any)?.avg7 || 0), dev, source);
+      return;
+    }
+  } catch (e: any) {
+    logger.warn(`[FX] Détection anomalie 7j indisponible pour ${code}: ${e.message}`);
+  }
+
   // BORNE DE SANITÉ : ±20 % vs le dernier taux connu FRAIS (< 30 j). Un HTML qui change ou une
   // API foireuse ne doit JAMAIS écrire un taux aberrant — rejet + alerte, dernier taux conservé.
   // (Au-delà de 30 j sans référence, on accepte : une devise peut réellement avoir bougé.)

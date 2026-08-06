@@ -11,8 +11,12 @@ CREATE TABLE IF NOT EXISTS public.margin_config (
 );
 ALTER TABLE public.margin_config ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Anyone can view margin_config" ON public.margin_config FOR SELECT USING (true);
-CREATE POLICY "Auth can update margin_config" ON public.margin_config FOR UPDATE TO authenticated USING (true);
-CREATE POLICY "Auth can insert margin_config" ON public.margin_config FOR INSERT TO authenticated WITH CHECK (true);
+-- ⚠️ SÉCURITÉ (durci 06/08/2026) : les anciennes policies d'écriture étaient permissives
+-- (`USING (true)` pour tout authentifié = marge FX modifiable par n'importe qui). Sur un
+-- fresh build, on crée directement la version PDG-only (la migration autoritaire
+-- 20260806190000_close_margin_config.sql réassure cet état sur les bases existantes).
+CREATE POLICY "margin_config write pdg" ON public.margin_config FOR ALL TO authenticated
+  USING (public.is_admin_or_pdg()) WITH CHECK (public.is_admin_or_pdg());
 
 INSERT INTO public.margin_config (config_key, config_value, description)
 VALUES ('default_margin', 0.03, 'Marge par défaut de 3% appliquée sur les taux officiels')

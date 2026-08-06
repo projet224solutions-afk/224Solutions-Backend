@@ -44,6 +44,33 @@ import { z } from 'zod';
 
 const router = Router();
 
+/**
+ * 💰 Journalise la commission acheteur au passage pending→paid d'une commande, depuis le fee
+ * MÉMORISÉ dans les metadata à la création (jamais un recalcul au taux du jour). Idempotent
+ * (index uniq (source_type, transaction_id) + ON CONFLICT DO NOTHING dans record_pdg_revenue).
+ * best-effort : ne lève jamais (ne bloque pas la transition de statut).
+ */
+export async function journalizeOrderCommissionOnPaid(orderId: string, meta: Record<string, any>, userId?: string | null): Promise<void> {
+  try {
+    const fee = Number(meta?.buyer_fee_amount || 0);
+    if (!(fee > 0)) return; // pas de commission mémorisée → rien à journaliser
+    await supabaseAdmin.rpc('record_pdg_revenue', {
+      p_source_type: 'frais_achat_commande',
+      p_amount: fee,
+      p_percentage: Number(meta?.buyer_fee_percent || 0),
+      p_transaction_id: orderId,
+      p_user_id: userId || null,
+      p_metadata: {
+        order_id: orderId,
+        currency: meta?.buyer_fee_currency || 'GNF',
+        source: 'order_paid_transition',
+      },
+    });
+  } catch (e: any) {
+    logger.warn(`journalizeOrderCommissionOnPaid non bloquant (commande ${orderId}): ${e?.message || e}`);
+  }
+}
+
 // ==================== DEVISE DYNAMIQUE ====================
 
 const COUNTRY_CURRENCY_MAP: Record<string, string> = {
@@ -683,6 +710,13 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
         }
         : {}),
       ...(payment_intent_id ? { external_payment_id: payment_intent_id } : {}),
+      // 💰 Commission acheteur MÉMORISÉE (ce qui a été FACTURÉ) → au passage pending→paid, on
+      // journalise CE montant, jamais un recalcul au taux du jour. Clé lue par le point de transition.
+      ...(buyerFeeAmount > 0 ? {
+        buyer_fee_amount: buyerFeeAmount,
+        buyer_fee_percent: buyerFeePercentForLog,
+        buyer_fee_currency: walletDebitParams.p_buyer_wallet_currency || summary.buyerCurrency,
+      } : {}),
       ...(order_metadata || {}),
     };
 
@@ -711,8 +745,13 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
     // pas le revenu. Le webhook Stripe Connect écrit sur un AUTRE flux (source_type
     // `frais_achat_marketplace`, clé = marketplace_transaction.id) → aucun chevauchement.
     // Le CLIENT n'écrit plus JAMAIS de revenu (appels rpc retirés de ProductPaymentModal).
-    // best-effort (ne bloque jamais la commande) — le gardien `commission_revenue_gap` rattrape.
-    if (buyerFeeAmount > 0) {
+    // 🔴 GATING PAIEMENT (fix commission fantôme) : on ne journalise QUE si la commande est
+    // réellement PAYÉE (`finalPaymentStatus === 'paid'`). Une commande cash (pending) ou
+    // carte/mobile non confirmée (pending) n'écrit RIEN — sinon le trigger de trésorerie
+    // créditerait le coffre PDG d'un revenu jamais encaissé. Le passage pending→paid (COD
+    // livrée / confirmation) journalise depuis les metadata mémorisées (voir confirm-cod-delivery
+    // et le webhook). best-effort — le gardien commission_revenue_gap_nonwallet rattrape.
+    if (buyerFeeAmount > 0 && finalPaymentStatus === 'paid') {
       try {
         await supabaseAdmin.rpc('record_pdg_revenue', {
           p_source_type: 'frais_achat_commande',
@@ -1249,6 +1288,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-cod-delivery', verifyJWT, order
       .from('orders')
       .update({
         status: 'delivered',
+        payment_status: 'paid',          // 💰 COD encaissé À LA LIVRAISON → paid (transition pending→paid)
         updated_at: nowIso,
         delivery_confirmed_at: nowIso,   // ✅ départ du compte à rebours 7j (purge preuve)
         metadata: {
@@ -1262,6 +1302,11 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-cod-delivery', verifyJWT, order
       .single();
 
     if (error) throw error;
+
+    // 📊 REVENU COMMISSION au passage pending→paid (COD encaissé) : journalise le fee MÉMORISÉ
+    // à la création (jamais un recalcul). Idempotent (uniq source_type+transaction_id) → un double
+    // clic ne double pas. best-effort (ne bloque pas la confirmation de livraison).
+    await journalizeOrderCommissionOnPaid(orderId, (fullOrder.metadata || {}) as any, userId);
 
     // 🔔 Notifier le vendeur — non bloquant.
     try {

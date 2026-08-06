@@ -119,13 +119,21 @@ class Surveillance24x7Service {
       // 👻 FATOME SENTINELLE — Étage B (balayage croisé, leader-gardé via surveillance) :
       // les gardiens de commission (wallet + non-wallet) → escalade en anomalies fatome si écart.
       try {
+        // Réf DATÉE (une alerte max/jour/type) — sinon la contrainte UNIQUE(type, ref) figeait
+        // une réf statique et le check n'alertait PLUS JAMAIS après la 1re fois.
+        const day = new Date().toISOString().slice(0, 10);
         const { data: cmr } = await supabaseAdmin.rpc('commission_monitor_report' as any);
         for (const c of ((cmr as any)?.checks || [])) {
-          if (Number(c?.count || 0) > 0 && String(c?.key || '').startsWith('commission_revenue_gap')) {
+          const key = String(c?.key || '');
+          if (!key.startsWith('commission_revenue_gap')) continue;
+          if (Number(c?.count || 0) > 0) {
             await supabaseAdmin.rpc('fatome_raise' as any, {
-              p_type: c.key, p_ref: `monitor:${c.key}`, p_severity: 'high',
+              p_type: key, p_ref: `monitor:${key}:${day}`, p_severity: 'high',
               p_detail: { count: c.count, label: c.label, source: 'surveillance24x7_etageB' },
             });
+          } else {
+            // Gap revenu à 0 → auto-résoudre les anomalies non traitées de ce type (la carte PDG suit l'état réel).
+            await supabaseAdmin.rpc('fatome_resolve_type' as any, { p_type: key });
           }
         }
       } catch (e: any) {

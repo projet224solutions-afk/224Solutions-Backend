@@ -14,6 +14,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { auditTrail } from '../services/auditTrail.service.js';
 import { webhookRateLimit } from '../middlewares/routeRateLimiter.js';
+import { journalizeOrderCommissionOnPaid } from './orders.routes.js';
 import { settleDeposit } from '../services/wallet.service.js';
 
 const router = Router();
@@ -163,7 +164,7 @@ export async function applyPaymentSucceeded(
     // réconciliation, qui n'a pas la garde webhook_events du webhook réel).
     const { data: cur } = await supabaseAdmin
       .from('orders')
-      .select('payment_status')
+      .select('payment_status, metadata, customer_id')
       .eq('id', orderId)
       .maybeSingle();
     if (cur?.payment_status === 'paid') {
@@ -180,6 +181,10 @@ export async function applyPaymentSucceeded(
         updated_at: new Date().toISOString(),
       })
       .eq('id', orderId);
+
+    // 💰 REVENU COMMISSION au passage pending→paid (paiement confirmé par le provider) : depuis le
+    // fee MÉMORISÉ à la création (jamais recalculé). Idempotent (uniq source_type+transaction_id).
+    await journalizeOrderCommissionOnPaid(orderId, (cur?.metadata || {}) as any, (cur as any)?.customer_id || null);
 
     // Update escrow to confirmed (try both order_id and stripe_payment_intent_id)
     await supabaseAdmin

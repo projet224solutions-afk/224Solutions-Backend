@@ -88,4 +88,21 @@ router.post('/collect-now', verifyJWT, async (req: AuthenticatedRequest, res) =>
   }
 });
 
+// 👻 V4/V6 — Revenus FX (spread) par corridor, pour le dashboard PDG.
+router.get('/revenue', verifyJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!(await requirePdg(req, res))) return;
+    const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    const { data, error } = await supabaseAdmin.rpc('fx_revenue_by_corridor', { p_since: since });
+    if (error) throw error;
+    const rows = (data as any[]) || [];
+    const total = rows.reduce((s, r) => s + Number(r.total || 0), 0);
+    return ok(res, { corridors: rows, total, days });
+  } catch (e: any) {
+    logger.error(`[FX/revenue] ${e.message}`);
+    return fail(res, 500, 'Erreur revenus FX', 'FX_REVENUE_ERROR');
+  }
+});
+
 export default router;

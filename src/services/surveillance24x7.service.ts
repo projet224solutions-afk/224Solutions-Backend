@@ -116,6 +116,22 @@ class Surveillance24x7Service {
         logger.warn(`[Surveillance24x7] platform monitor failed: ${e?.message || e}`);
       }
 
+      // 👻 FATOME SENTINELLE — Étage B (balayage croisé, leader-gardé via surveillance) :
+      // les gardiens de commission (wallet + non-wallet) → escalade en anomalies fatome si écart.
+      try {
+        const { data: cmr } = await supabaseAdmin.rpc('commission_monitor_report' as any);
+        for (const c of ((cmr as any)?.checks || [])) {
+          if (Number(c?.count || 0) > 0 && String(c?.key || '').startsWith('commission_revenue_gap')) {
+            await supabaseAdmin.rpc('fatome_raise' as any, {
+              p_type: c.key, p_ref: `monitor:${c.key}`, p_severity: 'high',
+              p_detail: { count: c.count, label: c.label, source: 'surveillance24x7_etageB' },
+            });
+          }
+        }
+      } catch (e: any) {
+        logger.warn(`[Surveillance24x7] fatome sentinelle failed: ${e?.message || e}`);
+      }
+
       // Alertes ÉVÉNEMENTIELLES (224Guard, role.changed, observateur frontend…) : pas de
       // signal de fin → auto-résolution quand plus aucune occurrence depuis 24 h (72 h critiques).
       try {

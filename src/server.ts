@@ -483,6 +483,9 @@ if (isVercelRuntime) {
 } else {
   server = app.listen(env.PORT, async () => {
     logger.info(`🚀 Backend v3 (Phase 6) started on port ${env.PORT}`);
+    // 🟢 PM2 wait_ready : signaler dès que le HTTP écoute (démarrage sans coupure en cluster).
+    // Le serveur peut déjà servir ; l'élection de leader + jobs démarrent en arrière-plan.
+    if (typeof process.send === 'function') process.send('ready');
     // Contrôle de config du canal WhatsApp OTP (UNE ligne, secrets masqués).
     try { const { logWhatsAppConfig } = await import('./services/whatsappOtp.service.js'); logWhatsAppConfig(); } catch { /* noop */ }
     await bootstrapBackgroundServices();

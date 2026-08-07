@@ -6,7 +6,7 @@ import { emitCoreFeatureEvent, type FeatureHealthStatus } from './coreFeatureEve
 import { runPlatformMonitors, autoResolveStaleEventAlerts } from './escrowMonitor.service.js';
 import { triggerAffiliateCommission } from './commission.service.js';
 import { ingestAndSummarize, scanAndDiagnose } from './autoHealing.service.js';
-import { dispatchCriticalAnomalySms } from './fatomeAlerts.service.js';
+import { dispatchCriticalAnomalySms, dispatchDigestSms } from './fatomeAlerts.service.js';
 
 type ServiceStatus = 'healthy' | 'degraded' | 'critical' | 'unknown';
 
@@ -247,6 +247,9 @@ class Surveillance24x7Service {
       if (this.cycleCount === 1 || this.cycleCount % 5 === 0) {
         try { await dispatchCriticalAnomalySms(); }
         catch (e: any) { logger.warn(`[Surveillance24x7] fatome sms dispatch failed: ${e?.message || e}`); }
+        // §6 : relais SMS du digest du matin (dédup 1/jour, si numéro configuré).
+        try { await dispatchDigestSms(); }
+        catch (e: any) { logger.warn(`[Surveillance24x7] digest sms dispatch failed: ${e?.message || e}`); }
       }
 
       // 🗒️ §10.1.4 : journal d'ACTIVITÉ de l'étage B — chaque cycle laisse une trace

@@ -34,7 +34,10 @@ jobs:
         id: verdict
         env:
           SUPABASE_URL: https://uakkxaibujzxdiqzpnpr.supabase.co
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Clé PUBLISHABLE (publique par nature — c'est celle du bundle frontend, pas un
+          # secret) : elle ne lit QUE la vue fatome_heartbeat_public (last_beat/last_ok,
+          # isolation anon prouvée). La clé service_role a été RETIRÉE de ce workflow.
+          SUPABASE_PUBLISHABLE_KEY: sb_publishable_rh1u3OG1tR3dPSY3dwoJpw_3VDt1BY3
         run: |
           set +e
           MAX_AGE=900   # 15 min
@@ -44,11 +47,10 @@ jobs:
           BACKEND_STATUS=$(echo "$BACKEND_JSON" | grep -o '"status":"[a-z]*"' | head -1 | cut -d'"' -f4)
           echo "backend: ${BACKEND_STATUS:-injoignable} ($BACKEND_JSON)"
 
-          # 2) Supabase direct (indépendant du backend)
+          # 2) Supabase direct (indépendant du backend) — VUE publique minimale uniquement
           SB_JSON=$(curl -sS --max-time 20 \
-            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-            "$SUPABASE_URL/rest/v1/fatome_sentinel_heartbeat?id=eq.1&select=last_beat" || true)
+            -H "apikey: $SUPABASE_PUBLISHABLE_KEY" \
+            "$SUPABASE_URL/rest/v1/fatome_heartbeat_public?select=last_beat" || true)
           LAST_BEAT=$(echo "$SB_JSON" | grep -o '"last_beat":"[^"]*"' | cut -d'"' -f4)
           if [ -n "$LAST_BEAT" ]; then
             BEAT_EPOCH=$(date -d "$LAST_BEAT" +%s 2>/dev/null || echo 0)

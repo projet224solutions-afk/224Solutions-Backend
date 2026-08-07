@@ -36,6 +36,37 @@ export function invalidatePdgAlertPhoneCache(): void {
   phoneCache = { value: null, at: 0 };
 }
 
+/**
+ * §6 — SMS du DIGEST du matin (si numéro configuré). La notification in-app est créée
+ * par pg_cron (SQL pur, survit au backend) ; ce relais SMS part au cycle suivant du
+ * backend. Dédup : 1 SMS par jour de digest (journal fatome_alert_dispatch).
+ */
+export async function dispatchDigestSms(): Promise<void> {
+  const phone = await getPdgAlertPhone();
+  if (!phone) return;
+  const { data: digest } = await supabaseAdmin
+    .from('notifications')
+    .select('message, metadata')
+    .eq('type', 'fatome_digest')
+    .gte('created_at', new Date(Date.now() - 24 * 3600_000).toISOString())
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (!digest) return;
+  const day = String((digest.metadata as any)?.day || '');
+  if (!day) return;
+  const key = `digest:${day}`;
+  const { data: sent } = await supabaseAdmin
+    .from('fatome_alert_dispatch')
+    .select('id').eq('anomaly_type', key).eq('ok', true).limit(1).maybeSingle();
+  if (sent) return;
+  const r = await sendSms(phone, String(digest.message).slice(0, 450), undefined, 'notification');
+  await supabaseAdmin.from('fatome_alert_dispatch').insert({
+    anomaly_type: key, channel: 'sms',
+    sent_to_masked: `${phone.slice(0, 5)}****${phone.slice(-2)}`,
+    ok: !!r.ok, error: r.ok ? null : String(r.error || 'unknown').slice(0, 300),
+  });
+  logger.info(`[FatomeAlerts] Digest SMS ${r.ok ? 'OK' : 'ÉCHEC'} (${day})`);
+}
+
 export async function dispatchCriticalAnomalySms(): Promise<void> {
   const phone = await getPdgAlertPhone();
   if (!phone) return; // non configuré → aucun SMS (l'in-app reste, le PDG peut configurer dans l'onglet Fatome)

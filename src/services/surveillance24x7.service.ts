@@ -192,8 +192,10 @@ class Surveillance24x7Service {
                 continue;
               }
               const res = await triggerAffiliateCommission(p.beneficiary_user_id, Math.round(converted), p.source_type, p.source_ref);
+              // res.pending = leg devise-agent toujours sans taux frais → reste en attente.
+              const done = res.success && !res.pending;
               await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, {
-                p_id: p.id, p_status: res.success ? 'resolved' : 'pending', p_error: res.success ? null : (res.error || 'credit_failed'),
+                p_id: p.id, p_status: done ? 'resolved' : 'pending', p_error: done ? null : (res.error || 'still_pending'),
               });
             } catch (e: any) {
               await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, { p_id: p.id, p_status: 'pending', p_error: e?.message || String(e) });

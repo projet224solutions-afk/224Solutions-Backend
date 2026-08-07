@@ -17,6 +17,7 @@ export interface CommissionTriggerResult {
   hasAgent?: boolean;
   alreadyProcessed?: boolean;
   commissionAmount?: number;
+  pending?: boolean; // leg devise-agent sans taux frais → mis en attente (jamais perdu)
   error?: string;
 }
 
@@ -61,6 +62,27 @@ export async function triggerAffiliateCommission(
     }
 
     const result = data as any;
+
+    // FX du leg GNF→devise agent indisponible : la commission N'EST PAS versée (fail-closed) mais
+    // N'EST PAS perdue — on la met EN ATTENTE (idempotent par (source_type, source_ref)). Le job
+    // leader-gardé la reverse dès qu'un taux frais existe. Nécessite un transactionId (clé d'idempotence).
+    if (result?.fx_pending) {
+      if (transactionId) {
+        await supabaseAdmin.rpc('affiliate_commission_enqueue', {
+          p_source_type: transactionType,
+          p_source_ref: String(transactionId),
+          p_beneficiary: userId,
+          p_fee_amount: amount,
+          p_fee_currency: 'GNF',
+          p_reason: 'FX_DOWN',
+          p_detail: { agent_fx: result?.error || 'AGENT_FX_UNAVAILABLE' },
+        } as any);
+      } else {
+        logger.warn(`[Commission] fx_pending sans transactionId → impossible de mettre en attente (userId=${userId})`);
+      }
+      return { success: true, pending: true, hasAgent: true };
+    }
+
     logger.info('[Commission] Affiliate commission processed', {
       userId,
       transactionType,

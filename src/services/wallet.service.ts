@@ -14,11 +14,9 @@
 import { randomUUID } from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
-
-const ZERO_DECIMAL_CURRENCIES = new Set([
-  'GNF', 'XOF', 'XAF', 'VND', 'IDR', 'KRW', 'JPY', 'CLP', 'UGX', 'RWF',
-  'PYG', 'COP', 'HUF', 'ISK', 'BIF', 'DJF', 'KMF', 'MGA', 'VUV',
-]);
+// Arrondi devise-aware : SOURCE UNIQUE = ../config/currencyConfig.js (smartRound / getCurrencyDecimals),
+// miroir de src/config/currencyConfig.ts (front) et de la liste SQL _ccy_decimals. Aucune liste locale.
+import { smartRound } from '../config/currencyConfig.js';
 
 type TransferExecutionOptions = {
   amountToCredit?: number;
@@ -112,13 +110,6 @@ export async function selectReceiverWallet(
   return { wallet: created as WalletRow };
 }
 
-function smartRoundTransferAmount(amount: number, currency: string): number {
-  if (!Number.isFinite(amount)) return 0;
-  return ZERO_DECIMAL_CURRENCIES.has(String(currency || '').toUpperCase())
-    ? Math.round(amount)
-    : Math.round(amount * 100) / 100;
-}
-
 async function persistTransferHistory(params: {
   transactionId?: string;
   senderId: string;
@@ -156,6 +147,11 @@ async function persistTransferHistory(params: {
     feeAmount,
   } = params;
 
+  // Reste d'arrondi FX (traçabilité PURE, AUCUN mouvement d'argent) — aligné sur _acash_fx :
+  // remainder = (montant × taux) − montant crédité arrondi, exprimé dans la devise du destinataire.
+  // 0 pour un transfert domestique (taux 1, crédit = envoi). Sert au rapprochement/sentinelle.
+  const fxRemainder = isInternational ? (amountSent * rateUsed) - amountReceived : 0;
+
   const metadata = {
     idempotency_key: idempotencyKey,
     source: 'backend-node',
@@ -170,6 +166,7 @@ async function persistTransferHistory(params: {
     // Traçabilité FX (faille 3) : source ET fraîcheur du taux au moment de l'exécution.
     rate_fetched_at: rateFetchedAt || null,
     fee_amount: feeAmount,
+    fx_remainder: fxRemainder,
   };
 
   const transferType = isInternational ? 'international_transfer' : 'transfer';
@@ -695,7 +692,7 @@ export async function transferBetweenWallets(
     const rateSource = String(options.rateSource || 'identity');
     const rateFetchedAt = options.rateFetchedAt;
     const feeAmount = Number(options.feeAmount ?? 0);
-    const amountToCredit = smartRoundTransferAmount(
+    const amountToCredit = smartRound(
       Number(options.amountToCredit ?? amount),
       receiverCurrency,
     );
@@ -706,7 +703,7 @@ export async function transferBetweenWallets(
 
     // Total réellement débité de l'expéditeur = montant envoyé + commission FX (devise expéditeur).
     // La commission reste dans le float plateforme (débitée, non recréditée au destinataire).
-    const debitAmount = smartRoundTransferAmount(amount + (Number.isFinite(feeAmount) ? feeAmount : 0), senderCurrency);
+    const debitAmount = smartRound(amount + (Number.isFinite(feeAmount) ? feeAmount : 0), senderCurrency);
     if (Number(senderWallet.balance) < debitAmount) return await fail('Solde insuffisant');
 
     const canUseRpc = !isInternational && feeAmount <= 0 && Math.abs(amountToCredit - amount) < 0.000001;
@@ -793,7 +790,7 @@ export async function transferBetweenWallets(
     // INTERDIT: écrire les wallets par user_id — TOUJOURS par id. Un utilisateur multi-wallets a
     // plusieurs lignes : écrire par user_id débiterait/écraserait les AUTRES devises (faille 2).
     // CAS (.eq('balance', before)) des DEUX côtés → toute course concurrente échoue proprement.
-    const newSenderBalance = smartRoundTransferAmount(Number(senderWallet.balance) - debitAmount, senderCurrency);
+    const newSenderBalance = smartRound(Number(senderWallet.balance) - debitAmount, senderCurrency);
 
     // Débit expéditeur : ciblé par id + CAS sur le solde lu. .single() → 0 ligne = course = échec net.
     const { data: debitResult, error: debitErr } = await supabaseAdmin
@@ -819,7 +816,7 @@ export async function transferBetweenWallets(
         .maybeSingle();
       if (!freshRcv) break;
       const before = Number((freshRcv as { balance: number }).balance);
-      const after = smartRoundTransferAmount(before + amountToCredit, receiverCurrency);
+      const after = smartRound(before + amountToCredit, receiverCurrency);
       const { data: creditRows, error: creditErr } = await supabaseAdmin
         .from('wallets')
         .update({ balance: after, updated_at: new Date().toISOString() })

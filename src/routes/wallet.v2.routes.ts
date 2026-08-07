@@ -29,6 +29,7 @@ import { createNotification } from '../services/notification.service.js';
 import { triggerAffiliateCommission } from '../services/commission.service.js';
 import { changeWalletPin, ensureWalletExistsForPin, getWalletPinPolicy, getWalletPinState, resetWalletPinWithPassword, setupWalletPin, verifyWalletPin, isPinSchemaAvailableForMoney, getPinPolicy } from '../services/walletPin.service.js';
 import { emitCoreFeatureEvent } from '../services/coreFeatureEvents.service.js';
+import { smartRound } from '../config/currencyConfig.js';
 
 const router = Router();
 
@@ -158,17 +159,10 @@ function mapCurrencyToCountry(currency: string | null | undefined): string {
   return CURRENCY_TO_COUNTRY[String(currency).toUpperCase()] || String(currency).toUpperCase();
 }
 
-const ZERO_DECIMAL_TRANSFER_CURRENCIES = new Set([
-  'GNF', 'XOF', 'XAF', 'VND', 'IDR', 'KRW', 'JPY', 'CLP', 'UGX', 'RWF',
-  'PYG', 'COP', 'HUF', 'ISK', 'BIF', 'DJF', 'KMF', 'MGA', 'VUV',
-]);
-
-function smartRoundCurrencyAmount(amount: number, currency: string): number {
-  if (!Number.isFinite(amount)) return 0;
-  return ZERO_DECIMAL_TRANSFER_CURRENCIES.has(String(currency || '').toUpperCase())
-    ? Math.round(amount)
-    : Math.round(amount * 100) / 100;
-}
+// Arrondi devise-aware : SOURCE UNIQUE = ../config/currencyConfig.js (smartRound / getCurrencyDecimals),
+// miroir de src/config/currencyConfig.ts (front) et de la liste SQL _ccy_decimals. Aucune liste locale
+// de décimales ici — une liste parallèle vieillit (bug commissions EUR). smartRound gère aussi les
+// devises à 3 décimales (BHD/KWD/…), ce que l'ancienne liste locale ignorait.
 
 function resolveStoredFxRate(
   row: { rate?: number | null; final_rate_usd?: number | null; final_rate_eur?: number | null; retrieved_at?: string | null } | null | undefined,
@@ -841,9 +835,9 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
     const commissionRate = isInternational ? await getFxCommissionRate() : 0;
     const feePercentage = commissionRate * 100;
     const feeAmount = isInternational
-      ? smartRoundCurrencyAmount(amount * commissionRate, senderCurrency)
+      ? smartRound(amount * commissionRate, senderCurrency)
       : 0;
-    const totalDebit = smartRoundCurrencyAmount(amount + feeAmount, senderCurrency);
+    const totalDebit = smartRound(amount + feeAmount, senderCurrency);
 
     if (senderBalance < totalDebit) {
       res.status(402).json({ success: false, error: 'Solde insuffisant' });
@@ -872,9 +866,9 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
       rateDisplayed = fxResult.rate; // TAUX NET du jour
       rateSource = fxResult.source;
       rateFetchedAt = fxResult.fetchedAt;
-      amountReceived = smartRoundCurrencyAmount(amount * rateDisplayed, receiverCurrency);
+      amountReceived = smartRound(amount * rateDisplayed, receiverCurrency);
       // Commission exprimée dans la devise du destinataire (pour l'affichage)
-      commissionConversion = smartRoundCurrencyAmount(feeAmount * rateDisplayed, receiverCurrency);
+      commissionConversion = smartRound(feeAmount * rateDisplayed, receiverCurrency);
     }
 
     // LIMITE de transfert vérifiée sur l'ÉQUIVALENT GNF du montant envoyé (limite en GNF).
@@ -1463,7 +1457,7 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       }
 
       // Destinataire crédité au taux NET (la commission est prélevée EN PLUS, ci-dessous)
-      amountToCredit = smartRoundCurrencyAmount(amount * rateUsed, receiverCurrency);
+      amountToCredit = smartRound(amount * rateUsed, receiverCurrency);
     }
 
     // COMMISSION FX (internationale uniquement) prélevée EN PLUS sur l'expéditeur.
@@ -1471,7 +1465,7 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     // La commission reste dans le float plateforme (débitée mais non recréditée).
     const commissionRate = isInternational ? await getFxCommissionRate() : 0;
     const feeAmount = isInternational
-      ? smartRoundCurrencyAmount(amount * commissionRate, senderCurrency)
+      ? smartRound(amount * commissionRate, senderCurrency)
       : 0;
 
     // ── LIMITE de transfert vérifiée sur l'ÉQUIVALENT GNF du montant envoyé ──
@@ -1598,7 +1592,7 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
       currency_received: receiverCurrency,
       fee_amount: feeAmount,
       fee_percentage: commissionRate * 100,
-      total_debit: smartRoundCurrencyAmount(amount + feeAmount, senderCurrency),
+      total_debit: smartRound(amount + feeAmount, senderCurrency),
       rate_used: rateUsed,
       rate_source: rateSource,
     });

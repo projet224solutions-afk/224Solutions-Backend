@@ -786,16 +786,27 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
         const feeCur = String(walletDebitParams.p_buyer_wallet_currency || currency || 'GNF').toUpperCase();
         let gnfFee = feeAmount;
         if (feeCur !== 'GNF' && feeAmount > 0) {
-          const { data: fx } = await supabaseAdmin
-            .from('currency_exchange_rates')
-            .select('rate')
-            .eq('from_currency', feeCur)
-            .eq('to_currency', 'GNF')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          // Pas de taux dispo → on n'invente pas (commission ignorée plutôt que fausse).
-          gnfFee = fx?.rate ? feeAmount * Number(fx.rate) : 0;
+          // Conversion TRACÉE par Fatome (_acash_fx : taux + date + source, garde de fraîcheur 24 h) —
+          // plus de spot brut non tracé. Fail-closed : pas de taux frais → JAMAIS de silence.
+          const { data: fx, error: fxErr } = await supabaseAdmin.rpc('_acash_fx', {
+            p_amount: feeAmount, p_from: feeCur, p_to: 'GNF',
+          } as any);
+          const converted = Number((fx as any)?.converted);
+          if (fxErr || !Number.isFinite(converted) || converted <= 0) {
+            // La commission n'est PAS perdue : elle passe EN ATTENTE (affiliate_commission_pending,
+            // idempotent par order_id) → le job leader-gardé la verse dès qu'un taux frais existe.
+            if (vendor.user_id) {
+              await supabaseAdmin.rpc('affiliate_commission_enqueue', {
+                p_source_type: 'achat_produit', p_source_ref: String(result.order_id),
+                p_beneficiary: vendor.user_id, p_fee_amount: feeAmount, p_fee_currency: feeCur,
+                p_reason: 'NO_RATE', p_detail: { order_id: result.order_id },
+              } as any);
+              logger.warn(`commission agent achat ${result.order_id} en ATTENTE (taux ${feeCur}→GNF indisponible)`);
+            }
+            gnfFee = 0;
+          } else {
+            gnfFee = converted;
+          }
         }
         if (gnfFee > 0 && vendor.user_id) {
           // ✅ Agent du CRÉATEUR (le vendeur), et non de l'acheteur.

@@ -43,6 +43,7 @@ export const MONITOR_DOMAINS: DomainDef[] = [
   { key: 'subscription', module: 'subscription', label: 'Abonnements', rpc: 'subscription_monitor_report' },
   { key: 'transfer', module: 'transfer', label: 'Transferts', rpc: 'transfer_monitor_report' },
   { key: 'commission', module: 'commission', label: 'Commissions', rpc: 'commission_monitor_report' },
+  { key: 'affiliate', module: 'affiliate', label: 'Commissions affiliation (agents/sous-agents)', rpc: 'affiliate_commission_monitor_report' },
   { key: 'order', module: 'order', label: 'Commandes', rpc: 'order_monitor_report' },
   { key: 'wallet', module: 'wallet', label: 'Wallet (dépôts/retraits)', rpc: 'wallet_monitor_report' },
   { key: 'pos', module: 'pos', label: 'POS (caisse vendeur)', rpc: 'pos_monitor_report' },
@@ -100,6 +101,10 @@ const SUGGESTED_FIX: Record<string, string> = {
   agent_commission_nonpositive: 'Commission agent ≤ 0 enregistrée. Vérifier le calcul des taux globaux (pdg_settings).',
   agent_commission_duplicate: 'Doublon (agent, transaction) : l\'index unique idx_agent_commissions_log_unique_transaction est-il présent ? Brèche d\'idempotence.',
   agent_commission_rapid: 'Rafale de commissions agent en 5 min. Vérifier un abus/attaque (transactions répétées d\'un même affilié).',
+  // affiliation (agents/sous-agents)
+  affiliate_gap: 'Commande payée avec frais acheteur > 0 dont le vendeur est rattaché à un agent ACTIF, MAIS aucune commission d\'affiliation tracée ni en attente : commission perdue. Vérifier orders.routes (triggerAffiliateCommission) et la file affiliate_commission_pending.',
+  affiliate_split_invalid: 'GRAVE : la somme des parts d\'affiliation (sous-agent + parent) dépasse le plafond des frais (max_total_agent_commission_percentage). Vérifier le split dans credit_agent_commission.',
+  affiliate_pending_overdue: 'Commissions d\'affiliation en attente > 24 h : taux de change jamais redevenu frais (ou Fatome KO). Vérifier le ledger FX (currency_exchange_rates) de la devise concernée ; le job les verse dès qu\'un taux frais existe.',
   agent_wallet_drift: 'agent_wallets ≠ somme des commissions loggées : crédit non tracé (chemin hors credit_agent_wallet_gnf) ou manipulation. Réconcilier.',
   order_paid_no_escrow: 'Commande payée sans escrow : le séquestre n\'a pas été créé. Vérifier create_order_core (insertion escrow) — risque vendeur non payé / argent bloqué.',
   order_duplicate_payment_intent: 'GRAVE : 2 commandes pour 1 paiement. L\'index unique uniq_orders_payment_intent est-il présent ? Webhook paiement rejoué.',

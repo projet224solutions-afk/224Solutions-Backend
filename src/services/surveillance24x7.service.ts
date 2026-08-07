@@ -4,6 +4,7 @@ import { checkSupabaseConnection, supabaseAdmin } from '../config/supabase.js';
 import { redisHealthCheck, locks, isRedisConnected } from '../config/redis.js';
 import { emitCoreFeatureEvent, type FeatureHealthStatus } from './coreFeatureEvents.service.js';
 import { runPlatformMonitors, autoResolveStaleEventAlerts } from './escrowMonitor.service.js';
+import { triggerAffiliateCommission } from './commission.service.js';
 import { ingestAndSummarize, scanAndDiagnose } from './autoHealing.service.js';
 
 type ServiceStatus = 'healthy' | 'degraded' | 'critical' | 'unknown';
@@ -169,6 +170,37 @@ class Surveillance24x7Service {
               logger.warn(`[Surveillance24x7] fatome escalation failed (${type}): ${e?.message || e}`);
             }
           }
+        }
+      }
+
+      // 🔁 CH2 — RETRY des commissions d'affiliation EN ATTENTE (jamais perdues). Dès qu'un taux
+      // frais existe, on convertit par Fatome (_acash_fx : taux+date+source, garde 24 h) et on verse
+      // via le flux normal (idempotent par (transaction_id, related_user_id)). Leader-gardé (tout ce
+      // cycle l'est) ; gaté ~toutes les 5 min pour ne pas marteler. Best-effort, jamais bloquant.
+      if (this.cycleCount === 1 || this.cycleCount % 5 === 0) {
+        try {
+          const { data: pend } = await supabaseAdmin.rpc('affiliate_commission_pending_list' as any, { p_limit: 50 });
+          for (const p of ((pend as any[]) || [])) {
+            try {
+              const { data: fx, error: fxErr } = await supabaseAdmin.rpc('_acash_fx' as any, {
+                p_amount: p.fee_amount, p_from: p.fee_currency, p_to: 'GNF',
+              });
+              const converted = Number((fx as any)?.converted);
+              if (fxErr || !Number.isFinite(converted) || converted <= 0) {
+                // Taux toujours indisponible → reste en attente (tentative comptée).
+                await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, { p_id: p.id, p_status: 'pending', p_error: fxErr?.message || 'no_fresh_rate' });
+                continue;
+              }
+              const res = await triggerAffiliateCommission(p.beneficiary_user_id, Math.round(converted), p.source_type, p.source_ref);
+              await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, {
+                p_id: p.id, p_status: res.success ? 'resolved' : 'pending', p_error: res.success ? null : (res.error || 'credit_failed'),
+              });
+            } catch (e: any) {
+              await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, { p_id: p.id, p_status: 'pending', p_error: e?.message || String(e) });
+            }
+          }
+        } catch (e: any) {
+          logger.warn(`[Surveillance24x7] affiliate pending retry failed: ${e?.message || e}`);
         }
       }
 

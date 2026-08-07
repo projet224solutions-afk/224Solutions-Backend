@@ -28,9 +28,17 @@ router.post("/firebase-health-check", async (req: Request, res: Response) => {
 });
 
 // Cron & Scheduled Tasks
-router.post("/production-cron-jobs", async (req: Request, res: Response) => {
-  const { job_type } = req.body || {};
-  return res.json({ success: true, job_type, executed: true });
+// ⚠️ Cette route N'A JAMAIS RIEN EXÉCUTÉ : elle répondait `executed: true` en dur.
+// Tant qu'elle mentait, un appelant croyait avoir déclenché les tâches (dont, jusqu'au
+// 08/08/2026, l'auto-libération des escrows — de l'argent). Elle échoue désormais
+// franchement. Les vraies tâches : pg_cron → Edge `production-cron-jobs` (nettoyage,
+// statuts, alertes) et backend `escrowAutoRelease.service.ts` (libération escrow).
+router.post("/production-cron-jobs", async (_req: Request, res: Response) => {
+  return res.status(501).json({
+    success: false,
+    error: "Cette route n'exécute aucune tâche. Les crons tournent via pg_cron (Edge) et le job backend escrowAutoRelease.",
+    error_code: "CRON_PROXY_NOT_IMPLEMENTED",
+  });
 });
 
 router.post("/apply-migrations", async (req: Request, res: Response) => {

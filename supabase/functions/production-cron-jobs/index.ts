@@ -1,13 +1,24 @@
 /**
  * ⏰ PRODUCTION CRON JOBS — Phase 5
- * 
+ *
  * Edge function déclenchée par pg_cron pour exécuter les tâches système :
  *   1. Nettoyage idempotency_keys expirées
  *   2. Expiration subscriptions trialing > 48h
- *   3. Réconciliation POS stock pending
- *   4. Auto-release escrow transactions
+ *   3. Expiration subscriptions past_due
+ *   4. Réconciliation POS stock pending
  *   5. Alertes commandes bloquées
- * 
+ *
+ * ⛔ NE PLUS AJOUTER ICI DE TÂCHE QUI DÉPLACE DE L'ARGENT.
+ *    L'auto-libération des escrows vivait ici — elle a été RETIRÉE le 08/08/2026 et
+ *    migrée vers le backend Node (`backend/src/services/escrowAutoRelease.service.ts`).
+ *    RAISON : les Edge Functions sont un 3e lieu de déploiement, indépendant de
+ *    `git push`. La version déployée ici datait d'avril alors que la source était
+ *    corrigée depuis : pendant ~2 mois, des escrows sont passés à 'released' SANS
+ *    créditer le vendeur (5 cas, 401 000 GNF dus à 2 vendeurs). Une dérive de
+ *    déploiement sur du code non financier coûte un bug ; sur de l'argent, elle
+ *    coûte des vendeurs impayés et invisibles.
+ *    Les tâches restantes sont sans mouvement d'argent (nettoyage, statuts, alertes).
+ *
  * Sécurisé par Authorization Bearer (anon key via pg_cron).
  */
 
@@ -137,45 +148,13 @@ Deno.serve(async (req) => {
     results['pos_reconciliation'] = { success: false, affected: 0, error: e.message }
   }
 
-  // ===== 5. AUTO-RELEASE ESCROW TRANSACTIONS (ATOMIQUE) =====
-  // ⚠️ CORRECTIF : avant, ce cron faisait un simple UPDATE status='released' SANS créditer le vendeur
-  //    ni écrire la ligne d'historique → escrows libérés mais VENDEURS NON PAYÉS (bug d'argent, faux
-  //    « released_no_ledger »). Désormais on délègue au primitif canonique release_escrow_to_seller
-  //    (crédit vendeur converti + commission PDG + ligne wallet_transactions + statut, en 1 transaction),
-  //    exactement comme le job backend Node. NB : idéalement retirer ce cron au profit du backend.
-  try {
-    const { data: due } = await supabase
-      .from('escrow_transactions')
-      .select('id, order_id')
-      .eq('status', 'held')
-      .lt('auto_release_at', new Date().toISOString())
-      .not('seller_confirmed_at', 'is', null)
-      .is('dispute_status', null)
-
-    let released = 0
-    for (const escrow of (due ?? [])) {
-      const { data: rel, error: relErr } = await supabase.rpc('release_escrow_to_seller', {
-        p_escrow_id: escrow.id,
-        p_reason: 'auto_release_cron',
-      })
-      // L'idempotence/autorisation est gérée dans le RPC ; on n'avance que si la libération a réussi.
-      if (relErr || (rel && (rel as any).success === false)) continue
-      released++
-      await supabase
-        .from('orders')
-        .update({
-          status: 'delivered',
-          delivered_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrow.order_id)
-        .in('status', ['shipped', 'confirmed', 'preparing'])
-    }
-
-    results['escrow_auto_release'] = { success: true, affected: released }
-  } catch (e: any) {
-    results['escrow_auto_release'] = { success: false, affected: 0, error: e.message }
-  }
+  // ===== [RETIRÉ] AUTO-RELEASE ESCROW → backend Node (08/08/2026) =====
+  // Ce bloc libérait les escrows échus. Il a été DÉPLACÉ, pas supprimé :
+  //   backend/src/services/escrowAutoRelease.service.ts (leader-gardé, toutes les 15 min)
+  // Il appelle le MÊME primitif `release_escrow_to_seller`. Ne pas le réintroduire ici :
+  // deux ordonnanceurs sur la même file, c'est deux vérités sur qui a payé le vendeur.
+  // Surveillance : capteur `auto_release_dead` du domaine escrow (alerte si un escrow
+  // éligible stagne > 1 h) + heartbeat `escrow_auto_release` au registre Fatome.
 
   // ===== 6. DETECT STUCK ORDERS (pending > 72h) =====
   try {

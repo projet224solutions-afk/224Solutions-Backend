@@ -33,6 +33,7 @@ import { metrics } from './services/metrics.service.js';
 import { surveillance24x7Service } from './services/surveillance24x7.service.js';
 import { fatomeGeneralService } from './services/fatomeGeneral.service.js';
 import { fatomeFeaturesService } from './services/fatomeFeatures.service.js';
+import { escrowAutoReleaseService } from './services/escrowAutoRelease.service.js';
 import { readManifest } from './services/featureManifest.js';
 import { startFeatureErrorRate, stopFeatureErrorRate } from './services/featureErrorRate.service.js';
 import { dropshipSyncScheduler } from './services/dropship/dropshipSync.service.js';
@@ -468,6 +469,9 @@ async function bootstrapBackgroundServices() {
       } catch (e: any) { logger.warn(`Chargement manifeste: ${e?.message}`); }
       fatomeFeaturesService.start();
       startFeatureErrorRate();
+      // 💰 Auto-libération des escrows (migrée de l'Edge Function) — ne démarre que si
+      // ESCROW_AUTO_RELEASE_BACKEND=true, pour une bascule sans double exécution.
+      escrowAutoReleaseService.start();
       dropshipSyncScheduler.start();
       medicationReminderScheduler.start();
       notificationRetryScheduler.start();
@@ -480,6 +484,7 @@ async function bootstrapBackgroundServices() {
         fatomeGeneralService.stop?.();
         fatomeFeaturesService.stop?.();
         stopFeatureErrorRate();
+        escrowAutoReleaseService.stop?.();
         dropshipSyncScheduler.stop?.();
         medicationReminderScheduler.stop?.();
         notificationRetryScheduler.stop?.();
@@ -527,6 +532,7 @@ const gracefulShutdown = async (signal: string) => {
     fatomeGeneralService.stop();
     fatomeFeaturesService.stop();
     stopFeatureErrorRate();
+    escrowAutoReleaseService.stop();
     dropshipSyncScheduler.stop();
     medicationReminderScheduler.stop();
     notificationRetryScheduler.stop();

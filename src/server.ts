@@ -31,6 +31,7 @@ import { closeRedis } from './config/redis.js';
 import { jobQueue } from './jobs/jobQueue.js';
 import { metrics } from './services/metrics.service.js';
 import { surveillance24x7Service } from './services/surveillance24x7.service.js';
+import { fatomeGeneralService } from './services/fatomeGeneral.service.js';
 import { dropshipSyncScheduler } from './services/dropship/dropshipSync.service.js';
 import { medicationReminderScheduler } from './services/medicationReminder.service.js';
 import { notificationRetryScheduler } from './services/notificationRetry.service.js';
@@ -456,6 +457,7 @@ async function bootstrapBackgroundServices() {
       await jobQueue.init();
       await jobQueue.scheduleRecurring();
       surveillance24x7Service.start();
+      fatomeGeneralService.start();
       dropshipSyncScheduler.start();
       medicationReminderScheduler.start();
       notificationRetryScheduler.start();
@@ -465,6 +467,7 @@ async function bootstrapBackgroundServices() {
     async () => {
       try {
         surveillance24x7Service.stop?.();
+        fatomeGeneralService.stop?.();
         dropshipSyncScheduler.stop?.();
         medicationReminderScheduler.stop?.();
         notificationRetryScheduler.stop?.();
@@ -509,6 +512,7 @@ const gracefulShutdown = async (signal: string) => {
   server.close(async () => {
     logger.info('HTTP server closed');
     surveillance24x7Service.stop();
+    fatomeGeneralService.stop();
     dropshipSyncScheduler.stop();
     medicationReminderScheduler.stop();
     notificationRetryScheduler.stop();

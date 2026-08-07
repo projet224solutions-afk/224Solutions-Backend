@@ -1571,6 +1571,48 @@ router.put('/sms-notification-types', verifyJWT, requireRole(PDG_ROLES), async (
 });
 
 // ============================================================================
+// 👻 FATOME §4 — numéro SMS d'ALERTE du PDG (config, jamais en dur dans le code).
+// Utilisé par fatomeAlerts.service (SMS hors-bande des anomalies critiques).
+// ============================================================================
+router.get('/fatome/alert-sms-phone', verifyJWT, requireRole(PDG_ROLES), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data } = await supabaseAdmin
+      .from('pdg_settings').select('setting_value').eq('setting_key', 'pdg_alert_sms_phone').maybeSingle();
+    const raw: any = data?.setting_value;
+    const phone = typeof raw === 'string' ? raw : typeof raw?.value === 'string' ? raw.value : null;
+    res.json({ success: true, data: { phone: phone && phone.trim() ? phone.trim() : null } });
+  } catch (error: any) {
+    logger.error(`[admin/fatome/alert-sms-phone GET] ${error.message}`);
+    res.status(500).json({ success: false, error: 'Erreur lecture numéro d\'alerte' });
+  }
+});
+
+router.put('/fatome/alert-sms-phone', verifyJWT, requireRole(PDG_ROLES), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const raw = String(req.body?.phone ?? '').trim();
+    // Vide = désactivation des SMS d'alerte ; sinon E.164 strict.
+    if (raw && !/^\+[1-9]\d{6,14}$/.test(raw)) {
+      res.status(400).json({ success: false, error: 'Numéro invalide (format international +XXX...)' });
+      return;
+    }
+    const { error } = await supabaseAdmin.from('pdg_settings').upsert({
+      setting_key: 'pdg_alert_sms_phone',
+      setting_value: { value: raw || null },
+      description: 'Numéro SMS du PDG pour les alertes Fatome critiques (hors-bande). Vide = désactivé.',
+      updated_by: req.user!.id,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'setting_key' });
+    if (error) { res.status(400).json({ success: false, error: error.message }); return; }
+    const { invalidatePdgAlertPhoneCache } = await import('../services/fatomeAlerts.service.js');
+    invalidatePdgAlertPhoneCache();
+    res.json({ success: true, data: { phone: raw || null } });
+  } catch (error: any) {
+    logger.error(`[admin/fatome/alert-sms-phone PUT] ${error.message}`);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================================
 // 🔐 2FA ADMIN — gestion du step-up TOTP (enrôlement / activation / step-up)
 // Tout est vérifié SERVEUR (speakeasy). Le secret ne transite jamais en clair vers
 // le client après l'enrôlement initial (QR/secret affichés une seule fois).

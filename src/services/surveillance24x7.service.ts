@@ -6,6 +6,7 @@ import { emitCoreFeatureEvent, type FeatureHealthStatus } from './coreFeatureEve
 import { runPlatformMonitors, autoResolveStaleEventAlerts } from './escrowMonitor.service.js';
 import { triggerAffiliateCommission } from './commission.service.js';
 import { ingestAndSummarize, scanAndDiagnose } from './autoHealing.service.js';
+import { dispatchCriticalAnomalySms } from './fatomeAlerts.service.js';
 
 type ServiceStatus = 'healthy' | 'degraded' | 'critical' | 'unknown';
 
@@ -240,6 +241,30 @@ class Surveillance24x7Service {
       try {
         await supabaseAdmin.rpc('fatome_heartbeat_beat' as any, { p_ok: cycleOk, p_error: cycleErr, p_cycle: this.cycleCount });
       } catch (e: any) { logger.warn(`[Surveillance24x7] heartbeat beat failed: ${e?.message || e}`); }
+
+      // 📟 §4 : SMS hors-bande au PDG pour les anomalies CRITIQUES (anti-spam 6 h/type,
+      // numéro en pdg_settings). ~1×/5 min — jamais bloquant.
+      if (this.cycleCount === 1 || this.cycleCount % 5 === 0) {
+        try { await dispatchCriticalAnomalySms(); }
+        catch (e: any) { logger.warn(`[Surveillance24x7] fatome sms dispatch failed: ${e?.message || e}`); }
+      }
+
+      // 🗒️ §10.1.4 : journal d'ACTIVITÉ de l'étage B — chaque cycle laisse une trace
+      // (horodatage, durée, résultat, volume) lisible dans l'onglet Fatome Sentinelle.
+      try {
+        await supabaseAdmin.from('fatome_activity_log').insert({
+          fatome_key: 'fatome_sentinelle',
+          duration_ms: summary.durationMs,
+          ok: cycleOk,
+          message: cycleOk ? `Cycle ${trigger} OK` : `Cycle ${trigger} en erreur : ${cycleErr}`,
+          volume: {
+            cycle: this.cycleCount,
+            services: services.length,
+            features: features.length,
+            domains: platformReport?.domains?.length ?? 0,
+          },
+        });
+      } catch { /* best-effort */ }
 
       return summary;
     } catch (error: any) {

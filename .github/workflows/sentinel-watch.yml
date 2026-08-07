@@ -1,0 +1,100 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 👁️ ŒIL EXTERNE (§5) — vérificateur qui ne partage AUCUNE panne avec l'infra.
+# Toutes les 15 min : sonde le backend (/health/sentinel) ET lit le heartbeat
+# directement dans Supabase (REST, clé service en secret GitHub). Verdict croisé :
+#   backend KO + Supabase OK      → « backend down »
+#   backend KO + Supabase KO      → « panne totale »
+#   joignables mais heartbeat vieux → « sentinelle morte »
+# Dans tous les cas d'échec, le job FAIL → GitHub envoie automatiquement un
+# e-mail au propriétaire du dépôt (aucun secret supplémentaire requis).
+# SMS optionnel : si les secrets TWILIO_* sont configurés au niveau du dépôt et
+# WATCH_SMS_TO est défini, un SMS part en plus (étape best-effort).
+# La sonde publique ne renvoie QUE {status, heartbeat_age_seconds} — rien d'autre.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Sentinel Watch (œil externe)
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinel-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sonde backend + heartbeat Supabase → verdict croisé
+        id: verdict
+        env:
+          SUPABASE_URL: https://uakkxaibujzxdiqzpnpr.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set +e
+          MAX_AGE=900   # 15 min
+
+          # 1) Backend (sonde publique minimale, rate-limitée)
+          BACKEND_JSON=$(curl -sS --max-time 20 https://api.solution224.com/health/sentinel || true)
+          BACKEND_STATUS=$(echo "$BACKEND_JSON" | grep -o '"status":"[a-z]*"' | head -1 | cut -d'"' -f4)
+          echo "backend: ${BACKEND_STATUS:-injoignable} ($BACKEND_JSON)"
+
+          # 2) Supabase direct (indépendant du backend)
+          SB_JSON=$(curl -sS --max-time 20 \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            "$SUPABASE_URL/rest/v1/fatome_sentinel_heartbeat?id=eq.1&select=last_beat" || true)
+          LAST_BEAT=$(echo "$SB_JSON" | grep -o '"last_beat":"[^"]*"' | cut -d'"' -f4)
+          if [ -n "$LAST_BEAT" ]; then
+            BEAT_EPOCH=$(date -d "$LAST_BEAT" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            AGE=$((NOW_EPOCH - BEAT_EPOCH))
+          else
+            AGE=-1
+          fi
+          echo "supabase heartbeat age: ${AGE}s"
+
+          # 3) Verdict croisé
+          VERDICT=ok; DETAIL=""
+          if [ "$BACKEND_STATUS" = "ok" ] && [ "$AGE" -ge 0 ] && [ "$AGE" -le "$MAX_AGE" ]; then
+            VERDICT=ok; DETAIL="backend ok, heartbeat ${AGE}s"
+          elif [ -z "$BACKEND_STATUS" ] && [ "$AGE" -lt 0 ]; then
+            VERDICT=panne_totale; DETAIL="backend ET Supabase injoignables"
+          elif [ -z "$BACKEND_STATUS" ] && [ "$AGE" -ge 0 ] && [ "$AGE" -le "$MAX_AGE" ]; then
+            VERDICT=backend_down; DETAIL="backend injoignable, mais la sentinelle battait il y a ${AGE}s"
+          elif [ "$AGE" -gt "$MAX_AGE" ] || [ "$BACKEND_STATUS" = "dead" ]; then
+            VERDICT=sentinelle_morte; DETAIL="heartbeat vieux de ${AGE}s (max ${MAX_AGE}s)"
+          elif [ "$AGE" -lt 0 ]; then
+            VERDICT=supabase_illisible; DETAIL="backend=$BACKEND_STATUS mais heartbeat illisible"
+          else
+            VERDICT=degrade; DETAIL="backend=$BACKEND_STATUS age=${AGE}s"
+          fi
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+          echo "### 👁️ Sentinel Watch : $VERDICT — $DETAIL" >> "$GITHUB_STEP_SUMMARY"
+          [ "$VERDICT" = "ok" ] || exit 1
+
+      - name: SMS PDG (optionnel — seulement si secrets Twilio configurés)
+        if: failure()
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_PHONE_NUMBER }}
+          WATCH_SMS_TO: ${{ secrets.WATCH_SMS_TO }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+          DETAIL: ${{ steps.verdict.outputs.detail }}
+        run: |
+          if [ -z "$TWILIO_ACCOUNT_SID" ] || [ -z "$WATCH_SMS_TO" ]; then
+            echo "Twilio/WATCH_SMS_TO non configurés → e-mail GitHub seulement (comportement documenté)."
+            exit 0
+          fi
+          curl -sS -X POST "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/Messages.json" \
+            --data-urlencode "To=$WATCH_SMS_TO" \
+            --data-urlencode "From=$TWILIO_FROM" \
+            --data-urlencode "Body=💀 224Solutions — Sentinel Watch: ${VERDICT:-echec} (${DETAIL:-, voir GitHub Actions})" \
+            -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" || true

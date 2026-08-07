@@ -35,7 +35,8 @@ export async function triggerAffiliateCommission(
   userId: string,
   amount: number,
   transactionType: string,
-  transactionId?: string
+  transactionId?: string,
+  amountCurrency: string = 'GNF', // 🌍 devise SOURCE du montant (grille par pays). Défaut GNF.
 ): Promise<CommissionTriggerResult> {
   // Validation montant (anti-exploit: pas de montants négatifs/nuls)
   if (typeof amount !== 'number' || amount <= 0) {
@@ -43,17 +44,43 @@ export async function triggerAffiliateCommission(
     return { success: false, error: 'Amount must be > 0' };
   }
 
+  const srcCur = String(amountCurrency || 'GNF').toUpperCase();
+  let gnfBase = amount;
+  let baseFx: { rate: number; rate_at: string; source: string } | null = null;
+
   try {
+    // 1) BASE DE CALCUL EN GNF. La commission raisonne en GNF (base du coffre PDG). Si le montant
+    //    source est dans une autre devise (grille par pays : XOF/SLE/EUR…), on convertit source→GNF
+    //    via _acash_fx (taux frais, TRACÉ). Taux indisponible → PENDING (devise SOURCE conservée) :
+    //    JAMAIS de calcul sur base fausse, JAMAIS d'abandon silencieux.
+    if (srcCur !== 'GNF') {
+      const { data: fx, error: fxErr } = await supabaseAdmin.rpc('_acash_fx', {
+        p_amount: amount, p_from: srcCur, p_to: 'GNF',
+      } as any);
+      const conv = Number((fx as any)?.converted);
+      if (fxErr || !Number.isFinite(conv) || conv <= 0) {
+        if (transactionId) {
+          await supabaseAdmin.rpc('affiliate_commission_enqueue', {
+            p_source_type: transactionType, p_source_ref: String(transactionId), p_beneficiary: userId,
+            p_fee_amount: amount, p_fee_currency: srcCur, p_reason: 'NO_RATE_SOURCE',
+            p_detail: { source_currency: srcCur, source_amount: amount },
+          } as any);
+          return { success: true, pending: true, hasAgent: true };
+        }
+        logger.warn(`[Commission] taux source ${srcCur}→GNF indisponible sans transactionId → non mis en attente (userId=${userId})`);
+        return { success: false, error: 'NO_RATE_SOURCE' };
+      }
+      gnfBase = conv;
+      baseFx = { rate: Number((fx as any).rate), rate_at: String((fx as any).rate_at), source: String((fx as any).source) };
+    }
+
+    // 2) Crédit sur BASE GNF (le maillon GNF→devise agent est tracé dans credit_agent_wallet_gnf).
     const { data, error } = await supabaseAdmin.rpc('credit_agent_commission', {
       p_user_id: userId,
-      p_amount: amount,
+      p_amount: Math.round(gnfBase),
       p_source_type: transactionType,
       p_transaction_id: transactionId || null,
-      p_metadata: {
-        currency: 'GNF', // Validé: uniquement 'GNF' autorisé
-        source: 'backend-node',
-        triggered_at: new Date().toISOString(),
-      },
+      p_metadata: { currency: 'GNF', source: 'backend-node', triggered_at: new Date().toISOString() },
     });
 
     if (error) {
@@ -63,18 +90,12 @@ export async function triggerAffiliateCommission(
 
     const result = data as any;
 
-    // FX du leg GNF→devise agent indisponible : la commission N'EST PAS versée (fail-closed) mais
-    // N'EST PAS perdue — on la met EN ATTENTE (idempotent par (source_type, source_ref)). Le job
-    // leader-gardé la reverse dès qu'un taux frais existe. Nécessite un transactionId (clé d'idempotence).
+    // Leg GNF→devise agent indisponible → PENDING (FX_DOWN), base GNF conservée (source déjà convertie).
     if (result?.fx_pending) {
       if (transactionId) {
         await supabaseAdmin.rpc('affiliate_commission_enqueue', {
-          p_source_type: transactionType,
-          p_source_ref: String(transactionId),
-          p_beneficiary: userId,
-          p_fee_amount: amount,
-          p_fee_currency: 'GNF',
-          p_reason: 'FX_DOWN',
+          p_source_type: transactionType, p_source_ref: String(transactionId), p_beneficiary: userId,
+          p_fee_amount: Math.round(gnfBase), p_fee_currency: 'GNF', p_reason: 'FX_DOWN',
           p_detail: { agent_fx: result?.error || 'AGENT_FX_UNAVAILABLE' },
         } as any);
       } else {
@@ -83,12 +104,17 @@ export async function triggerAffiliateCommission(
       return { success: true, pending: true, hasAgent: true };
     }
 
+    // 3) Trace du leg SOURCE→GNF sur la/les ligne(s) de commission (sous-agent + parent partagent la base).
+    if (baseFx && transactionId && result?.has_agent && !result?.already_processed) {
+      await supabaseAdmin.from('agent_commissions_log').update({
+        base_currency: srcCur, base_amount: amount,
+        base_fx_rate: baseFx.rate, base_fx_rate_at: baseFx.rate_at, base_fx_source: baseFx.source,
+      }).eq('transaction_id', transactionId).eq('related_user_id', userId);
+    }
+
     logger.info('[Commission] Affiliate commission processed', {
-      userId,
-      transactionType,
-      amount,
-      hasAgent: result?.has_agent,
-      alreadyProcessed: result?.already_processed,
+      userId, transactionType, amount, srcCur, gnfBase,
+      hasAgent: result?.has_agent, alreadyProcessed: result?.already_processed,
     });
 
     return {

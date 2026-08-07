@@ -784,33 +784,11 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
       try {
         const feeAmount = Number(walletDebitParams.p_buyer_fee_amount || 0); // frais de transaction (devise acheteur)
         const feeCur = String(walletDebitParams.p_buyer_wallet_currency || currency || 'GNF').toUpperCase();
-        let gnfFee = feeAmount;
-        if (feeCur !== 'GNF' && feeAmount > 0) {
-          // Conversion TRACÉE par Fatome (_acash_fx : taux + date + source, garde de fraîcheur 24 h) —
-          // plus de spot brut non tracé. Fail-closed : pas de taux frais → JAMAIS de silence.
-          const { data: fx, error: fxErr } = await supabaseAdmin.rpc('_acash_fx', {
-            p_amount: feeAmount, p_from: feeCur, p_to: 'GNF',
-          } as any);
-          const converted = Number((fx as any)?.converted);
-          if (fxErr || !Number.isFinite(converted) || converted <= 0) {
-            // La commission n'est PAS perdue : elle passe EN ATTENTE (affiliate_commission_pending,
-            // idempotent par order_id) → le job leader-gardé la verse dès qu'un taux frais existe.
-            if (vendor.user_id) {
-              await supabaseAdmin.rpc('affiliate_commission_enqueue', {
-                p_source_type: 'achat_produit', p_source_ref: String(result.order_id),
-                p_beneficiary: vendor.user_id, p_fee_amount: feeAmount, p_fee_currency: feeCur,
-                p_reason: 'NO_RATE', p_detail: { order_id: result.order_id },
-              } as any);
-              logger.warn(`commission agent achat ${result.order_id} en ATTENTE (taux ${feeCur}→GNF indisponible)`);
-            }
-            gnfFee = 0;
-          } else {
-            gnfFee = converted;
-          }
-        }
-        if (gnfFee > 0 && vendor.user_id) {
-          // ✅ Agent du CRÉATEUR (le vendeur), et non de l'acheteur.
-          await triggerAffiliateCommission(vendor.user_id, Math.round(gnfFee), 'achat_produit', result.order_id);
+        if (feeAmount > 0 && vendor.user_id) {
+          // ✅ Agent du CRÉATEUR (le vendeur), et non de l'acheteur. UN SEUL point de conversion :
+          //    la devise des frais est passée AU SERVICE (source→GNF tracée + pending si taux absent) —
+          //    même mécanique que les abonnements, plus de conversion locale/skip silencieux.
+          await triggerAffiliateCommission(vendor.user_id, feeAmount, 'achat_produit', result.order_id, feeCur);
         }
       } catch (commErr: any) {
         logger.warn(`commission agent achat non bloquante (commande ${result.order_id}): ${commErr?.message || commErr}`);

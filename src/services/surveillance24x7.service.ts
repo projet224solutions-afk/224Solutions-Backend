@@ -182,18 +182,11 @@ class Surveillance24x7Service {
           const { data: pend } = await supabaseAdmin.rpc('affiliate_commission_pending_list' as any, { p_limit: 50 });
           for (const p of ((pend as any[]) || [])) {
             try {
-              const { data: fx, error: fxErr } = await supabaseAdmin.rpc('_acash_fx' as any, {
-                p_amount: p.fee_amount, p_from: p.fee_currency, p_to: 'GNF',
-              });
-              const converted = Number((fx as any)?.converted);
-              if (fxErr || !Number.isFinite(converted) || converted <= 0) {
-                // Taux toujours indisponible → reste en attente (tentative comptée).
-                await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, { p_id: p.id, p_status: 'pending', p_error: fxErr?.message || 'no_fresh_rate' });
-                continue;
-              }
-              const res = await triggerAffiliateCommission(p.beneficiary_user_id, Math.round(converted), p.source_type, p.source_ref);
-              // res.pending = leg devise-agent toujours sans taux frais → reste en attente.
-              const done = res.success && !res.pending;
+              // UN SEUL point de conversion : on repasse le montant + la devise SOURCE au service, qui
+              // convertit source→GNF (tracé) puis GNF→devise agent (tracé). Idempotent par transaction_id.
+              // NO_RATE_SOURCE : fee_currency = devise source ; FX_DOWN : fee_currency = GNF (source déjà faite).
+              const res = await triggerAffiliateCommission(p.beneficiary_user_id, Number(p.fee_amount), p.source_type, p.source_ref, p.fee_currency);
+              const done = res.success && !res.pending; // pending = un leg toujours sans taux → reste en attente
               await supabaseAdmin.rpc('affiliate_commission_pending_mark' as any, {
                 p_id: p.id, p_status: done ? 'resolved' : 'pending', p_error: done ? null : (res.error || 'still_pending'),
               });

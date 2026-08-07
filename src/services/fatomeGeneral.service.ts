@@ -7,7 +7,8 @@
  * NB (dit au rapport) : la séparation de PROCESSUS n'est pas possible en l'état (un seul
  * worker pm2) — le Général tourne sur un CYCLE SÉPARÉ de la sentinelle, et c'est le
  * vérificateur pg_cron (hors backend) qui vérifie le Général (§9.3).
- * Les contrôles CROISÉS (§9.2 : verdict SUSPECT) sont VAGUE 3 — non implémentés ici.
+ * §9.2 CONTRÔLES CROISÉS : un Fatome qui dit « tout va bien » alors que ses ENTRÉES prouvent
+ * le contraire est déclaré SUSPECT (surveillant aveugle). Implémenté ci-dessous.
  * Aucun accès en écriture à quoi que ce soit d'argent.
  */
 import { logger } from '../config/logger.js';
@@ -15,7 +16,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 
 const INTERVAL_MS = Number(process.env.FATOME_GENERAL_INTERVAL_MS || 300_000); // 5 min
 
-type Verdict = 'SAIN' | 'DEGRADE' | 'MORT' | 'INCONNU';
+type Verdict = 'SAIN' | 'DEGRADE' | 'MORT' | 'SUSPECT' | 'INCONNU';
 
 interface RegistryRow {
   fatome_key: string;
@@ -65,7 +66,13 @@ class FatomeGeneralService {
       for (const r of (registry || []) as RegistryRow[]) {
         if (r.fatome_key === 'fatome_general') continue; // le pg_cron NOUS vérifie (§9.3), pas nous-mêmes
         try {
-          results.push(await this.checkOne(r));
+          const v = await this.checkOne(r);
+          // §9.2 — CONTRÔLE CROISÉ : un « SAIN » démenti par ses propres entrées devient SUSPECT.
+          if (v.verdict === 'SAIN') {
+            const cross = await this.crossCheck(r.fatome_key);
+            if (cross) { v.verdict = 'SUSPECT'; v.reason = cross; }
+          }
+          results.push(v);
         } catch (e: any) {
           // FAIL-CLOSED : un contrôle qui échoue = INCONNU, jamais SAIN.
           results.push({ fatome_key: r.fatome_key, verdict: 'INCONNU', reason: `contrôle en échec: ${String(e?.message || e).slice(0, 200)}`, heartbeat_age_sec: null });
@@ -85,6 +92,18 @@ class FatomeGeneralService {
         const reg = ((registry || []) as RegistryRow[]).find((r) => r.fatome_key === v.fatome_key);
         const critical = reg?.criticality === 'critical' || reg?.criticality === 'high';
         const type = `general:${v.fatome_key}_dead`;
+        try {
+          if (v.verdict === 'SUSPECT') {
+            await supabaseAdmin.rpc('fatome_raise' as any, {
+              p_type: `general:${v.fatome_key}_suspect`,
+              p_ref: `monitor:general:${v.fatome_key}_suspect:${day}`,
+              p_severity: 'critical',
+              p_detail: { reason: v.reason, source: 'fatome_general_crosscheck' },
+            });
+          } else {
+            await supabaseAdmin.rpc('fatome_resolve_type' as any, { p_type: `general:${v.fatome_key}_suspect` });
+          }
+        } catch (e: any) { logger.warn(`[FatomeGeneral] anomalie suspect ${v.fatome_key}: ${e?.message || e}`); }
         try {
           if (v.verdict === 'MORT' && critical) {
             await supabaseAdmin.rpc('fatome_raise' as any, {
@@ -113,6 +132,62 @@ class FatomeGeneralService {
       } catch { /* best-effort */ }
       this.running = false;
     }
+  }
+
+  /**
+   * §9.2 — CONTRÔLE CROISÉ. Renvoie la RAISON du soupçon, ou null si la cohérence tient.
+   * Principe : on confronte ce que le Fatome AFFIRME à ce que ses ENTRÉES montrent.
+   */
+  private async crossCheck(key: string): Promise<string | null> {
+    try {
+      if (key === 'fatome_sentinelle') {
+        // « 0 anomalie » alors que les erreurs réelles explosent → surveillant aveugle.
+        const { count: anomalies } = await supabaseAdmin
+          .from('fatome_anomalies').select('id', { count: 'exact', head: true })
+          .eq('resolved', false);
+        const { count: incidents } = await supabaseAdmin
+          .from('fatome_feature_incidents').select('id', { count: 'exact', head: true })
+          .is('resolved_at', null);
+        if ((anomalies || 0) === 0 && (incidents || 0) >= 3) {
+          return `dit « 0 anomalie » alors que ${incidents} incident(s) fonctionnel(s) sont ouverts — surveillant aveugle probable`;
+        }
+        // Étage B qui tourne mais n'a rien journalisé depuis 30 min → cycle vide suspect.
+        const { data: act } = await supabaseAdmin
+          .from('fatome_activity_log').select('run_at')
+          .eq('fatome_key', 'fatome_sentinelle').order('run_at', { ascending: false }).limit(1).maybeSingle();
+        if (act?.run_at && Date.now() - new Date(act.run_at as string).getTime() > 30 * 60_000) {
+          return 'bat le heartbeat mais n\'a journalisé aucun cycle depuis plus de 30 min';
+        }
+      }
+
+      if (key === 'fatome_x') {
+        // « taux frais » alors que la dernière ligne de taux date de plus de 24 h → il ment ou il est cassé.
+        const { data: last } = await supabaseAdmin
+          .from('currency_exchange_rates').select('retrieved_at')
+          .order('retrieved_at', { ascending: false }).limit(1).maybeSingle();
+        const age = last?.retrieved_at ? Date.now() - new Date(last.retrieved_at as string).getTime() : Infinity;
+        if (age > 24 * 3600_000) {
+          return `annonce des taux sains alors que la dernière collecte date de ${Math.round(age / 3600_000)} h`;
+        }
+      }
+
+      if (key === 'fatome_fonctionnalites') {
+        // Sondes déclarées mais AUCUN run récent → exécuteur qui tourne à vide.
+        const { count: probes } = await supabaseAdmin
+          .from('fatome_feature_probes').select('probe_key', { count: 'exact', head: true }).eq('enabled', true);
+        if ((probes || 0) > 0) {
+          const { count: runs } = await supabaseAdmin
+            .from('fatome_probe_runs').select('id', { count: 'exact', head: true })
+            .gte('run_at', new Date(Date.now() - 2 * 3600_000).toISOString());
+          if ((runs || 0) === 0) {
+            return `${probes} sonde(s) déclarée(s) mais AUCUNE exécution depuis 2 h — exécuteur aveugle`;
+          }
+        }
+      }
+    } catch (e: any) {
+      logger.warn(`[FatomeGeneral] contrôle croisé ${key}: ${e?.message || e}`);
+    }
+    return null;
   }
 
   private async checkOne(r: RegistryRow): Promise<CheckResult> {

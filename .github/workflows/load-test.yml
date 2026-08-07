@@ -1,0 +1,72 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 🏋️ TIR DE CHARGE k6 — manuel, JAMAIS automatique, JAMAIS contre la production.
+# Le harnais (load/*.js) existe et compile ; il exige un environnement de STAGING seedé
+# (tokens.json / users.json : wallets provisionnés, destinataires distincts, panier 2 vendeurs).
+# Ce workflow rend le tir accessible en un clic dès que le staging existe :
+#   Actions → Load test (k6) → Run workflow → renseigner base_url et le scénario.
+# GARDE-FOU : le job refuse de tourner si base_url contient le domaine de production.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Load test (k6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "URL du backend de STAGING (jamais la prod)"
+        required: true
+        default: "https://staging-api.example.com"
+      scenario:
+        description: "Scénario à tirer"
+        required: true
+        default: "04-hot-reads.js"
+        type: choice
+        options:
+          - 01-login.js
+          - 02-wallet-transfer.js
+          - 03-create-order.js
+          - 04-hot-reads.js
+          - 05-mixed.js
+
+permissions:
+  contents: read
+
+jobs:
+  k6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Garde-fou anti-production
+        run: |
+          URL="${{ inputs.base_url }}"
+          case "$URL" in
+            *api.solution224.com*|*224solution.net*|*15.188.246.26*)
+              echo "❌ REFUS : tirer contre la PRODUCTION est interdit (README load/)."; exit 1;;
+          esac
+          echo "✅ Cible hors production : $URL"
+
+      - name: Installer k6
+        run: |
+          curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v0.54.0-linux-amd64/k6 /usr/local/bin/k6
+          k6 version
+
+      - name: Vérifier que le scénario compile
+        run: k6 archive "load/${{ inputs.scenario }}" -O /tmp/scenario.tar
+
+      - name: Tirer le scénario
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          TOKENS: ${{ secrets.LOAD_TEST_TOKENS }}
+          USERS: ${{ secrets.LOAD_TEST_USERS }}
+        run: |
+          if [ -z "$TOKENS" ]; then
+            echo "❌ Secret LOAD_TEST_TOKENS absent — seeder le staging puis le poser (voir load/README.md)."
+            exit 1
+          fi
+          k6 run "load/${{ inputs.scenario }}"
+
+      - name: Rappel invariants
+        if: always()
+        run: echo "⚠️ Après le tir : psql \"\$STAGING_DB_URL\" -f load/invariants.sql — 0 violation exigée."

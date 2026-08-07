@@ -4,8 +4,18 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../config/logger.js';
+import { featureKeyForRoute } from '../services/featureManifest.js';
+import { recordFeatureError } from '../services/featureErrorRate.service.js';
 
 export function errorHandler(err: any, req: Request, res: Response, _next: NextFunction): void {
+  // 👻 §8.3 — chaque erreur est TAGUÉE par fonctionnalité (manifeste) et comptée dans la
+  // fenêtre glissante 5 min : un pic ouvre un incident AVANT le prochain passage de sonde.
+  // 100 % en mémoire, jamais bloquant : le chemin d'erreur ne doit rien coûter.
+  try {
+    const route = `${req.method.toUpperCase()} ${(req.baseUrl || '') + (req.route?.path || req.path || '')}`;
+    recordFeatureError(featureKeyForRoute(req.method, (req.baseUrl || '') + (req.path || '')), route);
+  } catch { /* la surveillance ne casse jamais la réponse */ }
+
   logger.error('Error occurred:', {
     error: err.message,
     stack: err.stack,

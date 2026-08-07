@@ -25,3 +25,14 @@ jobs:
         with: { node-version: 20, cache: npm }
       - run: npm ci
       - run: npx --yes --package typescript tsc -p tsconfig.json --noEmit
+
+  # 👻 LA CONNAISSANCE NE PEUT PAS POURRIR (Fatome §8.4/§8.6) : le manifeste des
+  # fonctionnalités est validé contre le CODE RÉEL. RPC/route/source disparue, ou
+  # domaine majeur non mémorisé → BUILD ROUGE + brouillon d'entrée généré dans les logs.
+  manifest-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: node scripts/check-manifest.mjs

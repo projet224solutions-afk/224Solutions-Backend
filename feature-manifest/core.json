@@ -1,0 +1,242 @@
+{
+  "features": [
+    {
+      "feature_key": "vendeur_physique.caisse_vente",
+      "interface": "vendeur_physique",
+      "label": "Caisse POS — vente comptoir",
+      "criticality": "critical",
+      "routes": ["POST /api/pos/sync", "POST /api/pos/order", "GET /api/pos/sales"],
+      "rpcs": ["create_pos_sale_complete", "create_pos_order_complete"],
+      "tables": ["pos_sales", "pos_sales.total_amount", "pos_sale_items"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:vendeur_physique.caisse_vente:total_coherent", "rule": "total_amount = subtotal + tax_amount − discount_total (± 0,01)" }
+      ],
+      "depends_on": ["transversal.wallet"],
+      "sources": ["src/routes/pos.routes.ts"]
+    },
+    {
+      "feature_key": "vendeur_physique.stock",
+      "interface": "vendeur_physique",
+      "label": "Stock produits",
+      "criticality": "high",
+      "routes": ["GET /api/inventory/stock", "POST /api/inventory/adjust", "GET /api/inventory/history"],
+      "rpcs": ["adjust_product_stock_atomic", "validate_stock_purchase"],
+      "tables": ["products", "products.stock_quantity", "inventory_history"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:vendeur_physique.stock:jamais_negatif", "rule": "stock_quantity >= 0 pour tout produit" }
+      ],
+      "depends_on": ["vendeur_physique.caisse_vente"],
+      "sources": ["src/routes/products.routes.ts", "src/routes/inventory.routes.ts"]
+    },
+    {
+      "feature_key": "marketplace.commande",
+      "interface": "vendeur_physique",
+      "label": "Commande marketplace (création + escrow)",
+      "criticality": "critical",
+      "routes": ["POST /api/orders", "GET /api/orders/mine", "PATCH /api/orders/:orderId/status"],
+      "rpcs": ["create_order_core", "record_pdg_revenue"],
+      "tables": ["orders", "orders.total_amount", "order_items", "escrow_transactions"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:marketplace.commande:total_positif", "rule": "toute commande payée a total_amount > 0" }
+      ],
+      "depends_on": ["transversal.wallet"],
+      "sources": ["src/routes/orders.routes.ts"]
+    },
+    {
+      "feature_key": "marketplace.escrow_release",
+      "interface": "vendeur_physique",
+      "label": "Libération d'escrow au vendeur",
+      "criticality": "critical",
+      "routes": ["POST /api/orders/:orderId/confirm-delivery"],
+      "rpcs": ["confirm_delivery_and_release_escrow", "release_escrow_to_seller", "credit_user_wallet_safe"],
+      "tables": ["escrow_transactions", "escrow_transactions.released_at", "wallet_transactions"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:marketplace.escrow:release_date", "rule": "un escrow 'released' porte toujours released_at" }
+      ],
+      "depends_on": ["marketplace.commande", "transversal.wallet"],
+      "sources": ["src/routes/orders.routes.ts:1370"]
+    },
+    {
+      "feature_key": "vendeur_digital.produits",
+      "interface": "vendeur_digital",
+      "label": "Produits numériques & liens de paiement",
+      "criticality": "high",
+      "routes": ["POST /api/orders/digital", "GET /api/v2/digital/:productId/download", "POST /api/payment-links/resolve", "POST /api/payment-links/process"],
+      "rpcs": ["settle_payment_link_atomic", "hold_payment_link_escrow"],
+      "tables": ["digital_products", "payment_links"],
+      "externals": [],
+      "invariants": [],
+      "depends_on": ["transversal.wallet"],
+      "sources": ["src/routes/digital.routes.ts", "src/routes/paymentLinks.routes.ts"]
+    },
+    {
+      "feature_key": "proximite.listing",
+      "interface": "proximite",
+      "label": "Listing & recherche des services de proximité",
+      "criticality": "critical",
+      "routes": [],
+      "rpcs": ["get_proximity_listings", "get_proximity_stats", "count_nearby_services"],
+      "tables": ["professional_services", "professional_services.status", "service_types"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:proximite.listing:non_vide", "rule": "au moins un service actif est listable" }
+      ],
+      "depends_on": [],
+      "sources": ["supabase/migrations/20260710160000_proximity_listings_v2_pagination.sql:26", "supabase/migrations/20260803120000_unify_nearby_availability.sql:49"]
+    },
+    {
+      "feature_key": "proximite.reservation",
+      "interface": "proximite",
+      "label": "Réservation / booking (plafond de plan)",
+      "criticality": "high",
+      "routes": ["POST /api/v2/bookings", "POST /api/v2/bookings/:id/status"],
+      "rpcs": ["create_service_booking", "update_service_booking_status", "get_service_subscription"],
+      "tables": ["proximity_bookings", "proximity_bookings.status"],
+      "externals": [],
+      "invariants": [],
+      "depends_on": ["proximite.listing"],
+      "sources": ["src/routes/bookings.routes.ts:28", "supabase/migrations/20260617450000_enforce_booking_cap_atomic.sql:14"]
+    },
+    {
+      "feature_key": "proximite.devis",
+      "interface": "proximite",
+      "label": "Devis prestataire (chiffrage → paiement)",
+      "criticality": "high",
+      "routes": ["POST /api/v2/quotes/:id/pay", "POST /api/v2/quotes/:id/release"],
+      "rpcs": ["pay_quote_atomic", "release_quote_atomic", "create_quote_from_offering", "preview_quote_service_fee"],
+      "tables": ["service_quotes", "service_quotes.total_amount"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:proximite.devis:prix_positif", "rule": "un devis accepté/payé a toujours total_amount > 0" }
+      ],
+      "depends_on": ["transversal.wallet"],
+      "sources": ["src/routes/quotes.routes.ts"]
+    },
+    {
+      "feature_key": "proximite.prestations",
+      "interface": "proximite",
+      "label": "Catalogue de prestations (offerings)",
+      "criticality": "normal",
+      "routes": [],
+      "rpcs": ["guard_offering_trade"],
+      "tables": ["service_offerings", "service_offerings.professional_service_id"],
+      "externals": [],
+      "invariants": [],
+      "depends_on": ["proximite.listing"],
+      "sources": ["src/components/service-common/ServiceOfferingsManager.tsx (frontend)", "supabase/migrations/20260807240000_offerings_trade_guard.sql"]
+    },
+    {
+      "feature_key": "taxi.course_prix",
+      "interface": "taxi",
+      "label": "Course taxi-moto / VTC (prix & partage)",
+      "criticality": "critical",
+      "routes": ["POST /api/v2/taxi/rides", "GET /api/v2/taxi/resolve-target", "POST /api/v2/taxi/rate"],
+      "rpcs": ["calculate_taxi_fare", "create_taxi_ride", "update_taxi_trip_status", "find_nearby_taxi_drivers", "resolve_user_id_by_phone"],
+      "tables": ["taxi_trips", "taxi_trips.price_total", "taxi_trips.driver_share", "taxi_drivers"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:taxi.course_prix:partage_exact", "rule": "driver_share + platform_fee = price_total (± 1 franc)" }
+      ],
+      "depends_on": ["transversal.wallet"],
+      "sources": ["src/routes/taxi.routes.ts"]
+    },
+    {
+      "feature_key": "livreur.mission",
+      "interface": "livreur",
+      "label": "Mission de livraison (cycle de vie + gain)",
+      "criticality": "critical",
+      "routes": ["POST /api/v2/delivery/accept", "POST /api/v2/delivery/start", "POST /api/v2/delivery/complete", "POST /api/v2/delivery/cancel", "GET /api/v2/delivery/stats"],
+      "rpcs": ["accept_delivery", "start_delivery", "complete_delivery", "cancel_delivery", "find_nearby_taxi_drivers"],
+      "tables": ["deliveries", "deliveries.driver_id", "delivery_tracking"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:livreur.mission:livreur_assigne", "rule": "une livraison 'delivered' a toujours un driver_id" }
+      ],
+      "depends_on": ["transversal.wallet", "marketplace.commande"],
+      "sources": ["src/routes/delivery.routes.ts"]
+    },
+    {
+      "feature_key": "transversal.wallet",
+      "interface": "transversal",
+      "label": "Wallet — solde, transfert, crédit",
+      "criticality": "critical",
+      "routes": ["GET /api/v2/wallet/balance", "POST /api/v2/wallet/transfer", "GET /api/v2/wallet/transactions", "POST /api/v2/wallet/deposit", "POST /api/v2/wallet/withdraw"],
+      "rpcs": ["execute_atomic_wallet_transfer", "execute_atomic_wallet_transfer_fx", "credit_user_wallet_safe", "apply_wallet_cap_split", "wallet_effective_cap"],
+      "tables": ["wallets", "wallets.balance", "wallet_transactions", "wallet_quarantined_funds"],
+      "externals": [],
+      "invariants": [
+        { "key": "inv:transversal.wallet:solde_positif", "rule": "aucun wallet n'a un solde négatif" }
+      ],
+      "depends_on": ["transversal.auth"],
+      "sources": ["src/routes/wallet.v2.routes.ts", "src/services/wallet.service.ts"]
+    },
+    {
+      "feature_key": "transversal.fx",
+      "interface": "transversal",
+      "label": "Taux de change (Fatome X)",
+      "criticality": "critical",
+      "routes": ["GET /api/v2/wallet/admin/fx-health", "POST /api/v2/wallet/admin/fx-refresh"],
+      "rpcs": ["_acash_fx", "fx_monitor_report", "fx_effective_margin_fraction"],
+      "tables": ["currency_exchange_rates", "currency_exchange_rates.retrieved_at", "fx_rate_history"],
+      "externals": ["bcrg", "exchangerate_host"],
+      "invariants": [
+        { "key": "inv:transversal.fx:taux_frais", "rule": "au moins un taux →GNF de moins de 24 h" }
+      ],
+      "depends_on": [],
+      "sources": ["src/routes/fx.routes.ts", "src/routes/wallet.v2.routes.ts"]
+    },
+    {
+      "feature_key": "transversal.auth",
+      "interface": "transversal",
+      "label": "Authentification",
+      "criticality": "critical",
+      "routes": ["POST /api/auth/login", "POST /api/auth/register"],
+      "rpcs": [],
+      "tables": ["profiles", "profiles.role"],
+      "externals": ["supabase_auth"],
+      "invariants": [],
+      "depends_on": [],
+      "sources": ["src/routes/auth.routes.ts"]
+    },
+    {
+      "feature_key": "transversal.notifications",
+      "interface": "transversal",
+      "label": "Notifications (in-app + dispatch SMS/email)",
+      "criticality": "high",
+      "routes": ["POST /api/v2/notifications/dispatch"],
+      "rpcs": ["create_notification"],
+      "tables": ["notifications", "notifications.user_id"],
+      "externals": ["twilio", "resend"],
+      "invariants": [],
+      "depends_on": ["transversal.auth"],
+      "sources": ["src/routes/notificationDispatch.routes.ts"]
+    }
+  ],
+  "probes": [
+    { "probe_key": "inv:vendeur_physique.caisse_vente:total_coherent", "feature_key": "vendeur_physique.caisse_vente", "probe_kind": "invariant", "label": "Total de caisse cohérent", "criticality": "critical" },
+    { "probe_key": "avail:vendeur_physique.caisse_vente", "feature_key": "vendeur_physique.caisse_vente", "probe_kind": "availability", "label": "RPC et tables de la caisse présentes", "criticality": "critical" },
+    { "probe_key": "inv:vendeur_physique.stock:jamais_negatif", "feature_key": "vendeur_physique.stock", "probe_kind": "invariant", "label": "Stock jamais négatif", "criticality": "high" },
+    { "probe_key": "inv:marketplace.commande:total_positif", "feature_key": "marketplace.commande", "probe_kind": "invariant", "label": "Commandes payées chiffrées", "criticality": "critical" },
+    { "probe_key": "avail:marketplace.commande", "feature_key": "marketplace.commande", "probe_kind": "availability", "label": "RPC de commande présentes", "criticality": "critical" },
+    { "probe_key": "inv:marketplace.escrow:release_date", "feature_key": "marketplace.escrow_release", "probe_kind": "invariant", "label": "Libérations d'escrow datées", "criticality": "critical" },
+    { "probe_key": "avail:marketplace.escrow_release", "feature_key": "marketplace.escrow_release", "probe_kind": "availability", "label": "Chaîne escrow présente", "criticality": "critical" },
+    { "probe_key": "avail:vendeur_digital.produits", "feature_key": "vendeur_digital.produits", "probe_kind": "availability", "label": "Tables produits numériques présentes", "criticality": "normal" },
+    { "probe_key": "inv:proximite.listing:non_vide", "feature_key": "proximite.listing", "probe_kind": "invariant", "label": "Listing proximité non vide", "criticality": "critical" },
+    { "probe_key": "inv:proximite.devis:prix_positif", "feature_key": "proximite.devis", "probe_kind": "invariant", "label": "Devis acceptés chiffrés", "criticality": "high" },
+    { "probe_key": "avail:proximite.prestations", "feature_key": "proximite.prestations", "probe_kind": "availability", "label": "Garde métier des prestations présente", "criticality": "normal" },
+    { "probe_key": "inv:taxi.course_prix:partage_exact", "feature_key": "taxi.course_prix", "probe_kind": "invariant", "label": "Partage des courses exact", "criticality": "critical" },
+    { "probe_key": "avail:taxi.course_prix", "feature_key": "taxi.course_prix", "probe_kind": "availability", "label": "RPC de course présentes", "criticality": "critical" },
+    { "probe_key": "inv:livreur.mission:livreur_assigne", "feature_key": "livreur.mission", "probe_kind": "invariant", "label": "Livraisons terminées assignées", "criticality": "critical" },
+    { "probe_key": "avail:livreur.mission", "feature_key": "livreur.mission", "probe_kind": "availability", "label": "RPC de livraison présentes", "criticality": "critical" },
+    { "probe_key": "inv:transversal.wallet:solde_positif", "feature_key": "transversal.wallet", "probe_kind": "invariant", "label": "Aucun wallet négatif", "criticality": "critical" },
+    { "probe_key": "avail:transversal.wallet", "feature_key": "transversal.wallet", "probe_kind": "availability", "label": "Primitives wallet présentes", "criticality": "critical" },
+    { "probe_key": "inv:transversal.fx:taux_frais", "feature_key": "transversal.fx", "probe_kind": "invariant", "label": "Taux de change frais", "criticality": "critical" },
+    { "probe_key": "avail:transversal.fx", "feature_key": "transversal.fx", "probe_kind": "availability", "label": "Chaîne FX présente", "criticality": "critical" },
+    { "probe_key": "avail:transversal.auth", "feature_key": "transversal.auth", "probe_kind": "availability", "label": "Tables d'authentification présentes", "criticality": "critical" },
+    { "probe_key": "avail:transversal.notifications", "feature_key": "transversal.notifications", "probe_kind": "availability", "label": "Chaîne de notifications présente", "criticality": "high" }
+  ]
+}

@@ -625,10 +625,29 @@ router.post('/secure/validate', optionalJWT, async (req: AuthenticatedRequest, r
       })
       .eq('id', transaction_id);
 
-    // ❌ PAS de commission agent sur un DÉPÔT (recharge wallet) : argent du client, pas un
-    // revenu ; la base était le montant TOTAL. La commission est désormais prélevée sur le PDG
-    // (fix moteur) → ponctionnerait le PDG à tort. Commission = achats en ligne (frais) uniquement.
-    // await triggerAffiliateCommission(userId, Number(transaction.net_amount), 'wallet_deposit', transaction_id);
+    // ✅ COMMISSION AGENT SUR DÉPÔT — RÉACTIVÉE (décision PDG 07/08/2026). Base SAINE :
+    // les FRAIS de dépôt (2,5 % payés EN PLUS par le client) = le REVENU plateforme — jamais
+    // le montant du dépôt (argent du client ; l'ancienne base net_amount aurait ponctionné le
+    // coffre 15 % d'un dépôt sans revenu en face, raison du gel historique). Règle du coffre :
+    // le revenu est JOURNALISÉ (record_pdg_revenue, idempotent par transaction) AVANT que la
+    // commission (15/5 sur cette base, moteur idempotent) ne se déverse.
+    const depositFee = Number(transaction.fee_amount || 0);
+    if (depositFee > 0) {
+      try {
+        const { error: revErr } = await supabaseAdmin.rpc('record_pdg_revenue', {
+          p_source_type: 'wallet_deposit_fee',
+          p_amount: depositFee,
+          p_percentage: 100,
+          p_transaction_id: transaction_id,
+          p_user_id: userId,
+          p_currency: 'GNF',
+        });
+        if (revErr) logger.warn(`[SecurePayment] record_pdg_revenue(wallet_deposit_fee) échoué: ${revErr.message}`);
+        await triggerAffiliateCommission(userId, depositFee, 'wallet_deposit', transaction_id, 'GNF');
+      } catch (e: any) {
+        logger.warn(`[SecurePayment] commission dépôt non bloquante: ${e?.message || e}`);
+      }
+    }
 
     await ignoreSupabaseError(supabaseAdmin.from('financial_audit_logs').insert({
       transaction_id,

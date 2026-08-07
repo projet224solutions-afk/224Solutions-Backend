@@ -82,6 +82,12 @@ class FatomeGeneralService {
               v.reason = `heartbeat absent/vieux MAIS le travail est prouvé par les données (${alive}) — câblage du battement à corriger`;
             }
           }
+          // Un DEGRADE dû à un battement manquant doit nommer la cause STRUCTURELLE en
+          // premier : « signale du critique » ferait chercher un problème métier alors que
+          // c'est la preuve de vie qui manque.
+          if (v.verdict === 'DEGRADE' && v.heartbeat_age_sec == null && r.health_check_rpc) {
+            v.reason = `heartbeat non émis (jugé sur ses données seules) — ${v.reason}`;
+          }
           results.push(v);
         } catch (e: any) {
           // FAIL-CLOSED : un contrôle qui échoue = INCONNU, jamais SAIN.

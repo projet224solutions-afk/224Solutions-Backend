@@ -110,8 +110,11 @@ class Surveillance24x7Service {
       // Le scan RÉSEAU sécurité-frontend (lourd) ne tourne qu'au 1er cycle puis tous les frontendScanEveryN.
       this.cycleCount++;
       const includeFrontendScan = this.cycleCount === 1 || this.cycleCount % this.frontendScanEveryN === 0;
+      // UN SEUL run des monitors : synchro system_alerts (dans runPlatformMonitors) + on CONSERVE
+      // le rapport pour la 2e synchro (Fatome, étage B ci-dessous) — jamais deux fois les RPC.
+      let platformReport: Awaited<ReturnType<typeof runPlatformMonitors>> | null = null;
       try {
-        await runPlatformMonitors({ skipFnDomains: !includeFrontendScan });
+        platformReport = await runPlatformMonitors({ skipFnDomains: !includeFrontendScan });
       } catch (e: any) {
         logger.warn(`[Surveillance24x7] platform monitor failed: ${e?.message || e}`);
       }
@@ -138,28 +141,35 @@ class Surveillance24x7Service {
         logger.warn(`[Surveillance24x7] accounting rollup failed: ${e?.message || e}`);
       }
 
-      // 👻 FATOME SENTINELLE — Étage B (balayage croisé, leader-gardé via surveillance) :
-      // les gardiens de commission (wallet + non-wallet) → escalade en anomalies fatome si écart.
-      try {
-        // Réf DATÉE (une alerte max/jour/type) — sinon la contrainte UNIQUE(type, ref) figeait
-        // une réf statique et le check n'alertait PLUS JAMAIS après la 1re fois.
+      // 👻 FATOME SENTINELLE — Étage B : POINT DE CONVERGENCE de TOUTE la surveillance.
+      // On RÉUTILISE le rapport plateforme ci-dessus (UN run, DEUX synchros — jamais de 2e appel RPC) :
+      // pour CHAQUE domaine du registre (escrow, wallet, aml, coffre PDG, agent cash, commissions,
+      // affiliation, …), les checks high/critical en anomalie → fatome_raise ; medium/low → system_alerts
+      // seulement (pas de bruit Fatome). Type = '<domaine>:<key>', réf DATÉE (1 alerte max/jour/type,
+      // sinon UNIQUE(type,ref) figerait le check). Check repassé à 0 → fatome_resolve_type (la carte PDG
+      // suit l'état réel). system_alerts ne notifie PAS (aucun trigger) → une SEULE notif PDG par
+      // anomalie/jour (fatome_raise idempotent).
+      if (platformReport) {
         const day = new Date().toISOString().slice(0, 10);
-        const { data: cmr } = await supabaseAdmin.rpc('commission_monitor_report' as any);
-        for (const c of ((cmr as any)?.checks || [])) {
-          const key = String(c?.key || '');
-          if (!key.startsWith('commission_revenue_gap')) continue;
-          if (Number(c?.count || 0) > 0) {
-            await supabaseAdmin.rpc('fatome_raise' as any, {
-              p_type: key, p_ref: `monitor:${key}:${day}`, p_severity: 'high',
-              p_detail: { count: c.count, label: c.label, source: 'surveillance24x7_etageB' },
-            });
-          } else {
-            // Gap revenu à 0 → auto-résoudre les anomalies non traitées de ce type (la carte PDG suit l'état réel).
-            await supabaseAdmin.rpc('fatome_resolve_type' as any, { p_type: key });
+        for (const dom of platformReport.domains) {
+          for (const c of (dom.report?.checks || [])) {
+            const sev = String(c?.severity || '');
+            if (sev !== 'high' && sev !== 'critical') continue; // medium/low → system_alerts uniquement
+            const type = `${dom.key}:${c.key}`;
+            try {
+              if (Number(c?.count || 0) > 0) {
+                await supabaseAdmin.rpc('fatome_raise' as any, {
+                  p_type: type, p_ref: `monitor:${type}:${day}`, p_severity: sev,
+                  p_detail: { count: c.count, observed: c.observed, label: c.label, domain: dom.key, source: 'surveillance24x7_etageB' },
+                });
+              } else {
+                await supabaseAdmin.rpc('fatome_resolve_type' as any, { p_type: type });
+              }
+            } catch (e: any) {
+              logger.warn(`[Surveillance24x7] fatome escalation failed (${type}): ${e?.message || e}`);
+            }
           }
         }
-      } catch (e: any) {
-        logger.warn(`[Surveillance24x7] fatome sentinelle failed: ${e?.message || e}`);
       }
 
       // Alertes ÉVÉNEMENTIELLES (224Guard, role.changed, observateur frontend…) : pas de

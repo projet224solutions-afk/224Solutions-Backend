@@ -1367,7 +1367,7 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
     }
 
     // Libération atomique vers le vendeur (crédit net + commission plateforme).
-    const { error: relErr } = await supabaseAdmin.rpc('confirm_delivery_and_release_escrow', {
+    const { data: relRes, error: relErr } = await supabaseAdmin.rpc('confirm_delivery_and_release_escrow', {
       p_escrow_id: escrow.id,
       p_customer_id: userId,
       p_notes: 'Réception confirmée par l\'acheteur',
@@ -1398,16 +1398,29 @@ router.post('/:orderId([0-9a-fA-F-]{36})/confirm-delivery', verifyJWT, orderMana
       .select('*')
       .single();
 
-    // 🔔 Notifier le vendeur (non bloquant).
+    // 🔔 Notifier le vendeur (non bloquant) — message HONNÊTE : si une partie du crédit est
+    // partie en quarantaine KYC (plafond), on le dit avec les montants, au lieu du mensonger
+    // « les fonds ont été libérés » alors que le solde ne bouge que partiellement.
     try {
       const { data: vendor } = await supabaseAdmin.from('vendors').select('user_id').eq('id', fullOrder.vendor_id).maybeSingle();
       if (vendor?.user_id) {
+        const rel = (relRes || {}) as Record<string, unknown>;
+        const quarantined = Number(rel.quarantined || 0);
+        const credited = Number(rel.credited || 0);
+        const relCur = String(rel.credited_currency || (fullOrder as { currency?: string })?.currency || 'GNF');
+        const fmtAmt = (n: number) => `${n.toLocaleString('fr-FR')} ${relCur}`;
+        const message = quarantined > 0
+          ? `L'acheteur a confirmé la réception. ${fmtAmt(credited)} sont disponibles sur votre wallet ; ${fmtAmt(quarantined)} sont temporairement retenus — vérifiez votre identité (KYC) pour les débloquer.`
+          : 'L\'acheteur a confirmé la réception. Les fonds ont été libérés sur votre wallet.';
         await createNotification({
           userId: vendor.user_id,
           type: 'order',
           title: `Commande ${fullOrder.order_number || ''}`.trim(),
-          message: 'L\'acheteur a confirmé la réception. Les fonds ont été libérés sur votre wallet.',
-          metadata: { order_id: orderId, order_number: fullOrder.order_number, status: 'delivered' },
+          message,
+          metadata: {
+            order_id: orderId, order_number: fullOrder.order_number, status: 'delivered',
+            ...(quarantined > 0 ? { credited, quarantined, currency: relCur, link: '/kyc' } : {}),
+          },
         });
       }
     } catch (e: any) {

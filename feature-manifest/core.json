@@ -180,11 +180,12 @@
       "label": "Taux de change (Fatome X)",
       "criticality": "critical",
       "routes": ["GET /api/v2/wallet/admin/fx-health", "POST /api/v2/wallet/admin/fx-refresh"],
-      "rpcs": ["_acash_fx", "fx_monitor_report", "fx_effective_margin_fraction"],
+      "rpcs": ["_acash_fx", "fx_monitor_report", "fx_effective_margin_fraction", "pdg_monetary_zones_rates"],
       "tables": ["currency_exchange_rates", "currency_exchange_rates.retrieved_at", "fx_rate_history"],
       "externals": ["bcrg", "exchangerate_host"],
       "invariants": [
-        { "key": "inv:transversal.fx:taux_frais", "rule": "au moins un taux →GNF de moins de 24 h" }
+        { "key": "inv:transversal.fx:taux_frais", "rule": "au moins un taux →GNF de moins de 24 h" },
+        { "key": "inv:transversal.fx:zones_panel_live", "rule": "le panneau Zones sert autant de paires que la source vivante en contient (jamais un écran vide sur une source pleine)" }
       ],
       "depends_on": [],
       "sources": ["src/routes/fx.routes.ts", "src/routes/wallet.v2.routes.ts"]
@@ -235,6 +236,7 @@
     { "probe_key": "inv:transversal.wallet:solde_positif", "feature_key": "transversal.wallet", "probe_kind": "invariant", "label": "Aucun wallet négatif", "criticality": "critical" },
     { "probe_key": "avail:transversal.wallet", "feature_key": "transversal.wallet", "probe_kind": "availability", "label": "Primitives wallet présentes", "criticality": "critical" },
     { "probe_key": "inv:transversal.fx:taux_frais", "feature_key": "transversal.fx", "probe_kind": "invariant", "label": "Taux de change frais", "criticality": "critical" },
+    { "probe_key": "inv:transversal.fx:zones_panel_live", "feature_key": "transversal.fx", "probe_kind": "invariant", "label": "Panneau Zones branché sur la source vivante", "criticality": "high" },
     { "probe_key": "avail:transversal.fx", "feature_key": "transversal.fx", "probe_kind": "availability", "label": "Chaîne FX présente", "criticality": "critical" },
     { "probe_key": "avail:transversal.auth", "feature_key": "transversal.auth", "probe_kind": "availability", "label": "Tables d'authentification présentes", "criticality": "critical" },
     { "probe_key": "avail:transversal.notifications", "feature_key": "transversal.notifications", "probe_kind": "availability", "label": "Chaîne de notifications présente", "criticality": "high" }

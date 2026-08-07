@@ -110,6 +110,9 @@ class Surveillance24x7Service {
       // Surveillance plateforme (escrow/conversion + abonnements) → alertes system_alerts (best-effort).
       // Le scan RÉSEAU sécurité-frontend (lourd) ne tourne qu'au 1er cycle puis tous les frontendScanEveryN.
       this.cycleCount++;
+      // 💓 Santé du cycle pour le HEARTBEAT (dead-man's switch) : un bloc critique qui échoue rend
+      // la Sentinelle aveugle → on le remonte en last_ok=false (plus un simple logger.warn ignoré).
+      let cycleOk = true; let cycleErr: string | null = null;
       const includeFrontendScan = this.cycleCount === 1 || this.cycleCount % this.frontendScanEveryN === 0;
       // UN SEUL run des monitors : synchro system_alerts (dans runPlatformMonitors) + on CONSERVE
       // le rapport pour la 2e synchro (Fatome, étage B ci-dessous) — jamais deux fois les RPC.
@@ -117,6 +120,7 @@ class Surveillance24x7Service {
       try {
         platformReport = await runPlatformMonitors({ skipFnDomains: !includeFrontendScan });
       } catch (e: any) {
+        cycleOk = false; cycleErr = `platform_monitor: ${e?.message || e}`;
         logger.warn(`[Surveillance24x7] platform monitor failed: ${e?.message || e}`);
       }
 
@@ -230,9 +234,20 @@ class Surveillance24x7Service {
         `[Surveillance24x7] Cycle complete trigger=${trigger} services=${services.length} features=${features.length} durationMs=${summary.durationMs}`
       );
 
+      // 💓 HEARTBEAT (dead-man's switch) : le cycle a tourné → on bat. cycleOk=false si un bloc
+      // critique a échoué (ex. runPlatformMonitors) → last_ok=false → le vérificateur pg_cron lève
+      // sentinel_failing après 30 min. Best-effort : un heartbeat raté ne casse jamais le cycle.
+      try {
+        await supabaseAdmin.rpc('fatome_heartbeat_beat' as any, { p_ok: cycleOk, p_error: cycleErr, p_cycle: this.cycleCount });
+      } catch (e: any) { logger.warn(`[Surveillance24x7] heartbeat beat failed: ${e?.message || e}`); }
+
       return summary;
     } catch (error: any) {
       logger.error(`[Surveillance24x7] Cycle failed: ${error?.message || 'unknown'}`);
+      // 💓 HEARTBEAT en ERREUR : la panne du cycle devient une DONNÉE (plus un log ignoré).
+      try {
+        await supabaseAdmin.rpc('fatome_heartbeat_beat' as any, { p_ok: false, p_error: String(error?.message || error).slice(0, 500), p_cycle: this.cycleCount });
+      } catch { /* best-effort */ }
       return null;
     } finally {
       this.isRunning = false;

@@ -14,7 +14,14 @@ interface ConversionResult {
   fetchedAt:       string;
 }
 
-/** Résout le taux stocké : priorité `rate` (net BCRG sans marge). */
+/**
+ * Résout le taux stocké : priorité `rate` (net BCRG sans marge).
+ * ⚠️ PÉRIMÈTRE : ce service ne sert QU'À `convertAmount` → endpoint `payments.v2/convert-preview`
+ * (estimation INFORMATIVE, AUCUN crédit). Le repli sur final_rate_* (taux margé) est toléré ICI
+ * comme dégradé d'affichage pour paires exotiques — JAMAIS pour créditer. Le chemin d'ARGENT
+ * (wallet.v2 transfert) utilise son propre resolveStoredFxRate MID-ONLY (FIX 5) qui bloque en
+ * TAUX_INDISPONIBLE si `rate` est absent (aucun repli margé).
+ */
 function resolveStoredFxRate(
   row: { rate?: number | null; final_rate_usd?: number | null; final_rate_eur?: number | null } | null,
   base: string

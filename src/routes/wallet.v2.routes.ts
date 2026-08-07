@@ -166,40 +166,18 @@ function mapCurrencyToCountry(currency: string | null | undefined): string {
 
 function resolveStoredFxRate(
   row: { rate?: number | null; final_rate_usd?: number | null; final_rate_eur?: number | null; retrieved_at?: string | null } | null | undefined,
-  baseCurrency: string,
+  _baseCurrency: string,
 ): number {
   if (!row) return Number.NaN;
 
-  // TAUX NET DU JOUR (brut BCRG, SANS la marge plateforme). La marge/commission
-  // est désormais prélevée SÉPARÉMENT comme commission explicite (cf. getFxCommissionRate),
-  // et non plus intégrée au taux du destinataire (final_rate). Le destinataire reçoit
-  // donc TOUJOURS au taux net du jour, de façon cohérente sur tous les corridors.
-  const base = String(baseCurrency || '').toUpperCase();
+  // CHEMIN D'ARGENT (transfert) : on ne crédite QU'AU TAUX NET DU JOUR (mid brut BCRG, `rate`).
+  // La marge/commission est prélevée SÉPARÉMENT (getFxCommissionRate). Le destinataire reçoit
+  // donc TOUJOURS au taux net — règle documentée, cohérente sur tous les corridors.
+  // FIX 5 : JAMAIS de repli sur final_rate_* (taux AVEC marge) sur un circuit d'argent — créditer
+  // à la marge léserait le destinataire (et sur la branche inverse, 1/final donnerait la marge du
+  // sens opposé). `rate` absent → NaN → l'appelant lève TAUX_INDISPONIBLE (fail-closed, règle Fatome).
   const directRate = Number(row.rate);
-  if (Number.isFinite(directRate) && directRate > 0) {
-    return directRate;
-  }
-
-  // Fallback uniquement si `rate` (net) est absent : on retombe sur final_rate_*
-  // (qui peut contenir la marge — dégradé acceptable car cas rare).
-  if (base === 'USD' && Number.isFinite(Number(row.final_rate_usd)) && Number(row.final_rate_usd) > 0) {
-    return Number(row.final_rate_usd);
-  }
-  if (base === 'EUR' && Number.isFinite(Number(row.final_rate_eur)) && Number(row.final_rate_eur) > 0) {
-    return Number(row.final_rate_eur);
-  }
-
-  const fallbackUsd = Number(row.final_rate_usd);
-  if (Number.isFinite(fallbackUsd) && fallbackUsd > 0) {
-    return fallbackUsd;
-  }
-
-  const fallbackEur = Number(row.final_rate_eur);
-  if (Number.isFinite(fallbackEur) && fallbackEur > 0) {
-    return fallbackEur;
-  }
-
-  return Number.NaN;
+  return Number.isFinite(directRate) && directRate > 0 ? directRate : Number.NaN;
 }
 
 async function getInternalFxRateFromTable(from: string, to: string): Promise<{ rate: number; source: string; fetchedAt: string }> {
@@ -269,10 +247,16 @@ async function getInternalFxRateFromTable(from: string, to: string): Promise<{ r
   const targetViaUsd = resolveStoredFxRate(usdToTarget, 'USD');
 
   if (Number.isFinite(sourceViaUsd) && sourceViaUsd > 0 && Number.isFinite(targetViaUsd) && targetViaUsd > 0) {
+    // FIX 4 : fraîcheur du croisé = la jambe la PLUS VIEILLE (min des deux retrieved_at, comme
+    // `_acash_fx` least(at1,at2)). Sinon une jambe périmée passerait inaperçue derrière une fraîche,
+    // et la garde isFxRateFresh laisserait passer un croisé à moitié périmé.
+    const legDates = [usdToSource?.retrieved_at, usdToTarget?.retrieved_at]
+      .filter((d): d is string => !!d)
+      .sort(); // ISO 8601 → tri lexicographique = chronologique
     return {
       rate: targetViaUsd / sourceViaUsd,
       source: 'table-usd-pivot',
-      fetchedAt: usdToTarget?.retrieved_at || usdToSource?.retrieved_at || new Date().toISOString(),
+      fetchedAt: legDates[0] || new Date().toISOString(), // [0] = la plus ancienne
     };
   }
 
@@ -852,7 +836,18 @@ router.post('/transfer/preview', verifyJWT, async (req: AuthenticatedRequest, re
     let commissionConversion = 0;
 
     if (isInternational) {
-      const fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      let fxResult: { rate: number; source: string; fetchedAt: string };
+      try {
+        fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      } catch {
+        // FIX 5 : aucun TAUX NET (mid) disponible → on BLOQUE (jamais de repli sur un taux margé).
+        res.status(503).json({
+          success: false,
+          error: 'Taux de change momentanément indisponible. Réessayez plus tard.',
+          error_code: 'FX_RATE_UNAVAILABLE',
+        });
+        return;
+      }
       // GARDE DE FRAÎCHEUR (faille 3) : un taux périmé ne doit pas servir de base à un aperçu chiffré.
       const maxAge = await getFxMaxAgeHours();
       if (!isFxRateFresh(fxResult.fetchedAt, maxAge)) {
@@ -1425,7 +1420,18 @@ router.post('/transfer', verifyJWT, async (req: AuthenticatedRequest, res: Respo
     let amountToCredit = amount;
 
     if (isInternational) {
-      const fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      let fxResult: { rate: number; source: string; fetchedAt: string };
+      try {
+        fxResult = await getInternalFxRateFromTable(senderCurrency, receiverCurrency);
+      } catch {
+        // FIX 5 : aucun TAUX NET (mid) disponible → on BLOQUE l'exécution (jamais de repli margé).
+        res.status(503).json({
+          success: false,
+          error: 'Taux de change momentanément indisponible. Réessayez plus tard.',
+          error_code: 'FX_RATE_UNAVAILABLE',
+        });
+        return;
+      }
       // GARDE DE FRAÎCHEUR (faille 3) : jamais d'exécution sur un taux périmé (fail-closed).
       const maxAge = await getFxMaxAgeHours();
       if (!isFxRateFresh(fxResult.fetchedAt, maxAge)) {

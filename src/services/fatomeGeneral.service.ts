@@ -16,7 +16,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 
 const INTERVAL_MS = Number(process.env.FATOME_GENERAL_INTERVAL_MS || 300_000); // 5 min
 
-type Verdict = 'SAIN' | 'DEGRADE' | 'MORT' | 'SUSPECT' | 'INCONNU';
+type Verdict = 'SAIN' | 'DEGRADE' | 'MORT' | 'SUSPECT' | 'HEARTBEAT_MANQUANT' | 'INCONNU';
 
 interface RegistryRow {
   fatome_key: string;
@@ -72,6 +72,16 @@ class FatomeGeneralService {
             const cross = await this.crossCheck(r.fatome_key);
             if (cross) { v.verdict = 'SUSPECT'; v.reason = cross; }
           }
+          // 🔄 INCOHÉRENCE INVERSE : déclaré mort par le heartbeat, MAIS ses données prouvent
+          // qu'il travaille → c'est un défaut de CÂBLAGE, pas une panne. Dire « MORT » ici
+          // ferait sonner une alarme pour un service qui tourne (cas Fatome X du 07/08).
+          if (v.verdict === 'MORT' || v.verdict === 'INCONNU') {
+            const alive = await this.dataProvesAlive(r.fatome_key);
+            if (alive) {
+              v.verdict = 'HEARTBEAT_MANQUANT';
+              v.reason = `heartbeat absent/vieux MAIS le travail est prouvé par les données (${alive}) — câblage du battement à corriger`;
+            }
+          }
           results.push(v);
         } catch (e: any) {
           // FAIL-CLOSED : un contrôle qui échoue = INCONNU, jamais SAIN.
@@ -104,6 +114,21 @@ class FatomeGeneralService {
             await supabaseAdmin.rpc('fatome_resolve_type' as any, { p_type: `general:${v.fatome_key}_suspect` });
           }
         } catch (e: any) { logger.warn(`[FatomeGeneral] anomalie suspect ${v.fatome_key}: ${e?.message || e}`); }
+        // Battement non câblé : signalé en 'high' (à corriger), jamais en critique — le
+        // service fonctionne, c'est sa preuve de vie qui manque.
+        try {
+          if (v.verdict === 'HEARTBEAT_MANQUANT') {
+            await supabaseAdmin.rpc('fatome_raise' as any, {
+              p_type: `general:${v.fatome_key}_heartbeat_missing`,
+              p_ref: `monitor:general:${v.fatome_key}_heartbeat_missing:${day}`,
+              p_severity: 'high',
+              p_detail: { reason: v.reason, source: 'fatome_general_inverse_check' },
+            });
+          } else {
+            await supabaseAdmin.rpc('fatome_resolve_type' as any,
+              { p_type: `general:${v.fatome_key}_heartbeat_missing` });
+          }
+        } catch (e: any) { logger.warn(`[FatomeGeneral] anomalie heartbeat ${v.fatome_key}: ${e?.message || e}`); }
         try {
           if (v.verdict === 'MORT' && critical) {
             await supabaseAdmin.rpc('fatome_raise' as any, {
@@ -132,6 +157,45 @@ class FatomeGeneralService {
       } catch { /* best-effort */ }
       this.running = false;
     }
+  }
+
+  /**
+   * SOURCE DE VÉRITÉ « DONNÉES » : le Fatome produit-il un travail RÉCENT, indépendamment
+   * de son heartbeat ? Renvoie une preuve lisible, ou null. Permet de distinguer un
+   * travailleur DONT LE BATTEMENT N'EST PAS CÂBLÉ d'un travailleur réellement mort.
+   */
+  private async dataProvesAlive(key: string): Promise<string | null> {
+    const FRESH_MS = 2 * 3600_000;   // travail « récent » = moins de 2 h
+    try {
+      if (key === 'fatome_x') {
+        const { data } = await supabaseAdmin
+          .from('currency_exchange_rates').select('retrieved_at')
+          .order('retrieved_at', { ascending: false }).limit(1).maybeSingle();
+        if (data?.retrieved_at && Date.now() - new Date(data.retrieved_at as string).getTime() < FRESH_MS) {
+          return `dernière collecte de taux il y a ${Math.round((Date.now() - new Date(data.retrieved_at as string).getTime()) / 60000)} min`;
+        }
+      }
+      if (key === 'fatome_sentinelle') {
+        const { data } = await supabaseAdmin
+          .from('fatome_activity_log').select('run_at')
+          .eq('fatome_key', 'fatome_sentinelle')
+          .order('run_at', { ascending: false }).limit(1).maybeSingle();
+        if (data?.run_at && Date.now() - new Date(data.run_at as string).getTime() < FRESH_MS) {
+          return 'cycles de l\'étage B journalisés récemment';
+        }
+      }
+      if (key === 'fatome_fonctionnalites') {
+        const { data } = await supabaseAdmin
+          .from('fatome_probe_runs').select('run_at')
+          .order('run_at', { ascending: false }).limit(1).maybeSingle();
+        if (data?.run_at && Date.now() - new Date(data.run_at as string).getTime() < FRESH_MS) {
+          return 'sondes exécutées récemment';
+        }
+      }
+    } catch (e: any) {
+      logger.warn(`[FatomeGeneral] preuve par les données ${key}: ${e?.message || e}`);
+    }
+    return null;
   }
 
   /**

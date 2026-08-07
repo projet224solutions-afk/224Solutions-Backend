@@ -1079,11 +1079,42 @@ export async function collectAfricanRates(): Promise<{
   logger.info(`[FX] Collecte terminée — OK: ${ok}, NO_CHANGE: ${results.filter(r => r.status === 'NO_CHANGE').length}, BCRG_CACHED: ${results.filter(r => r.status === 'BCRG_CACHED').length}, FALLBACK: ${fallback}, durée: ${durationMs}ms`);
 
   // ── 4. TAUX CROISÉS (le pont manquant) : matérialiser A→B via le pivot USD ──
+  let crosses = 0;
   try {
-    const crosses = await materializeCrossRates();
+    crosses = await materializeCrossRates();
     logger.info(`[FX] Croisés matérialisés: ${crosses} paires (pivot USD)`);
   } catch (e: any) {
     logger.error(`[FX] Échec matérialisation des croisés: ${e.message}`);
+  }
+
+  // ── 5. 💓 FATOME X : battement + journal d'activité (contrat commun du registre) ──
+  // Sans ces deux écritures, l'onglet PDG « Fatome X » affichait « Dernier passage : jamais »
+  // et un journal vide, alors que la collecte tournait — constat écran du 07/08.
+  // last_ok = la collecte a produit au moins un taux et n'a pas échoué en bloc.
+  // Best-effort ABSOLU : ni le battement ni le journal ne peuvent faire échouer une collecte.
+  const collectOk = failed === 0 && (ok + cached + fallback) > 0;
+  const collectErr = collectOk
+    ? null
+    : `collecte partielle: ok=${ok} cached=${cached} fallback=${fallback} failed=${failed}`;
+  try {
+    await supabaseAdmin.rpc('fatome_beat' as any, {
+      p_key: 'fatome_x', p_ok: collectOk, p_error: collectErr,
+    });
+  } catch (e: any) {
+    logger.warn(`[FX] heartbeat fatome_x non écrit: ${e?.message || e}`);
+  }
+  try {
+    await supabaseAdmin.from('fatome_activity_log').insert({
+      fatome_key: 'fatome_x',
+      duration_ms: durationMs,
+      ok: collectOk,
+      message: collectOk
+        ? `Collecte OK — ${ok} taux frais, ${cached} inchangés, ${crosses} croisés`
+        : `Collecte dégradée — ${collectErr}`,
+      volume: { devises_ok: ok, cache: cached, fallback, echecs: failed, croises: crosses },
+    });
+  } catch (e: any) {
+    logger.warn(`[FX] journal d'activité fatome_x non écrit: ${e?.message || e}`);
   }
 
   return { results, ok, fallback, cached, failed, durationMs };

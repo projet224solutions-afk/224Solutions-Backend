@@ -18,6 +18,7 @@ import { Router, Response } from 'express';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { smartRound } from '../config/currencyConfig.js';
 import { logger } from '../config/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { resolveVendorContext, vendorContextHasPermission } from '../services/vendorContext.service.js';
@@ -33,10 +34,10 @@ import { createRedisLimiter } from '../middlewares/rateLimiter.js';
 const router = Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const NO_DEC = new Set(['GNF', 'XOF', 'XAF', 'JPY', 'KRW', 'VND', 'CLP']);
 
+// Arrondi devise-aware : SOURCE UNIQUE currencyConfig (fini la liste 0-décimale locale).
 function roundMoney(amount: number, currency: string): number {
-  return NO_DEC.has(currency.toUpperCase()) ? Math.round(amount) : Math.round(amount * 100) / 100;
+  return smartRound(amount, currency);
 }
 
 /** customers.id de l'utilisateur (créé au besoin) — même logique que orders.routes. */

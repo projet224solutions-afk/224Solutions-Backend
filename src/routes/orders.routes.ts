@@ -20,6 +20,7 @@ import { verifyJWT } from '../middlewares/auth.middleware.js';
 import type { AuthenticatedRequest } from '../middlewares/auth.middleware.js';
 import { idempotencyGuard } from '../middlewares/idempotency.middleware.js';
 import { supabaseAdmin } from '../config/supabase.js';
+import { smartRound } from '../config/currencyConfig.js';
 import { logger } from '../config/logger.js';
 import { orderCreateRateLimit, orderManageRateLimit } from '../middlewares/routeRateLimiter.js';
 import { cache } from '../config/redis.js';
@@ -594,15 +595,13 @@ router.post('/', verifyJWT, idempotencyGuard, orderCreateRateLimit, async (req: 
     // pour TOUS les moyens de paiement (avant : dans la branche wallet uniquement → carte/mobile
     // money n'avaient AUCUN fee backend et le frontend le journalisait, ce qui a cassé après le
     // REVOKE de record_pdg_revenue). Base = montant payé converti, devise acheteur.
-    const NO_DEC = new Set(['GNF', 'XOF', 'XAF', 'JPY', 'KRW', 'VND', 'CLP']);
     let buyerFeeAmount = 0;
     try {
       const { data: feeSetting } = await supabaseAdmin
         .from('system_settings').select('setting_value').eq('setting_key', 'purchase_fee_percent').maybeSingle();
       const pct = Math.max(0, Math.min(50, Number(feeSetting?.setting_value ?? 0)));
-      const rawFee = summary.totalPaidAmount * (pct / 100);
-      buyerFeeAmount = NO_DEC.has(String(summary.buyerCurrency).toUpperCase())
-        ? Math.round(rawFee) : Math.round(rawFee * 100) / 100;
+      // Arrondi devise-aware canonique (currencyConfig) — fini la liste 0-décimale locale.
+      buyerFeeAmount = smartRound(summary.totalPaidAmount * (pct / 100), String(summary.buyerCurrency || 'GNF'));
       buyerFeePercentForLog = pct;
     } catch { buyerFeeAmount = 0; }
 

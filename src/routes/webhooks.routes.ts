@@ -98,6 +98,9 @@ async function isAlreadyProcessed(webhookId: string): Promise<boolean> {
 // ==================== EVENT HANDLERS ====================
 
 // Zero-decimal currencies that Stripe sends without ×100
+// ⚠️ LISTE STRIPE OFFICIELLE (zero-decimal de l'API Stripe) — DIFFÉRENTE PAR NATURE de
+// config/currencyConfig (décimales d'affichage/stockage 224) : ne PAS unifier. Réf croisée
+// vérifiée 07/08/2026 : https://stripe.com/docs/currencies#zero-decimal
 const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set([
   'BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA', 'PYG', 'RWF',
   'UGX', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',

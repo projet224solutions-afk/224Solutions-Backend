@@ -15,6 +15,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { logger } from '../config/logger.js';
 import { cache } from '../config/redis.js';
+import { smartRound } from '../config/currencyConfig.js';
 
 // ─────────────────────────────────────────────────────────────────
 // TYPES
@@ -103,8 +104,7 @@ export const PLATFORM_FEE_RATES: Record<string, number> = {
 // Durée de validité d'un taux verrouillé (ms)
 const RATE_LOCK_DURATION_MS = 8 * 60 * 1000; // 8 minutes
 
-// Devises sans décimales
-const NO_DECIMAL_CURRENCIES = new Set(['GNF', 'XOF', 'XAF', 'JPY', 'KRW', 'VND', 'CLP']);
+// Arrondi devise-aware : SOURCE UNIQUE currencyConfig (fini la liste 0-décimale locale).
 
 // Devise du PAYS du vendeur = source FIABLE du prix produit (Guinée→GNF, Sénégal/UEMOA→XOF,
 // CEMAC→XAF). Le champ `currency`/`seller_currency` du produit vaut toujours GNF par défaut, et
@@ -473,10 +473,7 @@ export async function convertPriceForBuyer(
 
   try {
     const fx = await getInternalFxRate(from, to);
-    const rawConverted = amount * fx.rate;
-    const convertedAmount = NO_DECIMAL_CURRENCIES.has(to)
-      ? Math.round(rawConverted)
-      : Math.round(rawConverted * 100) / 100;
+    const convertedAmount = smartRound(amount * fx.rate, to);
 
     return {
       originalAmount:    amount,
@@ -617,10 +614,7 @@ export async function lockCheckoutRate(
 
   // Obtenir le taux actuel
   const fx = await getInternalFxRate(from, to);
-  const rawConverted = originalAmount * fx.rate;
-  const convertedAmount = NO_DECIMAL_CURRENCIES.has(to)
-    ? Math.round(rawConverted)
-    : Math.round(rawConverted * 100) / 100;
+  const convertedAmount = smartRound(originalAmount * fx.rate, to);
 
   const now      = new Date();
   const expiresAt = new Date(now.getTime() + RATE_LOCK_DURATION_MS);
@@ -690,10 +684,7 @@ export function calculateMarketplaceCommission(
   productType: 'physical' | 'digital' | 'service' | string,
 ): CommissionResult {
   const feePercent = PLATFORM_FEE_RATES[productType] ?? PLATFORM_FEE_RATES.default;
-  const rawFee = grossAmount * (feePercent / 100);
-  const feeAmount = NO_DECIMAL_CURRENCIES.has(currency.toUpperCase())
-    ? Math.round(rawFee)
-    : Math.round(rawFee * 100) / 100;
+  const feeAmount = smartRound(grossAmount * (feePercent / 100), currency);
   const netAmount = grossAmount - feeAmount;
 
   return { grossAmount, currency, feePercent, feeAmount, netAmount };
@@ -752,10 +743,7 @@ export async function buildOrderFinancialSummary(params: {
     fxSource    = fx.source;
     fxFetchedAt = fx.fetched_at;
 
-    const rawTotal = totalOriginal * fxRate;
-    totalPaid = NO_DECIMAL_CURRENCIES.has(buyerCurrency)
-      ? Math.round(rawTotal)
-      : Math.round(rawTotal * 100) / 100;
+    totalPaid = smartRound(totalOriginal * fxRate, buyerCurrency);
 
     rateLockExp = new Date(Date.now() + RATE_LOCK_DURATION_MS).toISOString();
   }
